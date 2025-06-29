@@ -79,6 +79,7 @@ void storageManagerStart()
 // data will be malloc'd by the caller regardless of action type
 // e.g. for GET actions, the caller will malloc an empty struct to be filled
 // similarly, SET actions will have data malloc'd by the caller
+// also, this will block if the queue is full
 void storageManagerAction(StorageManagerActionType actionType, void *data, size_t dataSize, bool isGet = false)
 {
     if (xStorageManagerQueue == NULL)
@@ -171,17 +172,8 @@ void storageManagerAction(StorageManagerActionType actionType, void *data, size_
             vSemaphoreDelete(action_item.completionSemaphore);
             action_item.completionSemaphore = NULL;
         }
-        ESP.restart(); // Consistent with original error handling
+        ESP.restart(); // TODO: better error handling
     }
-}
-
-char *int16ToHex(uint16_t value)
-{
-    // Convert an integer to two hexadecimal char (no null terminator)
-    static char hexStr[2];
-    hexStr[0] = "0123456789ABCDEF"[(value >> 4) & 0x0F];
-    hexStr[1] = "0123456789ABCDEF"[value & 0x0F];
-    return hexStr;
 }
 
 void initPersonalStats(char *username, char *bio, char *url)
@@ -220,12 +212,10 @@ void initPersonalStats(char *username, char *bio, char *url)
     if (writtenSize != sizeof(personal_stats_t))
     {
         ESP_LOGE(TAG_STORAGE, "Failed to write personal stats to file, written size: %zu", writtenSize);
-        statsFile.flush(); // Ensure data is written to disk
         statsFile.close(); // Close the file before restarting
         pauseAndRestart(); // Restart if write fails
     }
     ESP_LOGI(TAG_STORAGE, "Personal stats initialized with username: %s", username);
-    statsFile.flush(); // Ensure data is written to disk
     statsFile.close(); // Close the file after writing
 }
 
@@ -252,7 +242,7 @@ bool readPersonalStats(personal_stats_t *stats)
 bool writePersonalStats(const personal_stats_t *stats)
 {
     // Write personal stats to the file
-    File statsFile = LittleFS.open(STATS_DATABASE_FILENAME, FILE_WRITE);
+    File statsFile = LittleFS.open(STATS_DATABASE_FILENAME, "r+");
     if (!statsFile)
     {
         ESP_LOGE(TAG_STORAGE, "Failed to open personal stats file for writing");
@@ -262,12 +252,10 @@ bool writePersonalStats(const personal_stats_t *stats)
     if (writtenSize != sizeof(personal_stats_t))
     {
         ESP_LOGE(TAG_STORAGE, "Failed to write personal stats to file, written size: %zu", writtenSize);
-        statsFile.flush(); // Ensure data is written to disk
         statsFile.close(); // Close the file before returning
         return false;      // Return false if write fails
     }
     ESP_LOGI(TAG_STORAGE, "Personal stats updated with username: %s", stats->username);
-    statsFile.flush(); // Ensure data is written to disk
     statsFile.close(); // Close the file after writing
     return true;       // Return true if write is successful
 }
@@ -289,127 +277,30 @@ void initFSDatabases()
     {
         ESP_LOGI(TAG_STORAGE, "One or more database files do not exist!");
         ESP_LOGI(TAG_STORAGE, "Creating: %s", ALBUM_DATABASE_FILENAME);
-        // Open in overwrite mode
+        // Create empty album database file
         File albumFile = LittleFS.open(ALBUM_DATABASE_FILENAME, FILE_WRITE); // Create the album database file
         if (!albumFile)
         {
             ESP_LOGE(TAG_STORAGE, "Failed to create album database file");
             pauseAndRestart(); // Restart if file creation fails
         }
-        // preallocate the file with invalid album ID
-        // this is redefined below for track database because they have smaller size
-        // so we can write more tracks at once
-        int batch_write_size = 32;                                                                             // Number of albums to write at once
-        local_album_t *batch_empty_albums = (local_album_t *)malloc(batch_write_size * sizeof(local_album_t)); // Allocate memory for empty albums
-        if (batch_empty_albums == NULL)
-        {
-            ESP_LOGE(TAG_STORAGE, "Failed to allocate memory for empty albums");
-            pauseAndRestart(); // Restart if memory allocation fails
-        }
-        // fill the batch with empty albums
-        // TODO: maybe memset(0x00) + loop setting invalid album id is more efficient?
-        for (int i = 0; i < batch_write_size; i++)
-        {
-            batch_empty_albums[i] = EMPTY_ALBUM; // Fill with empty album structure
-        }
-        for (int i = 0; i < MAX_ALBUMS; i += batch_write_size)
-        {
-            ESP_LOGI(TAG_STORAGE, "Creating: %s, %d/%d", TRACK_DATABASE_FILENAME, i + batch_write_size, MAX_ALBUMS);
-            // Write a batch of empty albums to the file
-            size_t total_size = batch_write_size * sizeof(local_album_t);
-            size_t actual_size = albumFile.write((uint8_t *)batch_empty_albums, total_size);
-            if (actual_size != total_size)
-            {
-                ESP_LOGE(TAG_STORAGE, "Failed to write all empty albums to album database file");
-                free(batch_empty_albums); // Free allocated memory for empty albums
-                albumFile.flush();        // Ensure data is written to disk
-                albumFile.close();        // Close the file before restarting
-                pauseAndRestart();        // Restart if write fails
-            }
-        }
-        albumFile.flush();        // Ensure data is written to disk
-        albumFile.close();        // Close the file after creation
-        free(batch_empty_albums); // Free allocated memory for empty albums after writing
+        albumFile.close(); // Close the file after creation
         ESP_LOGI(TAG_STORAGE, "Album database file created: %s", ALBUM_DATABASE_FILENAME);
 
-        // Now creating the track database file
+        // Create empty track database file
         ESP_LOGI(TAG_STORAGE, "Creating: %s", TRACK_DATABASE_FILENAME);
-        // Open in overwrite mode
         File trackFile = LittleFS.open(TRACK_DATABASE_FILENAME, FILE_WRITE); // Create the track database file
         if (!trackFile)
         {
             ESP_LOGE(TAG_STORAGE, "Failed to create track database file");
             pauseAndRestart(); // Restart if file creation fails
         }
-        // preallocate the file with empty tracks
-        // this is redefined above
-        batch_write_size = 64;                                                                                 // can be higher as track structs take much smaller space
-        local_track_t *batch_empty_tracks = (local_track_t *)malloc(batch_write_size * sizeof(local_track_t)); // Allocate memory for empty tracks
-        if (batch_empty_tracks == NULL)
-        {
-            ESP_LOGE(TAG_STORAGE, "Failed to allocate memory for empty tracks");
-            trackFile.flush(); // Ensure data is written to disk
-            trackFile.close(); // Close the file before restarting
-            pauseAndRestart(); // Restart if memory allocation fails
-        }
-        // fill the batch with empty tracks
-        for (int i = 0; i < batch_write_size; i++)
-        {
-            batch_empty_tracks[i] = EMPTY_TRACK; // Fill with empty track structure
-        }
-        for (int i = 0; i < MAX_TRACKS; i += batch_write_size)
-        {
-            ESP_LOGI(TAG_STORAGE, "Creating: %s, %d/%d", TRACK_DATABASE_FILENAME, i + batch_write_size, MAX_TRACKS);
-            // Write a batch of empty tracks to the file
-            size_t total_size = batch_write_size * sizeof(local_track_t);
-            size_t actual_size = trackFile.write((uint8_t *)batch_empty_tracks, total_size);
-            if (actual_size != total_size)
-            {
-                ESP_LOGE(TAG_STORAGE, "Failed to write all empty tracks to track database file");
-                free(batch_empty_tracks); // Free allocated memory for empty tracks
-                trackFile.flush();        // Ensure data is written to disk
-                trackFile.close();        // Close the file before restarting
-                pauseAndRestart();        // Restart if write fails
-            }
-        }
-        trackFile.flush();        // Ensure data is written to disk
-        trackFile.close();        // Close the file after creation
-        free(batch_empty_tracks); // Free allocated memory for empty tracks after writing
+        trackFile.close(); // Close the file after creation
         ESP_LOGI(TAG_STORAGE, "Track database file created: %s", TRACK_DATABASE_FILENAME);
     }
     else
     {
         ESP_LOGI(TAG_STORAGE, "Album and track database files already exist");
-    }
-    // check for sizes of the files
-    File albumFile = LittleFS.open(ALBUM_DATABASE_FILENAME, "r");
-    if (!albumFile)
-    {
-        ESP_LOGE(TAG_STORAGE, "Failed to open album database file for reading");
-        pauseAndRestart(); // Restart if file opening fails
-    }
-    size_t albumFileSize = albumFile.size();
-    albumFile.close(); // Close the file after checking size
-    File trackFile = LittleFS.open(TRACK_DATABASE_FILENAME, "r");
-    if (!trackFile)
-    {
-        ESP_LOGE(TAG_STORAGE, "Failed to open track database file for reading");
-        pauseAndRestart(); // Restart if file opening fails
-    }
-    size_t trackFileSize = trackFile.size();
-    trackFile.close(); // Close the file after checking size
-    // calculate expected sizes
-    size_t expectedAlbumSize = MAX_ALBUMS * sizeof(local_album_t);
-    size_t expectedTrackSize = MAX_TRACKS * sizeof(local_track_t);
-    if (albumFileSize != expectedAlbumSize || trackFileSize != expectedTrackSize)
-    {
-        ESP_LOGE(TAG_STORAGE, "Database files sizes do not match expected sizes");
-        ESP_LOGE(TAG_STORAGE, "Album file size: %d, expected: %d", albumFileSize, expectedAlbumSize);
-        ESP_LOGE(TAG_STORAGE, "Track file size: %d, expected: %d", trackFileSize, expectedTrackSize);
-        // TODO: maybe don't format?
-        LittleFS.format(); // Format the file system to ensure consistency
-        // Restart the system to reinitialize the file system
-        pauseAndRestart(); // Restart if sizes do not match
     }
     // TODO: more sanity check the files for corruption
     // Gather free space after creating the files
@@ -496,11 +387,13 @@ void storageManagerTask(void *pvParameters)
 
             // read personal stats to check album count
             personal_stats_t personalStats = {0}; // Initialize personal stats structure
+            ESP_LOGI(TAG_STORAGE, "Reading personal stats...");
             if (readPersonalStats(&personalStats) == false)
             {
                 ESP_LOGE(TAG_STORAGE, "Failed to read personal stats");
                 pauseAndRestart(); // Restart if reading personal stats fails
             }
+            ESP_LOGI(TAG_STORAGE, "Done reading personal stats.");
 
             // check current album count
             if (personalStats.total_albums >= MAX_ALBUMS)
@@ -511,34 +404,38 @@ void storageManagerTask(void *pvParameters)
             }
 
             // Now store the album data in LittleFS
-            File albumFile = LittleFS.open(ALBUM_DATABASE_FILENAME, "r+"); // Open file in write mode
+            ESP_LOGI(TAG_STORAGE, "Opening album file for appending...");
+            File albumFile = LittleFS.open(ALBUM_DATABASE_FILENAME, FILE_APPEND); // Open file in append mode
             if (!albumFile)
             {
-                ESP_LOGE(TAG_STORAGE, "Failed to open album file for writing");
+                ESP_LOGE(TAG_STORAGE, "Failed to open album file for appending");
                 free(albumData); // Free allocated memory for album
                 while (1)
                 {
                     vTaskDelay(pdMS_TO_TICKS(1000)); // Wait indefinitely
                 }
             }
-            albumFile.seek((personalStats.total_albums) * sizeof(local_album_t)); // Seek to the position for the new album
-            albumFile.write((uint8_t *)albumData, sizeof(local_album_t));         // Write album data to file
+            ESP_LOGI(TAG_STORAGE, "Done opening album file.");
+            ESP_LOGI(TAG_STORAGE, "Appending album data...");
+            albumFile.write((uint8_t *)albumData, sizeof(local_album_t)); // Append album data to file
+            ESP_LOGI(TAG_STORAGE, "Done writing to album file.");
 
             // update tracks - optimized to open file once for all tracks
-            File trackFile = LittleFS.open(TRACK_DATABASE_FILENAME, "r+"); // Open file in write mode
+            ESP_LOGI(TAG_STORAGE, "Opening track file for appending...");
+            File trackFile = LittleFS.open(TRACK_DATABASE_FILENAME, FILE_APPEND); // Open file in append mode
             if (!trackFile)
             {
-                ESP_LOGE(TAG_STORAGE, "Failed to open track file for writing");
+                ESP_LOGE(TAG_STORAGE, "Failed to open track file for appending");
                 albumFile.close(); // Close album file before restarting
                 pauseAndRestart(); // Restart if file opening fails
             }
+            ESP_LOGI(TAG_STORAGE, "Done opening track file.");
 
-            // Seek to the starting position for all new tracks
-            trackFile.seek((personalStats.total_tracks) * sizeof(local_track_t));
-
-            // Write all tracks in one batch operation
+            // Write all tracks in one batch operation using append mode
+            ESP_LOGI(TAG_STORAGE, "Appending tracks data...");
             size_t totalTracksSize = trackCount * sizeof(local_track_t);
             size_t actualWritten = trackFile.write((uint8_t *)tracksData, totalTracksSize);
+            ESP_LOGI(TAG_STORAGE, "Done writing to track file.");
 
             if (actualWritten != totalTracksSize)
             {
@@ -548,21 +445,23 @@ void storageManagerTask(void *pvParameters)
                 pauseAndRestart();
             }
 
-            trackFile.flush(); // Flush once after all tracks are written
+            ESP_LOGI(TAG_STORAGE, "Closing track file...");
             trackFile.close(); // Close the file after writing all tracks
             ESP_LOGI(TAG_STORAGE, "All %zu tracks written to file: %s", trackCount, TRACK_DATABASE_FILENAME);
 
             // total albums should be the last one to update as it ensures valid album data
             personalStats.total_albums++;             // Increment album count for new album
             personalStats.total_tracks += trackCount; // Increment total tracks by the number of tracks in the album
-            if (!writePersonalStats(&personalStats))  // Write updated personal stats to file
+            ESP_LOGI(TAG_STORAGE, "Writing updated personal stats...");
+            if (!writePersonalStats(&personalStats)) // Write updated personal stats to file
             {
                 ESP_LOGE(TAG_STORAGE, "Failed to write personal stats");
                 pauseAndRestart(); // Restart if writing personal stats fails
             }
+            ESP_LOGI(TAG_STORAGE, "Done writing personal stats.");
             ESP_LOGI(TAG_STORAGE, "Current album count: %d", personalStats.total_albums);
 
-            albumFile.flush(); // Ensure data is written to disk
+            ESP_LOGI(TAG_STORAGE, "Closing album file...");
             albumFile.close(); // Close the file after writing
             ESP_LOGI(TAG_STORAGE, "Album data written to file: %s", ALBUM_DATABASE_FILENAME);
             break;
