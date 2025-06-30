@@ -18,7 +18,10 @@ typedef enum
     CMD_TOGGLE_PAUSE,
     CMD_GET_CURRENT_TRACK_INFO, // Logs info
     CMD_GET_PLAYBACK_STATUS,    // Logs info
-    CMD_SET_PLAYBACK_MODE       // Parameter: PlaybackMode mode
+    CMD_SET_PLAYBACK_MODE,      // Parameter: PlaybackMode mode
+    // TODO: impl CMD_SET_GAIN_ADD, CMD_SET_GAIN_SUB
+    CMD_SET_GAIN_ADD, // 15 levels of gain increase
+    CMD_SET_GAIN_SUB
 } AudioCommandType;
 
 // Playback Mode

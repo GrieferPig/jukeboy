@@ -6,8 +6,8 @@
 #define MAX_ALBUMS 512           // Maximum number of albums to store
 #define MAX_TRACKS_PER_ALBUM 128 // Maximum number of tracks per album
 #define MAX_TRACKS 4096          // Maximum number of tracks to store
-#define MAX_FRIENDS 50           // Maximum number of friends to store
-#define MAX_TAG_LEN 15           // Maximum length of a tag
+#define MAX_FRIENDS 64           // Maximum number of friends to store
+#define MAX_TAG_LEN 16           // Maximum length of a tag
 
 #define INVALID_ALBUM_ID 0xFFFF // Invalid album ID
 #define INVALID_TRACK_ID 0xFFFF // Invalid track ID
@@ -77,11 +77,11 @@ struct local_album_t
 {
     // these are persistent data stored in littlefs
     uint16_t album_id; // global id for referencing, starting from 0
-    char name[31];
-    char artist_name[61];
-    char url[61];
-    uint8_t release_year;           // years since 1970
-    char tags[5][MAX_TAG_LEN];      // 5 maximum tags, each tag is a string of MAX_TAG_LEN characters
+    char name[32];
+    char artist_name[64];
+    char url[64];
+    uint16_t release_year;          // years since 1970
+    char tags[4][MAX_TAG_LEN];      // 4 maximum tags, each tag is a string of MAX_TAG_LEN characters
     uint8_t track_count;            // not including track references as this needs to be sent in packets of at most 246 bytes
     common_date_t first_added_date; // date when the album was first added to the library
 
@@ -97,9 +97,8 @@ struct local_track_t
 {
     uint16_t track_id; // global id for referencing, starting from 0
     uint16_t album_id; // cannot be null even if it's a single
-    char name[21];
-    char artist_name[21];
-    char filename[2]; // hex encoded filename, no null terminator, 256 tracks max
+    char name[64];
+    char artist_name[64];
 
     uint16_t playcount;
     common_date_t first_listen_date;
@@ -119,10 +118,10 @@ struct last_status
 // used to track album/track database and sharing status
 struct personal_stats_t
 {
-    char username[31];
-    char bio[71];
-    char url[71];
-    uint8_t friend_count; // number of friends, maximum 50
+    char username[32];
+    char bio[64];
+    char url[64];
+    uint8_t friend_count; // number of friends, maximum 64
 
     uint16_t fav_albums_id[5];  // 5 maximum
     uint16_t fav_tracks_id[15]; // 15 maximum
@@ -144,13 +143,56 @@ struct friend_t
 
 #define FRIEND_T_SIZE sizeof(friend_t)
 
+// .tja audio file format
+// the header uses the first 512 bytes of the file
+struct tja_header_t
+{
+    char magic[4];      // "TJA\0"
+    uint8_t version;    // Version of the TJA format
+    uint8_t format;     // Format of the TJA file (now only adpcm)
+    uint32_t len_pages; // 512 byte aligned
+    uint32_t checksum;  // crc32 of the file (excl. header)
+    char padding[18];   // Padding to make this section 32 bytes
+
+    // audio metadata (starting at offset 32)
+    char name[64];        // Track name
+    char artist_name[64]; // Artist name
+};
+
+#define TJA_HEADER_T_SIZE sizeof(tja_header_t)
+
+// album.tjm metadata file
+// this fits within 512 bytes
+struct album_tjm_header_t
+{
+    char magic[4];      // "TJM\0"
+    uint8_t version;    // Version of the TJM format
+    uint32_t len_pages; // 512 byte aligned
+    // TODO: checksum would be never used, remove?
+    uint32_t checksum; // crc32 of the file (excl. header)
+    char padding[19];  // Padding to make this section 32 bytes
+
+    // album metadata (starting at offset 32)
+    char name[32];             // Album name
+    char artist_name[64];      // Artist name
+    char url[64];              // URL of the album
+    uint16_t release_year;     // Release year (years since 1970)
+    char tags[4][MAX_TAG_LEN]; // 4 maximum tags
+    uint8_t track_count;       // Number of tracks in the album
+};
+
+#define ALBUM_TJM_HEADER_T_SIZE sizeof(album_tjm_header_t)
+
+// Empty album and track structures for initialization
+// Do not use {0} to initialize as we need invalid IDs
+
 static const local_album_t EMPTY_ALBUM = {
     .album_id = INVALID_ALBUM_ID,
     .name = "",
     .artist_name = "",
     .url = "",
     .release_year = 0,
-    .tags = {"", "", "", "", ""},
+    .tags = {"", "", "", ""},
     .track_count = 0,
     .first_added_date = {0, 0, 0},
     .playcount = 0,
@@ -161,7 +203,6 @@ static const local_track_t EMPTY_TRACK = {
     .album_id = INVALID_ALBUM_ID,
     .name = "",
     .artist_name = "",
-    .filename = "",
     .playcount = 0,
     .first_listen_date = {0, 0, 0},
     .last_listen_date_offset = 0};
