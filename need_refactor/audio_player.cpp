@@ -7,6 +7,7 @@
 #include <string.h>
 #include <ESP32I2SAudio.h>
 #include <algorithm> // For std::min and std::max
+#include "storage_struct.h"
 #include "esp_log.h" // Added for ESP_LOGx macros
 
 // SD Card SPI pins
@@ -20,8 +21,12 @@ BackgroundAudioRAWClass BMP(audio); // Use BackgroundAudioRAWClass
 
 static const char *TAG = "AudioPlayer"; // Added for ESP_LOGx
 
-// List of all raw files
-std::vector<String> rawlist;                                  // Renamed from tjalist
+static const uint32_t TJA_HEADER_SIZE = 512;
+static const uint32_t ADPCM_BLOCK_SIZE = 44032;
+static const uint32_t ADPCM_BLOCK_HEADER_SIZE = 6; // Dual-state header
+static const uint32_t ADPCM_BLOCK_DATA_SIZE = ADPCM_BLOCK_SIZE - ADPCM_BLOCK_HEADER_SIZE;
+static const uint32_t SAMPLES_PER_BLOCK = ADPCM_BLOCK_DATA_SIZE * 2;
+
 int currentTrackIndex = -1;                                   // Index in rawlist of the *currently playing* track
 float current_gain_level = 0.05f;                             // Store current gain level
 static uint32_t currentStreamStartFileOffsetBytes = 0;        // Start offset of the current stream segment in the file
@@ -29,15 +34,19 @@ bool isPaused = false;                                        // State for pause
 static uint32_t pausedFilePositionBytes = 0;                  // Store file position when paused
 static PlaybackMode currentPlaybackMode = PLAYBACK_MODE_LOOP; // Default to loop mode
 
+static TjaHeader current_track_header;
+static uint8_t adpcm_block_buffer[ADPCM_BLOCK_SIZE];
+// This buffer holds one fully decoded ADPCM block's worth of PCM data
+static const size_t DECODED_PCM_BUFFER_SIZE = SAMPLES_PER_BLOCK * BYTES_PER_SAMPLE_FRAME;
+static uint8_t decoded_pcm_buffer[DECODED_PCM_BUFFER_SIZE];
+static size_t decoded_pcm_buffer_read_pos = DECODED_PCM_BUFFER_SIZE; // Start at max to force a read
+
+static int total_track_count = 0; // Replaces rawlist.size()
+
 // New variables for enhanced shuffle mode
 std::vector<int> shuffled_indices_list; // Stores indices from rawlist in shuffled order
 int current_shuffled_list_play_idx = 0; // Points to the current track *within* shuffled_indices_list
 
-// Audio format constants from BackgroundAudioRAW.h (or use its defines directly if accessible)
-// These are defined in BackgroundAudioRAW.h, so we can use them conceptually
-// #define _fixedSampleRate 44100
-// #define _fixedChannels 2
-// #define _fixedBitDepth 16
 static const uint32_t FIXED_SAMPLE_RATE = 44100;
 static const uint32_t FIXED_CHANNELS = 2;
 static const uint32_t FIXED_BIT_DEPTH = 16;
