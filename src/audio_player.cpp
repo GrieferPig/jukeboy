@@ -32,7 +32,12 @@ static PlaybackMode currentPlaybackMode = PLAYBACK_MODE_LOOP; // Default to loop
 // New variables for enhanced shuffle mode
 std::vector<int> shuffled_indices_list; // Stores indices from rawlist in shuffled order
 int current_shuffled_list_play_idx = 0; // Points to the current track *within* shuffled_indices_list
-// Constants for audio playback
+
+// Audio format constants from BackgroundAudioRAW.h (or use its defines directly if accessible)
+// These are defined in BackgroundAudioRAW.h, so we can use them conceptually
+// #define _fixedSampleRate 44100
+// #define _fixedChannels 2
+// #define _fixedBitDepth 16
 static const uint32_t FIXED_SAMPLE_RATE = 44100;
 static const uint32_t FIXED_CHANNELS = 2;
 static const uint32_t FIXED_BIT_DEPTH = 16;
