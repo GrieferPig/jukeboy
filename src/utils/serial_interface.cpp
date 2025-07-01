@@ -9,11 +9,11 @@ const char *SERIAL_TAG = "serial";
 static void print_help()
 {
     Serial.println("\n=== Audio Player Commands ===");
-    Serial.println("p<num> - Play track (e.g., p0, p1, p2)");
+    // Serial.println("p<num> - Play track (e.g., p0, p1, p2)");
     Serial.println("space  - Toggle pause");
     Serial.println("n      - Next track");
     Serial.println("b      - Previous track");
-    Serial.println("v<num> - Set volume shift (e.g., v1, v5, v10)");
+    // Serial.println("v<num> - Set volume shift (e.g., v1, v5, v10)");
     Serial.println("s      - Toggle shuffle");
     Serial.println("f      - Fast forward 10 seconds");
     Serial.println("r      - Rewind 5 seconds");
@@ -31,38 +31,39 @@ static void serial_interface_task(void *parameter)
     {
         if (Serial.available())
         {
-            String input = Serial.readStringUntil('\n');
+            char input = Serial.read();
 
             // Check for space before trimming
-            bool is_space_command = (input.length() > 0 && input.charAt(0) == ' ');
+            // bool is_space_command = (input.length() > 0 && input.charAt(0) == ' ');
 
-            input.trim();
+            // input.trim();
 
-            if (input.length() == 0 && !is_space_command)
-            {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
+            // if (input.length() == 0 && !is_space_command)
+            // {
+            //     vTaskDelay(pdMS_TO_TICKS(10));
+            //     continue;
+            // }
 
             AudioCommand cmd;
             bool valid_command = true;
 
-            char first_char = is_space_command ? ' ' : input.charAt(0);
+            // char first_char = is_space_command ? ' ' : input.charAt(0);
 
-            switch (first_char)
+            // switch (first_char)
+            switch (input)
             {
-            case 'p': // Play track
-                if (input.length() > 1)
-                {
-                    cmd.type = CMD_PLAY_TRACK;
-                    cmd.params.track_number = input.substring(1).toInt();
-                    ESP_LOGI(SERIAL_TAG, "Playing track %d", cmd.params.track_number);
-                }
-                else
-                {
-                    valid_command = false;
-                }
-                break;
+                // case 'p': // Play track
+                //     if (input.length() > 1)
+                //     {
+                //         cmd.type = CMD_PLAY_TRACK;
+                //         cmd.params.track_number = input.substring(1).toInt();
+                //         ESP_LOGI(SERIAL_TAG, "Playing track %d", cmd.params.track_number);
+                //     }
+                //     else
+                //     {
+                //         valid_command = false;
+                //     }
+                //     break;
 
             case ' ': // Toggle pause
                 cmd.type = CMD_TOGGLE_PAUSE;
@@ -79,18 +80,18 @@ static void serial_interface_task(void *parameter)
                 ESP_LOGI(SERIAL_TAG, "Previous track");
                 break;
 
-            case 'v': // Set volume shift
-                if (input.length() > 1)
-                {
-                    cmd.type = CMD_SET_VOLUME_SHIFT;
-                    cmd.params.volume_shift = input.substring(1).toInt();
-                    ESP_LOGI(SERIAL_TAG, "Setting volume shift to %d", cmd.params.volume_shift);
-                }
-                else
-                {
-                    valid_command = false;
-                }
-                break;
+                // case 'v': // Set volume shift
+                //     if (input.length() > 1)
+                //     {
+                //         cmd.type = CMD_SET_VOLUME_SHIFT;
+                //         cmd.params.volume_shift = input.substring(1).toInt();
+                //         ESP_LOGI(SERIAL_TAG, "Setting volume shift to %d", cmd.params.volume_shift);
+                //     }
+                //     else
+                //     {
+                //         valid_command = false;
+                //     }
+                //     break;
 
             case 's': // Toggle shuffle
                 cmd.type = CMD_TOGGLE_SHUFFLE;
