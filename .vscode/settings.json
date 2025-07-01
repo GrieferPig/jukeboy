@@ -17,6 +17,15 @@
         "bitset": "cpp",
         "string_view": "cpp",
         "initializer_list": "cpp",
-        "span": "cpp"
+        "span": "cpp",
+        "sd.h": "c",
+        "deque": "cpp",
+        "list": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "vector": "cpp",
+        "text_encoding": "cpp",
+        "chrono": "cpp",
+        "functional": "cpp"
     }
 }
