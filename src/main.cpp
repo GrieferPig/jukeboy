@@ -11,10 +11,9 @@
 volatile uint8_t g_volume_shift = 2; // Start at 25% volume (shift right by 2)
 
 // --- Hardware Pins ---
-#define I2S_BCLK_PIN 7
-#define I2S_LRCLK_PIN 9
-#define I2S_DIN_PIN -1 // Not used for playback
-#define I2S_DOUT_PIN 10
+#define I2S_BCLK_PIN 5
+#define I2S_LRCLK_PIN 7
+#define I2S_DOUT_PIN 6
 
 // SD Card SPI Pins
 #define SD_CS_PIN 3
@@ -87,11 +86,23 @@ void setup()
     xTaskCreate(sd_reader_task, "SDReaderTask", 4096, NULL, 5, &sdReaderTaskHandle);
     xTaskCreate(decoder_task, "DecoderTask", 4096, NULL, 10, &decoderTaskHandle);
     xTaskCreate(profiler_task, "ProfilerTask", 4096, NULL, 1, NULL);
+
+    pinMode(9, INPUT_PULLUP); // Ensure pin is set up (safe to call repeatedly)
 }
 
 void loop()
 {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    uint8_t button_state = digitalRead(9);
+
+    if (button_state == LOW) // Button pressed
+    {
+        g_volume_shift++;
+        if (g_volume_shift > 10)
+            g_volume_shift = 1;
+        ESP_LOGI(TAG, "Volume shift set to: %d", g_volume_shift);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10)); // Small delay for RTOS friendliness
 }
 
 // --- SD Reader Task (Producer) ---
@@ -156,7 +167,7 @@ void decoder_task(void *pvParameters)
             .bclk = (gpio_num_t)I2S_BCLK_PIN,
             .ws = (gpio_num_t)I2S_LRCLK_PIN,
             .dout = (gpio_num_t)I2S_DOUT_PIN,
-            .din = (gpio_num_t)I2S_DIN_PIN,
+            .din = (gpio_num_t)I2S_GPIO_UNUSED,
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
