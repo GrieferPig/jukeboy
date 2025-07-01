@@ -43,6 +43,7 @@ TaskHandle_t decoderTaskHandle = NULL;
 // Forward declarations for our tasks
 void sd_reader_task(void *pvParameters);
 void decoder_task(void *pvParameters);
+void profiler_task(void *pvParameters);
 
 // --- Gain Application Function (Integer-based) ---
 static inline void apply_gain(int16_t *pcm_buffer, size_t sample_count, uint8_t volume_shift)
@@ -85,6 +86,7 @@ void setup()
 
     xTaskCreate(sd_reader_task, "SDReaderTask", 4096, NULL, 5, &sdReaderTaskHandle);
     xTaskCreate(decoder_task, "DecoderTask", 4096, NULL, 10, &decoderTaskHandle);
+    xTaskCreate(profiler_task, "ProfilerTask", 4096, NULL, 1, NULL);
 }
 
 void loop()
@@ -202,5 +204,21 @@ void decoder_task(void *pvParameters)
 
         // 4. Return the now-processed buffer to the empty queue so the reader can use it.
         xQueueSend(empty_buffer_queue, &adpcm_block_to_decode, portMAX_DELAY);
+    }
+}
+
+void profiler_task(void *pvParameters)
+{
+    char stats_buffer[2048]; // Buffer to hold the formatted stats string
+
+    while (true)
+    {
+        // Wait for 5 seconds before printing stats again
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        ESP_LOGI("Profiler", "--- TASK RUN-TIME STATS ---");
+        vTaskGetRunTimeStats(stats_buffer);
+        printf("%s\n", stats_buffer);
+        ESP_LOGI("Profiler", "---------------------------\n");
     }
 }
