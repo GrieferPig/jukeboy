@@ -680,6 +680,11 @@ void audio_player_task(void *pvParameters)
                 break;
 
             case CMD_VOLUME_DEC:
+                if (g_volume_level == 11)
+                {
+                    // Already muted, do nothing
+                    break;
+                }
                 if (g_volume_level > 1)
                 {
                     g_volume_level--;
