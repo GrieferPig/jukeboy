@@ -1,8 +1,6 @@
 #ifndef AUDIO_INTERNALS_H
 #define AUDIO_INTERNALS_H
 
-#include <Arduino.h>
-#include <SD.h>
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/i2s_std.h"

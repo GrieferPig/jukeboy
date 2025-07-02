@@ -26,6 +26,7 @@
         "vector": "cpp",
         "text_encoding": "cpp",
         "chrono": "cpp",
-        "functional": "cpp"
+        "functional": "cpp",
+        "task.h": "c"
     }
 }

@@ -1,11 +1,16 @@
 #pragma once
 
 #include <stdint.h>
-#include <Arduino.h>
 
+#ifdef ESP32_WROOM
+#define I2S_BCK_PIN GPIO_NUM_26
+#define I2S_DOUT_PIN GPIO_NUM_22
+#define I2S_WS_PIN GPIO_NUM_25
+#else
 #define I2S_BCK_PIN GPIO_NUM_5
 #define I2S_DOUT_PIN GPIO_NUM_6
 #define I2S_WS_PIN GPIO_NUM_7
+#endif
 
 // Enum for playback commands
 typedef enum
@@ -45,4 +50,4 @@ void audio_player_init();
  * @brief Sends a command to the audio player's control task.
  * @param cmd The command to be executed.
  */
-void audio_player_send_command(const AudioCommand &cmd);
+void audio_player_send_command(const AudioCommand *cmd);
