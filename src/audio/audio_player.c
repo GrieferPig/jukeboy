@@ -8,7 +8,7 @@
 #include "esp_log.h"
 #include "audio/adpcm_decoder.h" // Assuming your custom decoder library
 #include "storage_struct.h"      // Assuming your storage structure definitions
-#include "utils/macros.h"        // For utility macros like `unwrap_basetype`, `todo`, etc.
+#include "macros.h"              // For utility macros like `unwrap_basetype`, `todo`, etc.
 #include "esp_vfs_fat.h"
 #include "driver/spi_common.h"
 #include "driver/sdspi_host.h"
