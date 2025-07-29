@@ -38,6 +38,17 @@
         "ble_svc_gatt.h": "c",
         "ble_hs.h": "c",
         "zlib.h": "c",
-        "part_mgr.h": "c"
+        "part_mgr.h": "c",
+        "gpio.h": "c",
+        "esp_intr_alloc.h": "c",
+        "pindef.h": "c",
+        "freertos.h": "c",
+        "*.bak": "c",
+        "pindef_ulp.h": "c",
+        "power_mgr.h": "c",
+        "esp_sleep.h": "c",
+        "ulp_main.h": "c",
+        "led_mgr.h": "c",
+        "esp_err.h": "c"
     }
 }

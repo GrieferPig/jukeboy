@@ -16,22 +16,10 @@
 #include <dirent.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h> // for malloc, abort()
 
 // --- Constants and Globals ---
 static const char *TAG = "AudioPlayer";
-
-// SD Card SPI Pins (Update these to your board's configuration)
-#ifdef ESP32_WROOM
-#define SD_CS_PIN 5
-#define SD_SCK_PIN 18
-#define SD_MOSI_PIN 23
-#define SD_MISO_PIN 19
-#else
-#define SD_CS_PIN 3
-#define SD_SCK_PIN 1
-#define SD_MOSI_PIN 2
-#define SD_MISO_PIN 0
-#endif
 
 // Audio format constants
 #define TJA_HEADER_SIZE 512U
@@ -78,9 +66,9 @@ EventGroupHandle_t player_event_group;
 #define DECODER_TASK_EXITED_BIT (1 << 2)
 
 // --- Buffers ---
-static uint8_t adpcm_buffer_A[ADPCM_BLOCK_SIZE];
-static uint8_t adpcm_buffer_B[ADPCM_BLOCK_SIZE];
-static int16_t i2s_write_chunk_buffer[I2S_WRITE_CHUNK_SIZE / sizeof(int16_t)];
+static uint8_t *adpcm_buffer_A;
+static uint8_t *adpcm_buffer_B;
+static int16_t *i2s_write_chunk_buffer;
 
 // --- Task Forward Declarations ---
 void audio_player_task(void *pvParameters);
@@ -371,23 +359,9 @@ void decoder_task(void *pvParameters)
     i2s_channel_enable(g_tx_handle);
 
     DecoderContext decoder_ctx;
-    bool i2s_is_enabled = true;
 
     while (g_playback_state != STATE_STOPPED)
     {
-        // Handle resume state changes
-        if (g_playback_state == STATE_PLAYING && !i2s_is_enabled)
-        {
-            i2s_channel_enable(g_tx_handle);
-            i2s_is_enabled = true;
-            ESP_LOGI(TAG, "I2S channel enabled (resumed).");
-        }
-        else if (g_playback_state == STATE_PAUSED && i2s_is_enabled)
-        {
-            // The player task now handles disabling, but we need to update our state
-            i2s_is_enabled = false;
-        }
-
         // If paused, wait here before trying to receive from queue
         if (g_playback_state == STATE_PAUSED)
         {
@@ -426,10 +400,7 @@ void decoder_task(void *pvParameters)
         xQueueSend(empty_buffer_queue, &adpcm_block_to_decode, portMAX_DELAY);
     }
 
-    if (i2s_is_enabled)
-    {
-        i2s_channel_disable(g_tx_handle);
-    }
+    i2s_channel_disable(g_tx_handle);
     i2s_del_channel(g_tx_handle);
     g_tx_handle = NULL;
     ESP_LOGI(TAG, "Decoder task exiting.");
@@ -437,7 +408,7 @@ void decoder_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-void init_sdcard()
+esp_err_t init_sdcard()
 {
     esp_err_t ret;
     sdmmc_card_t *card = NULL;
@@ -464,7 +435,7 @@ void init_sdcard()
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
-        return;
+        return ret;
     }
 
     // Configure SPI device
@@ -477,10 +448,12 @@ void init_sdcard()
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
-        return;
     }
-
-    ESP_LOGI(TAG, "SD card mounted successfully");
+    else
+    {
+        ESP_LOGI(TAG, "SD card mounted successfully");
+    }
+    return ret;
 }
 
 /**
@@ -492,43 +465,14 @@ void audio_player_task(void *pvParameters)
     ESP_LOGI(TAG, "Audio Player control task started.");
 
     // Initialize SD card
-    init_sdcard();
-    ESP_LOGI(TAG, "SD Card initialized.");
-
-    // --- Scan SD card for tracks ---
-    // File root = SD.open("/");
-    // if (!root)
-    // {
-    //     ESP_LOGE(TAG, "Failed to open root directory. Stopping.");
-    //     vTaskDelete(NULL);
-    //     return;
-    // }
-    // if (!root.isDirectory())
-    // {
-    //     ESP_LOGE(TAG, "Root is not a directory. Stopping.");
-    //     // root.close();
-    //     fclose(root);
-    //     vTaskDelete(NULL);
-    //     return;
-    // }
+    if (init_sdcard() != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to initialize SD card.");
+        vTaskDelete(NULL);
+        return;
+    }
 
     int track_count = 0;
-    // File file = root.openNextFile();
-    // while (file)
-    // {
-    //     if (!file.isDirectory())
-    //     {
-    //         const char *fname = file.name();
-    //         // Check for format "xx.tja" (e.g., "0A.tja", "1F.tja")
-    //         if (strlen(fname) == 6 && isxdigit(fname[0]) && isxdigit(fname[1]) && strcmp(fname + 2, ".tja") == 0)
-    //         {
-    //             track_count++;
-    //         }
-    //     }
-    //     file.close();
-    //     file = root.openNextFile();
-    // }
-    // root.close();
 
     DIR *dir = opendir("/sdcard");
     if (dir == NULL)
@@ -609,7 +553,15 @@ void audio_player_task(void *pvParameters)
                 else if (g_playback_state == STATE_PAUSED)
                 {
                     g_playback_state = STATE_PLAYING;
-                    ESP_LOGI(TAG, "CMD: RESUME");
+                    if (g_tx_handle)
+                    {
+                        i2s_channel_enable(g_tx_handle);
+                        ESP_LOGI(TAG, "CMD: RESUME - I2S channel enabled.");
+                    }
+                    else
+                    {
+                        ESP_LOGI(TAG, "CMD: RESUME");
+                    }
                 }
                 break;
 
@@ -713,21 +665,30 @@ void audio_player_task(void *pvParameters)
  */
 void audio_player_init()
 {
-    // Create command queue
-    audio_command_queue = xQueueCreate(10, sizeof(AudioCommand));
-    if (!audio_command_queue)
+    // Allocate buffers on heap only if not already allocated
+    // so that subsequent audio_player runs can reuse these buffers
+    if (adpcm_buffer_A == NULL)
     {
-        ESP_LOGE(TAG, "Failed to create command queue.");
-        return;
+        adpcm_buffer_A = malloc(ADPCM_BLOCK_SIZE);
+        panic_if(!adpcm_buffer_A, "Failed to allocate adpcm_buffer_A");
+    }
+    if (adpcm_buffer_B == NULL)
+    {
+        adpcm_buffer_B = malloc(ADPCM_BLOCK_SIZE);
+        panic_if(!adpcm_buffer_B, "Failed to allocate adpcm_buffer_B");
+    }
+    if (i2s_write_chunk_buffer == NULL)
+    {
+        i2s_write_chunk_buffer = malloc(I2S_WRITE_CHUNK_SIZE);
+        panic_if(!i2s_write_chunk_buffer, "Failed to allocate i2s_write_chunk_buffer");
     }
 
+    // Create command queue
+    audio_command_queue = xQueueCreate(10, sizeof(AudioCommand));
+    panic_if(!audio_command_queue, "Failed to create audio command queue");
     // Create event group
     player_event_group = xEventGroupCreate();
-    if (!player_event_group)
-    {
-        ESP_LOGE(TAG, "Failed to create event group.");
-        return;
-    }
+    panic_if(!player_event_group, "Failed to create event group.");
 
     // Create buffer queues and pre-fill the empty one
     full_buffer_queue = xQueueCreate(2, sizeof(uint8_t *));
@@ -736,6 +697,11 @@ void audio_player_init()
     uint8_t *buf_b_ptr = adpcm_buffer_B;
     xQueueSend(empty_buffer_queue, &buf_a_ptr, 0);
     xQueueSend(empty_buffer_queue, &buf_b_ptr, 0);
+
+    // Register an interrupt on pin CART_PRESENCE
+    // when cart is removed, kill the player task
+    gpio_set_direction(CART_PRESENCE_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(CART_PRESENCE_GPIO, GPIO_PULLUP_ONLY);
 
     // Create and start the main player control task
     xTaskCreate(audio_player_task, "AudioPlayerTask", 4096, NULL, 8, &playerTaskHandle);

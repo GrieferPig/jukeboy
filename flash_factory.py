@@ -37,6 +37,10 @@ if env.subst("$PIOENV") == "factory":
         esptool_path = env.get("ESPTOOL", "esptool")
         upload_port = env.get("UPLOAD_PORT")
 
+        # Get bootloader and partition table paths
+        bootloader_path = env.subst("$BUILD_DIR/bootloader.bin")
+        partition_table_path = env.subst("$BUILD_DIR/partitions.bin")
+
         if not upload_port:
             raise Exception(
                 "Error: Upload port not defined. Set upload_port or use --upload-port."
@@ -51,8 +55,8 @@ if env.subst("$PIOENV") == "factory":
         if not otadata_info:
             raise Exception("Error: Could not find 'otadata' partition in CSV.")
 
-        # --- 1. Flash the factory application ---
-        cmd_flash = [
+        # Combine flashing of bootloader, partition table, and factory app into one esptool command
+        cmd = [
             esptool_path,
             "--chip",
             env.get("BOARD_MCU"),
@@ -61,19 +65,23 @@ if env.subst("$PIOENV") == "factory":
             "--baud",
             str(env.get("UPLOAD_SPEED")),
             "write_flash",
+            "0x1000",
+            bootloader_path,
+            "0x8000",
+            partition_table_path,
             factory_info["offset"],
             firmware_path,
         ]
 
-        print(f"Flashing factory app: {' '.join(cmd_flash)}")
-        result = subprocess.run(cmd_flash)
+        print(f"Flashing all partitions in one go: {' '.join(cmd)}")
+        result = subprocess.run(cmd)
         if result.returncode != 0:
-            print("Factory app flashing failed. Aborting.")
+            print("Flashing failed. Aborting.")
             return result.returncode
 
-        print("\n--- Factory app flashed successfully ---")
+        print("\n--- All components flashed successfully ---")
 
         return result.returncode
 
     # Replace the default "upload" command with our custom function
-    env.Replace(UPLOADCMD=custom_upload_and_erase)
+    env.Replace(UPLOADCMD=custom_upload_and_erase)  # noqa: F821

@@ -63,7 +63,7 @@ static uint8_t zlib_out_buf[ZLIB_CHUNK_SIZE * 4];
 
 SemaphoreHandle_t cmd_done_sem;
 
-#define BLE_DEVICE_NAME "tj_needs_your_help"
+#define BLE_DEVICE_NAME "jb_needs_your_help"
 
 // 前向
 static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
@@ -127,7 +127,9 @@ static int handle_control_write(struct ble_gatt_access_ctxt *ctxt)
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
         part_type = (part_mgr_partition_type_t)ctxt->om->om_data[1];
-        if (part_type != PART_MGR_PARTITION_TYPE_APP && part_type != PART_MGR_PARTITION_TYPE_LITTLEFS)
+        if (part_type != PART_MGR_PARTITION_TYPE_APP &&
+            part_type != PART_MGR_PARTITION_TYPE_LITTLEFS &&
+            part_type != PART_MGR_PARTITION_TYPE_NVS)
         {
             ESP_LOGE(TAG, "Invalid or unsupported partition type for command %d: %d", command, part_type);
             notify_client(NOTIFY_ERR_PARTITION);

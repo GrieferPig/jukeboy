@@ -27,6 +27,9 @@ esp_err_t part_mgr_get_partition(part_mgr_partition_type_t type, esp_partition_t
     case PART_MGR_PARTITION_TYPE_LITTLEFS:
         found_partition = esp_partition_find_first(LITTLEFS_PARTITION_TYPE, LITTLEFS_PARTITION_SUBTYPE, LITTLEFS_PARTITION_LABEL);
         break;
+    case PART_MGR_PARTITION_TYPE_NVS:
+        found_partition = esp_partition_find_first(NVS_PARTITION_TYPE, NVS_PARTITION_SUBTYPE, NVS_PARTITION_LABEL);
+        break;
     default:
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -54,6 +57,12 @@ esp_err_t part_mgr_get_partition(part_mgr_partition_type_t type, esp_partition_t
         break;
     case PART_MGR_PARTITION_TYPE_LITTLEFS:
         if (found_partition->type != LITTLEFS_PARTITION_TYPE || found_partition->subtype != LITTLEFS_PARTITION_SUBTYPE)
+        {
+            return ESP_ERR_NOT_FOUND;
+        }
+        break;
+    case PART_MGR_PARTITION_TYPE_NVS:
+        if (found_partition->type != NVS_PARTITION_TYPE || found_partition->subtype != NVS_PARTITION_SUBTYPE)
         {
             return ESP_ERR_NOT_FOUND;
         }

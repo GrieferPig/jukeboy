@@ -9,10 +9,9 @@ void app_main(void)
     factory_app_main();
 #else
     // This is a normal OTA build
-    // ota_app_main();
+    ota_app_main();
 
     // Test fallback by crashing the app
-    hardfault();
-
+    // hardfault();
 #endif
 }

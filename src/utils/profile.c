@@ -49,7 +49,7 @@ void profiler_task(void *pvParameters)
     }
 }
 
-BaseType_t profiler_start()
+BaseType_t profiler_init()
 {
     // Create the profiler task
     return xTaskCreate(profiler_task, "Profiler", 4096, NULL, 5, &g_profileTaskHandle);

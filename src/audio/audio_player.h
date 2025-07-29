@@ -1,16 +1,7 @@
 #pragma once
 
 #include <stdint.h>
-
-#ifdef ESP32_WROOM
-#define I2S_BCK_PIN GPIO_NUM_26
-#define I2S_DOUT_PIN GPIO_NUM_22
-#define I2S_WS_PIN GPIO_NUM_25
-#else
-#define I2S_BCK_PIN GPIO_NUM_5
-#define I2S_DOUT_PIN GPIO_NUM_6
-#define I2S_WS_PIN GPIO_NUM_7
-#endif
+#include "pindef.h"
 
 // Enum for playback commands
 typedef enum
@@ -35,7 +26,7 @@ typedef struct
     union
     {
         int track_number;
-        int volume_shift; // Volume shift value for CMD_SET_VOLUME_SHIFT
+        int volume_shift;                // Volume shift value for CMD_SET_VOLUME_SHIFT
     } params;
 } AudioCommand;
 

@@ -1,0 +1,290 @@
+/*
+ * SPDX-FileCopyrightText: 2021-2022 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "soc/soc_caps.h"
+#include "esp_log.h"
+#include "esp_adc/adc_continuous.h"
+#include "driver/gpio.h"
+#include "driver/i2s_std.h"
+#include "esp_system.h"
+#include "pindef.h"
+#include "macros.h"
+
+#include "macros.h"
+#include "audio/audio_player.h"
+#include "audio/audio_internals.h" // Needed for task handles
+#include "utils/profile.h"
+#include "utils/serial_interface.h"
+
+// Define the GPIO pins for ADC reading
+#define ADC_CHANNEL_FIRST ADC_CHANNEL_3
+#define ADC_CHANNEL_SECOND ADC_CHANNEL_0
+
+// Define ADC configuration parameters
+#define READ_LEN 256
+#define ADC_UNIT ADC_UNIT_1
+#define ADC_CONV_MODE ADC_CONV_MODE_CONTINUOUS
+#define ADC_ATTEN ADC_ATTEN_DB_12
+
+// --- Sine Wave Configuration ---
+#define SAMPLE_RATE (44100)
+#define BITS_PER_SAMPLE (I2S_DATA_BIT_WIDTH_16BIT)
+#define SINE_WAVE_FREQ_HZ (440.0) // A4 note
+#define AMPLITUDE (16383 / 4)
+#define BUFFER_SIZE_BYTES (1024)
+
+static const char *TAG = "ADC_CONTINUOUS_EXAMPLE";
+
+// ADC channel configuration
+static adc_channel_t channel[2] = {ADC_CHANNEL_FIRST, ADC_CHANNEL_SECOND};
+
+// I2S channel handle
+static i2s_chan_handle_t tx_handle;
+
+// GPIOs to read every 200 ms
+static const gpio_num_t input_pins[] = {
+    GPIO_NUM_34, GPIO_NUM_35, GPIO_NUM_32, GPIO_NUM_25,
+    GPIO_NUM_26, GPIO_NUM_27, GPIO_NUM_14, GPIO_NUM_13};
+
+// Callback function for when a conversion frame is done
+// This is optional but useful for debugging or complex applications.
+static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data)
+{
+    // In this example, we don't do anything in the callback.
+    // In a real application, you could use this to signal a task that data is ready.
+    return false;
+}
+
+/**
+ * @brief Task to generate and write sine wave data to I2S
+ *
+ * This task generates sine wave data and writes it to the I2S TX channel
+ * in stereo format (left and right channels). It uses a phase accumulator
+ * to prevent floating point precision issues over time.
+ */
+void sine_wave_task(void *pvParameters)
+{
+    int16_t *sine_buffer = (int16_t *)malloc(BUFFER_SIZE_BYTES);
+    if (!sine_buffer)
+    {
+        printf("Failed to allocate memory for sine buffer\n");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    size_t bytes_written = 0;
+    // Phase accumulator and step for continuous sine wave generation
+    double phase = 0.0;
+    double phase_step = 2.0 * M_PI * SINE_WAVE_FREQ_HZ / SAMPLE_RATE;
+
+    printf("Sine wave task started. Generating stereo audio...\n");
+
+    while (1)
+    {
+        // Generate a chunk of the sine wave for stereo output
+        // The loop iterates over stereo frames (L/R pairs)
+        for (int i = 0; i < (BUFFER_SIZE_BYTES / sizeof(int16_t) / 2); i++)
+        {
+            // Calculate the sample value from the current phase
+            int16_t sample_value = (int16_t)(AMPLITUDE * sin(phase));
+
+            // Write the same sample to both left and right channels for a dual-mono output
+            sine_buffer[i * 2] = sample_value;     // Left channel
+            sine_buffer[i * 2 + 1] = sample_value; // Right channel
+
+            // Increment phase and wrap around 2*PI to avoid large numbers
+            phase += phase_step;
+            if (phase >= 2.0 * M_PI)
+            {
+                phase -= 2.0 * M_PI;
+            }
+        }
+
+        // Write the generated stereo data to the I2S channel
+        esp_err_t err = i2s_channel_write(tx_handle, sine_buffer, BUFFER_SIZE_BYTES, &bytes_written, portMAX_DELAY);
+        if (err != ESP_OK)
+        {
+            printf("I2S write failed: %s\n", esp_err_to_name(err));
+        }
+        if (bytes_written != BUFFER_SIZE_BYTES)
+        {
+            printf("I2S write timeout. Wrote %d bytes.\n", bytes_written);
+        }
+    }
+
+    // This part is unreachable but good practice
+    free(sine_buffer);
+    vTaskDelete(NULL);
+}
+
+void ota_app_main(void)
+{
+    // Reconfigure LDO to be output and low
+    ESP_LOGI(TAG, "Reconfiguring LDO_EN_GPIO to output and low");
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << LDO_EN_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE};
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    unwrap_esp_err(gpio_set_level(LDO_EN_GPIO, 0), "Failed to set LDO_EN_GPIO level");
+    ESP_LOGI(TAG, "LDO_EN_GPIO configured to low");
+
+    // Initialize I2S
+    ESP_LOGI(TAG, "Starting I2S Stereo Sine Wave Example");
+
+    // 1. Create a new I2S channel
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, NULL));
+
+    // 2. Configure the I2S channel for standard mode with stereo output
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(BITS_PER_SAMPLE, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED, // No MCLK pin
+            .bclk = I2S_BCK_PIN,
+            .ws = I2S_WS_PIN,
+            .dout = I2S_DOUT_PIN,
+            .din = I2S_GPIO_UNUSED, // Not used
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &std_cfg));
+
+    // 3. Enable the I2S channel before writing data
+    ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
+
+    // 4. Create the task that generates and writes the sine wave
+    xTaskCreate(sine_wave_task, "sine_wave_task", 4096, NULL, 5, NULL);
+
+    // Variable to hold the ADC continuous mode handle
+    adc_continuous_handle_t handle = NULL;
+
+    // --- 1. ADC Continuous Mode Handle Initialization ---
+    adc_continuous_handle_cfg_t adc_config = {
+        .max_store_buf_size = 1024,
+        .conv_frame_size = READ_LEN,
+    };
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &handle));
+    ESP_LOGI(TAG, "ADC handle created.");
+
+    // --- 2. ADC Continuous Mode Configuration ---
+    adc_continuous_config_t dig_cfg = {
+        .sample_freq_hz = 20 * 1000, // 20 kHz
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1,
+        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
+    };
+
+    adc_digi_pattern_config_t adc_pattern[SOC_ADC_PATT_LEN_MAX] = {0};
+    dig_cfg.pattern_num = 2;    // Changed from 1 to 2 for two channels
+    for (int i = 0; i < 2; i++) // Changed from 1 to 2
+    {
+        adc_pattern[i].atten = ADC_ATTEN;
+        adc_pattern[i].channel = channel[i] & 0x7;
+        adc_pattern[i].unit = ADC_UNIT;
+        adc_pattern[i].bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
+
+        ESP_LOGI(TAG, "adc_pattern[%d].atten is :%x", i, adc_pattern[i].atten);
+        ESP_LOGI(TAG, "adc_pattern[%d].channel is :%x", i, adc_pattern[i].channel);
+        ESP_LOGI(TAG, "adc_pattern[%d].unit is :%x", i, adc_pattern[i].unit);
+    }
+    dig_cfg.adc_pattern = adc_pattern;
+    ESP_ERROR_CHECK(adc_continuous_config(handle, &dig_cfg));
+    ESP_LOGI(TAG, "ADC configuration set.");
+
+    // --- 3. Register Callbacks (Optional) ---
+    adc_continuous_evt_cbs_t cbs = {
+        .on_conv_done = s_conv_done_cb,
+    };
+    ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(handle, &cbs, NULL));
+    ESP_LOGI(TAG, "Callbacks registered.");
+
+    // --- 4. Start ADC Continuous Conversion ---
+    ESP_ERROR_CHECK(adc_continuous_start(handle));
+    ESP_LOGI(TAG, "ADC continuous mode started.");
+
+    // --- 5. Main Loop to Read Data ---
+    // Buffer to store the results
+    uint8_t result[READ_LEN] = {0};
+    // Variable to store the number of bytes read
+    uint32_t ret_num = 0;
+
+    // Configure GPIO inputs (avoid redefinition of io_conf)
+    gpio_config_t io_conf_inputs = {
+        .pin_bit_mask =
+            (1ULL << GPIO_NUM_34) | (1ULL << GPIO_NUM_35) |
+            (1ULL << GPIO_NUM_32) | (1ULL << GPIO_NUM_25) |
+            (1ULL << GPIO_NUM_26) | (1ULL << GPIO_NUM_27) |
+            (1ULL << GPIO_NUM_14) | (1ULL << GPIO_NUM_13),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE};
+    gpio_config(&io_conf_inputs);
+
+    // Variables to hold last ADC readings
+    uint32_t last_data_first = 0;
+    uint32_t last_data_second = 0;
+
+    while (1)
+    {
+        // Read the conversion results
+        esp_err_t ret = adc_continuous_read(handle, result, READ_LEN, &ret_num, 0);
+
+        if (ret == ESP_OK)
+        {
+            // Update last readings for each channel
+            for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES)
+            {
+                adc_digi_output_data_t *p = (adc_digi_output_data_t *)&result[i];
+                if (p->type1.channel == ADC_CHANNEL_FIRST)
+                {
+                    last_data_first = p->type1.data;
+                }
+                else if (p->type1.channel == ADC_CHANNEL_SECOND)
+                {
+                    last_data_second = p->type1.data;
+                }
+            }
+        }
+        else if (ret == ESP_ERR_TIMEOUT)
+        {
+            // This can happen if the read timeout is set to 0 and no data is available.
+            // It's not necessarily an error.
+        }
+
+        // Print both ADC channels once per 200 ms cycle
+        ESP_LOGI(TAG, "ADC Ch[%d]: %d, Ch[%d]: %d",
+                 ADC_CHANNEL_FIRST, last_data_first,
+                 ADC_CHANNEL_SECOND, last_data_second);
+
+        // Read digital GPIOs and print levels
+        for (int i = 0; i < sizeof(input_pins) / sizeof(input_pins[0]); i++)
+        {
+            int lvl = gpio_get_level(input_pins[i]);
+            ESP_LOGI(TAG, "GPIO[%d] Level: %d", input_pins[i], lvl);
+        }
+
+        // Delay to match GPIO polling rate
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    // --- 6. Stop and Deinitialize ADC (This part is not reached in this example) ---
+    ESP_ERROR_CHECK(adc_continuous_stop(handle));
+    ESP_LOGI(TAG, "ADC continuous mode stopped.");
+    ESP_ERROR_CHECK(adc_continuous_deinit(handle));
+    ESP_LOGI(TAG, "ADC handle de-initialized.");
+}

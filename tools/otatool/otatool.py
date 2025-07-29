@@ -32,6 +32,7 @@ PARTITION_TYPE = {
     "app": b"\x00",  # PART_MGR_PARTITION_TYPE_APP
     "otadata": b"\x01",  # PART_MGR_PARTITION_TYPE_OTADATA
     "littlefs": b"\x02",  # PART_MGR_PARTITION_TYPE_LITTLEFS
+    "nvs": b"\x03",  # PART_MGR_PARTITION_TYPE_NVS
 }
 
 # Global event for command completion
@@ -70,7 +71,7 @@ async def connect_to_device(device_name):
 
     print(f"✅ Found device: {device.name} ({device.address})")
 
-    client = BleakClient(device)
+    client = BleakClient(device, winrt={"use_cached_services": False})
     try:
         await client.connect()
         if not client.is_connected:
@@ -303,8 +304,8 @@ def main():
     parser.add_argument(
         "--name",
         "-n",
-        default="tj_needs_your_help",
-        help="BLE device name (default: tj_needs_your_help)",
+        default="jb_needs_your_help",
+        help="BLE device name (default: jb_needs_your_help)",
     )
 
     subparsers = parser.add_subparsers(
@@ -330,8 +331,8 @@ def main():
         "--partition",
         "-p",
         required=True,
-        choices=["app", "littlefs"],
-        help="Partition to erase (app or littlefs)",
+        choices=["app", "littlefs", "nvs"],
+        help="Partition to erase (app, littlefs, or nvs)",
     )
 
     # Verify command

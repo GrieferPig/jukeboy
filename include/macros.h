@@ -56,3 +56,14 @@
             }                                                                          \
         }                                                                              \
     }
+
+// Return an error to the upper level caller
+// Function must be defined to return esp_err_t
+#define throw_esp_err(result, msg, ...)            \
+    {                                              \
+        if (result != ESP_OK)                      \
+        {                                          \
+            ESP_LOGE("THROW", msg, ##__VA_ARGS__); \
+            return result;                         \
+        }                                          \
+    }

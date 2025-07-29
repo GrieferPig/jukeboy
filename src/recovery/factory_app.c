@@ -12,8 +12,10 @@
 #include "ble_serv.h"
 #include "pindef.h"
 #include "driver/gpio.h"
+#include "led/led_mgr.h"
 
-const char *TAG = "factory_app";
+static const char *TAG = "factory_app";
+#define bootloader_ver "1.0.0"
 
 // panic counter in NVS
 #define PANIC_MAX_RETRIES 3
@@ -32,24 +34,60 @@ void recovery_mode(void);
     }
 
 // Button used to enter recovery mode, ext pulled up
-#define REC_BUTTON_GPIO BTN2_GPIO // GPIO 0 for recovery button
+#define REC_BUTTON_GPIO BTN2_GPIO      // BTN 2 for recovery button
+#define REC_EXIT_BUTTON_GPIO BTN3_GPIO // BTN 3 for exit recovery button
 
 void factory_app_main(void)
 {
+    ESP_LOGI(TAG, "Starting third stage bootloader: version %s", bootloader_ver);
+    // Initialize LED Manager first
+    esp_err_t led_ret = led_mgr_init();
+    if (led_ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to initialize LED Manager: %s", esp_err_to_name(led_ret));
+        // Continue without LED functionality
+    }
+
+    // initialize i2s pins to output 0 to avoid noise
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << I2S_BCK_PIN) | (1ULL << I2S_WS_PIN) | (1ULL << I2S_DOUT_PIN),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE};
+    gpio_config(&io_conf);
+    gpio_set_level(I2S_BCK_PIN, 0);
+    gpio_set_level(I2S_WS_PIN, 0);
+    gpio_set_level(I2S_DOUT_PIN, 0);
+
     // Check whether rec buttons are pressed
     gpio_set_direction(REC_BUTTON_GPIO, GPIO_MODE_INPUT);
     if (gpio_get_level(REC_BUTTON_GPIO) == 0)
     {
-        // need to be held for 3 seconds
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        if (gpio_get_level(REC_BUTTON_GPIO) == 0)
+        ESP_LOGI(TAG, "Recovery button detected pressed, setting LED to purple");
+        led_color_t purple_color = LED_COLOR_PURPLE;
+        led_mgr_set_color(purple_color);
+
+        int held = 1;
+        for (int i = 0; i < 30; ++i) // 30 * 100ms = 3 seconds
         {
-            ESP_LOGI(TAG, "Recovery button pressed, entering recovery mode.");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (gpio_get_level(REC_BUTTON_GPIO) != 0)
+            {
+                held = 0;
+                break;
+            }
+        }
+        if (held)
+        {
+            ESP_LOGI(TAG, "Recovery button pressed for 3 seconds, entering recovery mode.");
             recovery_mode();
         }
         else
         {
             ESP_LOGI(TAG, "Recovery button released too early, not entering recovery mode.");
+            // Turn off LED since we're not entering recovery mode
+            led_mgr_turn_off();
         }
     }
     else
@@ -115,6 +153,10 @@ void factory_app_main(void)
             nvs_set_i32(nvs_handle, NVS_KEY_PANIC_COUNTER, panic_counter);
             nvs_commit(nvs_handle);
             nvs_close(nvs_handle);
+
+            // Turn off LED before entering recovery mode
+            led_mgr_turn_off();
+
             recovery_mode();
         }
         break;
@@ -129,6 +171,9 @@ void factory_app_main(void)
 
     nvs_close(nvs_handle);
 
+    // Turn off LED before continuing to OTA app
+    led_mgr_turn_off();
+
     // Find the next available OTA partition (which is ota_0 in our case)
     const esp_partition_t *ota_partition = esp_ota_get_next_update_partition(NULL);
     enter_rec_when(ota_partition == NULL, "No OTA partition found.");
@@ -138,6 +183,11 @@ void factory_app_main(void)
     enter_rec_when(err != ESP_OK, "Failed to set boot partition: %s.", esp_err_to_name(err));
 
     ESP_LOGI(TAG, "Booting into main app (ota_0) for a single run...");
+
+    // Turn off LED before restart
+    led_mgr_turn_off();
+    vTaskDelay(pdMS_TO_TICKS(100)); // Small delay to ensure LED turns off
+
     esp_restart();
 }
 
@@ -145,18 +195,26 @@ void recovery_mode(void)
 {
     ESP_LOGI(TAG, "Entering recovery mode...");
 
+    // Start flashing purple LED in recovery mode
+    led_color_t purple_color = LED_COLOR_PURPLE;
+    led_mgr_start_flash(purple_color);
+
     // Initialize BLE service as the last step in recovery mode
     ble_serv_init();
 
     ESP_LOGI(TAG, "BLE service initialized. Recovery mode ready for OTA updates.");
 
-    // Keep the device in recovery mode - don't restart
-    // The BLE service will handle OTA updates
-    while (1)
+    // Poll if the recovery exit button is pressed
+    while (gpio_get_level(REC_EXIT_BUTTON_GPIO) == 1)
     {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
+    // Button pressed, exit recovery mode
 
-    // esp_restart();
+    // Turn off LED before restart
+    led_mgr_turn_off();
+    vTaskDelay(pdMS_TO_TICKS(100)); // Small delay to ensure LED turns off
+
+    esp_restart();
 }
 #endif // BUILD_FACTORY_APP
