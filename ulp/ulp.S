@@ -29,7 +29,10 @@ entry:
     ADC r0, ADC_UNIT, BAT_ADC_PAD
     // Load ADC value address
     MOVE r1, adc_value
-    // Check if ADC value is above threshold
+    // Check if ADC value is below critical threshold
+    JUMPR suicide, BAT_ADC_CRITICAL_THRESHOLD, LT
+    // JUMP suicide
+    // Check if ADC value is above wakeup threshold
     JUMPR exit, BAT_ADC_WAKEUP_THRESHOLD, LT
     // Store ADC value
     ST r0, r1, 0
@@ -66,6 +69,9 @@ wakeup:
     AND R0, R0,1
     JUMP wakeup, eq
     WAKE
+    // Stop Wakeup timer
+    WRITE_RTC_FIELD(RTC_CNTL_STATE0_REG, RTC_CNTL_ULP_CP_SLP_TIMER_EN, 0)
+    HALT
 
 wakeup_exit:
     // Wakeup attempted
@@ -79,4 +85,12 @@ exit:
     MOVE r0, 0xdead
     MOVE r1, prog_status
     ST r0, r1, 0
+    HALT
+
+suicide:
+    // disable LDO EN hold
+    WRITE_RTC_FIELD(ADC_RTCIO_REG, RTCIO_RTC_GPIO_PIN12_HOLD, 0)
+    // turn off LDO EN pin
+    WRITE_RTC_REG(RTC_GPIO_OUT_W1TC_REG, LDO_EN_RTC_GPIO_OFFSET + RTC_GPIO_OUT_DATA_W1TC_S, 1, 1)
+    WRITE_RTC_FIELD(RTC_CNTL_STATE0_REG, RTC_CNTL_ULP_CP_SLP_TIMER_EN, 0)
     HALT

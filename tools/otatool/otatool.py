@@ -3,8 +3,16 @@ import zlib
 import hashlib
 import os
 import argparse
-from bleak import BleakClient, BleakScanner
-from bleak.exc import BleakError
+
+# Check whether bleak is installed
+try: 
+    from bleak import BleakClient, BleakScanner
+    from bleak.exc import BleakError
+except ImportError:
+    # Install bleak
+    os.system("pip install bleak")
+    from bleak import BleakClient, BleakScanner
+    from bleak.exc import BleakError
 
 # --- UUID definitions ---
 OTA_SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"

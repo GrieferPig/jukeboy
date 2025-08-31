@@ -49,6 +49,7 @@
         "esp_sleep.h": "c",
         "ulp_main.h": "c",
         "led_mgr.h": "c",
-        "esp_err.h": "c"
+        "esp_err.h": "c",
+        "rtc_io_reg.h": "c"
     }
 }

@@ -1,5 +1,6 @@
 #include "led_mgr.h"
 #include "pindef.h"
+#include "power_mgr.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -142,6 +143,9 @@ esp_err_t led_mgr_init(void)
     // Turn off LED initially
     ws2812_set_color_with_brightness((led_color_t)LED_COLOR_OFF, 0.0f);
 
+    // Clear tired bit since LED starts in OFF state
+    xEventGroupClearBits(power_mgr_tired_event_group, LED_TIRED_BIT);
+
     // Create LED task
     BaseType_t task_ret = xTaskCreate(
         led_task,
@@ -279,6 +283,9 @@ static void led_task(void *pvParameters)
                 ESP_LOGI(TAG, "Setting color: R=%d, G=%d, B=%d",
                          event.color.r, event.color.g, event.color.b);
 
+                // Set tired bit to prevent sleep while LED is active
+                xEventGroupSetBits(power_mgr_tired_event_group, LED_TIRED_BIT);
+
                 // If LED is off, start fade in
                 if (led_ctx.state == LED_STATE_OFF)
                 {
@@ -307,6 +314,10 @@ static void led_task(void *pvParameters)
             case LED_EVENT_START_FLASH:
                 ESP_LOGI(TAG, "Starting flash: R=%d, G=%d, B=%d",
                          event.color.r, event.color.g, event.color.b);
+
+                // Set tired bit to prevent sleep while LED is flashing
+                xEventGroupSetBits(power_mgr_tired_event_group, LED_TIRED_BIT);
+
                 led_ctx.flash_color = event.color;
                 led_ctx.state = LED_STATE_FLASHING;
                 led_ctx.flash_start_time = esp_timer_get_time() / 1000; // Convert to ms
@@ -388,6 +399,9 @@ static void led_task(void *pvParameters)
                 led_ctx.current_brightness = 0.0f;
                 led_ctx.current_color = (led_color_t)LED_COLOR_OFF;
                 led_ctx.target_color = (led_color_t)LED_COLOR_OFF;
+
+                // Clear tired bit to allow sleep when LED is completely off
+                xEventGroupClearBits(power_mgr_tired_event_group, LED_TIRED_BIT);
             }
             else
             {

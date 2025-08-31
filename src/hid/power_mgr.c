@@ -12,6 +12,7 @@
 #include "ulp_main.h"
 #include <esp32/ulp.h>
 #include <esp_sleep.h>
+#include "hid_mgr.h"
 
 static const char *TAG = "POWER_MGR";
 
@@ -28,6 +29,8 @@ extern const uint8_t ulp_main_bin_end[] asm("_binary_ulp_main_bin_end");
 
 void power_mgr_deep_sleep()
 {
+    // Kill hid_mgr task
+    hid_mgr_deinit();
     // Acquire adc mutex to prevent conflict
     xSemaphoreTake(adc_mutex, portMAX_DELAY);
     unwrap_esp_err(ulp_load_binary(0, ulp_main_bin_start, (ulp_main_bin_end - ulp_main_bin_start) / sizeof(uint32_t)), "Failed to load ULP binary");
@@ -64,6 +67,8 @@ void power_mgr_deep_sleep()
     unwrap_esp_err(ulp_set_wakeup_period(0, 100 * 1000), "Failed to set ULP wakeup period");
     unwrap_esp_err(esp_sleep_enable_ulp_wakeup(), "Failed to enable ULP wakeup");
     unwrap_esp_err(ulp_run(&ulp_entry - RTC_SLOW_MEM), "Failed to run ULP program");
+    unwrap_esp_err(rtc_gpio_hold_en(LDO_EN_GPIO), "Failed to hold LDO_EN_GPIO");
+
     ESP_LOGW(TAG, "Entering deep sleep");
     vTaskDelay(pdMS_TO_TICKS(100)); // Allow time for log to flush
 
@@ -132,15 +137,16 @@ esp_err_t power_mgr_init(void)
     ESP_LOGI(TAG, "Initializing power manager...");
 
     // Keep LDO enabled
-    gpio_set_level(LDO_EN_GPIO, 1);
-    gpio_hold_en(LDO_EN_GPIO);
-    gpio_deep_sleep_hold_en();
+    rtc_gpio_set_level(LDO_EN_GPIO, 1);
 
     // Kill ULP processor
     ulp_timer_stop();
 
     // Initialize the event group for power manager tired events
     power_mgr_tired_event_group = xEventGroupCreate();
+
+    // Pre-set main task tired bit
+    xEventGroupSetBits(power_mgr_tired_event_group, MAIN_TIRED_BIT);
 
     // Initialize ADC mutex
     adc_mutex = xSemaphoreCreateMutex();
@@ -149,10 +155,6 @@ esp_err_t power_mgr_init(void)
         ESP_LOGE(TAG, "Failed to create ADC mutex");
         return ESP_ERR_NO_MEM;
     }
-
-    // Set initial bits for all tasks
-    // xEventGroupSetBits(power_mgr_tired_event_group, AUDIO_PLAYER_TIRED_BIT | HID_TIRED_BIT | MAIN_TIRED_BIT);
-    xEventGroupSetBits(power_mgr_tired_event_group, HID_TIRED_BIT | MAIN_TIRED_BIT);
 
     // --- 1. ADC One-Shot Mode Initialization ---
     adc_oneshot_unit_init_cfg_t init_cfg = {
@@ -192,7 +194,7 @@ esp_err_t power_mgr_init(void)
     gpio_config(&ldo_en_cfg);
 
     // --- 4. Create the power manager task ---
-    BaseType_t task_ret = xTaskCreate(power_mgr_task, "power_mgr_task", 2048, NULL, 5, &power_mgr_task_handle);
+    BaseType_t task_ret = xTaskCreate(power_mgr_task, "power_mgr_task", 4096, NULL, 5, &power_mgr_task_handle);
     if (task_ret != pdPASS)
     {
         ESP_LOGE(TAG, "Failed to create power manager task");

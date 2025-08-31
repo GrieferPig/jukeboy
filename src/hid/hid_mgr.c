@@ -38,7 +38,7 @@ static const button_config_t button_configs[] = {
 
 // Queue for button events
 static QueueHandle_t button_queue = NULL;
-static TaskHandle_t hid_task_handle = NULL;
+TaskHandle_t hid_task_handle = NULL;
 
 // Restart combination tracking
 static bool button_states[NUM_BUTTONS] = {false};
@@ -261,15 +261,15 @@ esp_err_t hid_mgr_init(void)
     ret = gpio_config(&io_conf);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to configure GPIO pins");
+        ESP_LOGE(TAG, "Failed to configure GPIO pins, ret=%d", ret);
         goto cleanup;
     }
 
     // Install GPIO ISR service
     ret = gpio_install_isr_service(0);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+    if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to install GPIO ISR service");
+        ESP_LOGE(TAG, "Failed to install GPIO ISR service, ret=%d", ret);
         goto cleanup;
     }
 
@@ -327,14 +327,30 @@ esp_err_t hid_mgr_deinit(void)
         hid_task_handle = NULL;
     }
 
+    // Turns out resetting pins prevents the system from being woken up
+    // Espressif, excuse me?
+    // for (int i = 0; i < NUM_BUTTONS; i++)
+    // {
+    //     gpio_reset_pin(button_configs[i].gpio_num);
+    // }
+
     // Remove ISR handlers
     for (int i = 0; i < NUM_BUTTONS; i++)
     {
-        gpio_isr_handler_remove(button_configs[i].gpio_num);
+        esp_err_t ret = gpio_isr_handler_remove(button_configs[i].gpio_num);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to remove ISR handler for %s, ret=%d", button_configs[i].name, ret);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Removed ISR handler for %s", button_configs[i].name);
+        }
     }
 
+    // Can't do this either
     // Uninstall GPIO ISR service
-    gpio_uninstall_isr_service();
+    // gpio_uninstall_isr_service();
 
     // Delete queue
     if (button_queue != NULL)
@@ -344,7 +360,7 @@ esp_err_t hid_mgr_deinit(void)
     }
 
     // Deinitialize LED Manager
-    led_mgr_deinit();
+    // led_mgr_deinit();
 
     ESP_LOGI(TAG, "HID Manager deinitialized");
     return ESP_OK;

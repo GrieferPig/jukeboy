@@ -9,7 +9,7 @@
  * This function sets up GPIO interrupts for buttons BTN1-BTN6 and starts
  * a task to handle button press events. The buttons are mapped as follows:
  * - BTN1: Previous track
- * - BTN2: Pause/Unpause
+ * - BTN2: Pause/Unpausef
  * - BTN3: Next track
  * - BTN4: Toggle shuffle
  * - BTN5: Volume down

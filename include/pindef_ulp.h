@@ -1,4 +1,5 @@
 #pragma once
+#include <soc/rtc_io_reg.h>
 // Use READ_RTC_REG (RTC_GPIO_IN_REG, RTC_GPIO_IN_NEXT_S, 16)
 // As ULP register can only read 16 bits at a time,
 // for exception pins, use READ_RTC_REG (RTC_GPIO_IN_REG, RTC_GPIO_IN_NEXT_S + 16, 2)
@@ -22,4 +23,6 @@
 #define STDBY_ADC_PAD (3 + 1) // Pad 4, channel 3
 
 #define ADC_UNIT 0 // ADC unit 1
-#define BAT_ADC_WAKEUP_THRESHOLD 2700
+#define BAT_ADC_WAKEUP_THRESHOLD 2750
+#define BAT_ADC_CRITICAL_THRESHOLD 2700
+#define ADC_RTCIO_REG RTCIO_RTC_GPIO_PIN13_REG

@@ -16,7 +16,9 @@
 #include <dirent.h>
 #include <string.h>
 #include <ctype.h>
-#include <stdlib.h> // for malloc, abort()
+#include <stdlib.h>
+#include "../hid/power_mgr.h"
+#include "soc/rtc.h" // For RTC_SLOW_ATTR
 
 // --- Constants and Globals ---
 static const char *TAG = "AudioPlayer";
@@ -25,6 +27,22 @@ static const char *TAG = "AudioPlayer";
 #define TJA_HEADER_SIZE 512U
 #define ADPCM_BLOCK_SIZE 44032U
 #define I2S_WRITE_CHUNK_SIZE 2048U
+#define MAX_PLAYLIST_TRACKS 256 // Maximum possible tracks (00.tja to FF.tja)
+#define RTC_STATE_MAGIC 0xDEADBEEF
+
+// --- RTC Persistent State ---
+typedef struct
+{
+    uint32_t magic;
+    uint8_t volume_level;
+    int current_track;
+    uint32_t current_position_ms;
+    bool shuffle_enabled;
+    int playlist_position;
+    int playlist[MAX_PLAYLIST_TRACKS];
+} rtc_playback_state_t;
+
+RTC_SLOW_ATTR static rtc_playback_state_t rtc_state;
 
 // --- Playback State Management ---
 typedef enum
@@ -55,10 +73,11 @@ TaskHandle_t playerTaskHandle = NULL;
 TaskHandle_t readerTaskHandle = NULL;
 TaskHandle_t decoderTaskHandle = NULL;
 i2s_chan_handle_t g_tx_handle = NULL; // Share I2S handle for pausing
-QueueHandle_t audio_command_queue;
-QueueHandle_t full_buffer_queue;
-QueueHandle_t empty_buffer_queue;
-EventGroupHandle_t player_event_group;
+QueueHandle_t audio_command_queue = NULL;
+QueueHandle_t full_buffer_queue = NULL;
+QueueHandle_t empty_buffer_queue = NULL;
+EventGroupHandle_t player_event_group = NULL;
+TimerHandle_t audio_can_sleep_timer = NULL;
 
 // Event bits for the event group
 #define TRACK_FINISHED_BIT (1 << 0)
@@ -74,8 +93,18 @@ static int16_t *i2s_write_chunk_buffer;
 void audio_player_task(void *pvParameters);
 void sd_reader_task(void *pvParameters);
 void decoder_task(void *pvParameters);
+static void save_playback_state();
 
 // --- Helper Functions ---
+
+/**
+ * @brief Callback for the audio player idle timer. Clears the tired bit.
+ */
+static void audio_can_sleep_timer_callback(TimerHandle_t xTimer)
+{
+    ESP_LOGI(TAG, "Audio player idle timer expired, clearing tired bit.");
+    xEventGroupClearBits(power_mgr_tired_event_group, AUDIO_PLAYER_TIRED_BIT);
+}
 
 /**
  * @brief Applies volume control to a PCM buffer using bit-shifting.
@@ -97,6 +126,9 @@ static inline void apply_gain(int16_t *pcm_buffer, size_t sample_count)
 static void stop_playback()
 {
     ESP_LOGI(TAG, "Stopping playback...");
+
+    // Save state before stopping
+    save_playback_state();
 
     // Signal tasks to exit if they are running
     g_playback_state = STATE_STOPPED;
@@ -138,6 +170,13 @@ static void stop_playback()
     xQueueSend(empty_buffer_queue, &buf_b_ptr, 0);
 
     ESP_LOGI(TAG, "Playback stopped and resources cleaned.");
+    // Clear tired bit
+    // Start a timer to clear the tired bit after a delay
+    if (audio_can_sleep_timer != NULL)
+    {
+        ESP_LOGI(TAG, "Starting 1-second idle timer before clearing tired bit.");
+        xTimerStart(audio_can_sleep_timer, 0);
+    }
 }
 
 /**
@@ -146,6 +185,14 @@ static void stop_playback()
  */
 static void start_playback(int track_number)
 {
+    // Stop the idle timer if it's running, as we are now active
+    if (audio_can_sleep_timer != NULL)
+    {
+        xTimerStop(audio_can_sleep_timer, 0);
+    }
+    // Set tired bit
+    xEventGroupSetBits(power_mgr_tired_event_group, AUDIO_PLAYER_TIRED_BIT);
+
     if (g_playback_state != STATE_STOPPED)
     {
         stop_playback();
@@ -215,7 +262,7 @@ static void create_shuffled_playlist()
     // Shuffle remaining tracks (Fisher-Yates shuffle)
     for (int i = g_total_tracks - 1; i > 1; i--)
     {
-        int j = 1 + (rand() % (i - 1 + 1)); // Random between 1 and i
+        int j = 1 + (rand() % (i)); // Random between 1 and i
         int temp = g_playlist[i];
         g_playlist[i] = g_playlist[j];
         g_playlist[j] = temp;
@@ -223,6 +270,87 @@ static void create_shuffled_playlist()
 
     g_playlist_position = 0;
     ESP_LOGI(TAG, "Created shuffled playlist, current track %d at position 0", g_current_track);
+}
+
+/**
+ * @brief Saves the current playback state to RTC memory.
+ */
+static void save_playback_state()
+{
+    if (g_total_tracks == 0)
+        return;
+
+    rtc_state.magic = RTC_STATE_MAGIC;
+    rtc_state.volume_level = g_volume_level;
+    rtc_state.current_track = g_current_track;
+    rtc_state.current_position_ms = g_current_position_ms;
+    rtc_state.shuffle_enabled = g_shuffle_enabled;
+    rtc_state.playlist_position = g_playlist_position;
+
+    if (g_shuffle_enabled && g_playlist)
+    {
+        memcpy(rtc_state.playlist, g_playlist, g_total_tracks * sizeof(int));
+    }
+
+    ESP_LOGI(TAG, "Playback state saved to RTC memory.");
+}
+
+/**
+ * @brief Loads playback state from RTC memory if available.
+ */
+static void load_playback_state()
+{
+    if (rtc_state.magic != RTC_STATE_MAGIC)
+    {
+        ESP_LOGI(TAG, "No valid playback state found in RTC memory.");
+        return;
+    }
+
+    // Check if the stored track is valid with the current file system
+    if (rtc_state.current_track < 0 || rtc_state.current_track >= g_total_tracks)
+    {
+        ESP_LOGW(TAG, "RTC state has invalid track number (%d). Ignoring.", rtc_state.current_track);
+        rtc_state.magic = 0; // Invalidate state
+        return;
+    }
+
+    g_volume_level = rtc_state.volume_level;
+    g_current_track = rtc_state.current_track;
+    g_current_position_ms = rtc_state.current_position_ms;
+    g_shuffle_enabled = rtc_state.shuffle_enabled;
+    g_playlist_position = rtc_state.playlist_position;
+
+    update_volume_shift(); // Apply loaded volume
+
+    if (g_shuffle_enabled)
+    {
+        if (!g_playlist)
+        {
+            g_playlist = (int *)malloc(g_total_tracks * sizeof(int));
+        }
+        if (g_playlist)
+        {
+            memcpy(g_playlist, rtc_state.playlist, g_total_tracks * sizeof(int));
+            ESP_LOGI(TAG, "Restored shuffled playlist from RTC.");
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Failed to allocate memory for restored playlist!");
+            g_shuffle_enabled = false; // Disable shuffle if allocation fails
+        }
+    }
+
+    // If there's a playback position, set up for a seek on the first play
+    if (g_current_position_ms > 0)
+    {
+        g_seek_position_ms = g_current_position_ms;
+        g_seek_requested = true;
+    }
+
+    ESP_LOGI(TAG, "Restored playback state from RTC: Track %d, Pos %lums, Vol %d, Shuffle %s",
+             g_current_track, g_current_position_ms, g_volume_level, g_shuffle_enabled ? "On" : "Off");
+
+    rtc_state.magic = 0; // Invalidate after loading to prevent re-loading stale data on next boot without a save
 }
 
 /**
@@ -502,6 +630,13 @@ void audio_player_task(void *pvParameters)
     {
         ESP_LOGW(TAG, "No tracks found. Player will be idle.");
         todo("report no tracks to the main application");
+        vTaskDelay(pdMS_TO_TICKS(100)); // flush the logs
+        vTaskDelete(NULL);
+    }
+    else
+    {
+        // Load persisted state from RTC memory now that we know total tracks
+        load_playback_state();
     }
 
     // Initialize volume
@@ -510,6 +645,8 @@ void audio_player_task(void *pvParameters)
     AudioCommand cmd;
 
     ESP_LOGI(TAG, "Audio Player control task ready. Waiting for commands...");
+    // Now it is certain that the player will start playing, set tired bit
+    xEventGroupSetBits(power_mgr_tired_event_group, AUDIO_PLAYER_TIRED_BIT);
 
     while (true)
     {
@@ -549,9 +686,23 @@ void audio_player_task(void *pvParameters)
                     {
                         ESP_LOGI(TAG, "CMD: PAUSE");
                     }
+                    // Save state on pause
+                    save_playback_state();
+                    // Start a timer to clear the tired bit after a delay
+                    if (audio_can_sleep_timer != NULL)
+                    {
+                        xTimerStart(audio_can_sleep_timer, 0);
+                    }
                 }
                 else if (g_playback_state == STATE_PAUSED)
                 {
+                    // Stop the idle timer if it's running
+                    if (audio_can_sleep_timer != NULL)
+                    {
+                        xTimerStop(audio_can_sleep_timer, 0);
+                    }
+                    // Set tired bit
+                    xEventGroupSetBits(power_mgr_tired_event_group, AUDIO_PLAYER_TIRED_BIT);
                     g_playback_state = STATE_PLAYING;
                     if (g_tx_handle)
                     {
@@ -690,6 +841,10 @@ void audio_player_init()
     player_event_group = xEventGroupCreate();
     panic_if(!player_event_group, "Failed to create event group.");
 
+    // Create the can sleep timer
+    audio_can_sleep_timer = xTimerCreate("audio_can_sleep_timer", pdMS_TO_TICKS(1000), pdFALSE, NULL, audio_can_sleep_timer_callback);
+    panic_if(!audio_can_sleep_timer, "Failed to create audio can sleep timer");
+
     // Create buffer queues and pre-fill the empty one
     full_buffer_queue = xQueueCreate(2, sizeof(uint8_t *));
     empty_buffer_queue = xQueueCreate(2, sizeof(uint8_t *));
@@ -714,8 +869,25 @@ void audio_player_init()
  */
 void audio_player_send_command(const AudioCommand *cmd)
 {
-    if (audio_command_queue != NULL)
+    if (cmd == NULL)
     {
-        xQueueSend(audio_command_queue, cmd, 0);
+        ESP_LOGE(TAG, "Cannot send NULL command");
+        return;
+    }
+
+    if (audio_command_queue == NULL)
+    {
+        ESP_LOGW(TAG, "Audio player not initialized, ignoring command type %d", cmd->type);
+        return;
+    }
+
+    BaseType_t result = xQueueSend(audio_command_queue, cmd, 0);
+    if (result != pdTRUE)
+    {
+        ESP_LOGW(TAG, "Failed to send command %d to audio player (queue full)", cmd->type);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Command %d sent successfully", cmd->type);
     }
 }

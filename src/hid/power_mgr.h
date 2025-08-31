@@ -1,5 +1,7 @@
 #pragma once
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 
 // Bits from other tasks that indicate whether the pm can sleep
 // Only if all bits are cleared, the power manager can sleep
@@ -10,6 +12,7 @@ typedef enum
     AUDIO_PLAYER_TIRED_BIT = BIT0, // Audio player
     HID_TIRED_BIT = BIT1,          // HID task
     MAIN_TIRED_BIT = BIT2,         // Main task (prevent deepsleep until everything is initialized)
+    LED_TIRED_BIT = BIT3,          // LED manager
 } power_mgr_tired_bits_t;
 
 esp_err_t power_mgr_init(void);
