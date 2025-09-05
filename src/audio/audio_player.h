@@ -16,6 +16,7 @@ typedef enum
     CMD_REWIND_5SEC,
     CMD_VOLUME_INC,
     CMD_VOLUME_DEC,
+    CMD_SHUTDOWN,  // New: Gracefully shut down the daemon task
     // Add other commands here
 } CommandType;
 
@@ -26,7 +27,7 @@ typedef struct
     union
     {
         int track_number;
-        int volume_shift;                // Volume shift value for CMD_SET_VOLUME_SHIFT
+        int volume_shift; // Volume shift value for CMD_SET_VOLUME_SHIFT
     } params;
 } AudioCommand;
 

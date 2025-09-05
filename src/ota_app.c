@@ -30,13 +30,5 @@ void ota_app_main()
     // Initialize profiler
     // unwrap_basetype(profiler_init(), "Failed to initialize profiler");
 
-    // Example: send a command to start playing track
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Wait a bit for initialization
-    ESP_LOGI(TAG, "Sending command to play track 0...");
-    AudioCommand play_cmd;
-    play_cmd.type = CMD_PLAY_TRACK;
-    play_cmd.params.track_number = 0;
-    audio_player_send_command(&play_cmd);
-
     power_mgr_notify_main_initialized(); // Notify the power manager that the main task is exiting
 }

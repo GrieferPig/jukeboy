@@ -67,7 +67,6 @@ void power_mgr_deep_sleep()
     unwrap_esp_err(ulp_set_wakeup_period(0, 100 * 1000), "Failed to set ULP wakeup period");
     unwrap_esp_err(esp_sleep_enable_ulp_wakeup(), "Failed to enable ULP wakeup");
     unwrap_esp_err(ulp_run(&ulp_entry - RTC_SLOW_MEM), "Failed to run ULP program");
-    unwrap_esp_err(rtc_gpio_hold_en(LDO_EN_GPIO), "Failed to hold LDO_EN_GPIO");
 
     ESP_LOGW(TAG, "Entering deep sleep");
     vTaskDelay(pdMS_TO_TICKS(100)); // Allow time for log to flush
@@ -137,7 +136,10 @@ esp_err_t power_mgr_init(void)
     ESP_LOGI(TAG, "Initializing power manager...");
 
     // Keep LDO enabled
+    rtc_gpio_init(LDO_EN_GPIO);
+    rtc_gpio_set_direction(LDO_EN_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
     rtc_gpio_set_level(LDO_EN_GPIO, 1);
+    rtc_gpio_hold_en(LDO_EN_GPIO);
 
     // Kill ULP processor
     ulp_timer_stop();
@@ -182,16 +184,6 @@ esp_err_t power_mgr_init(void)
         return ret;
     }
     ESP_LOGI(TAG, "ADC channel configured.");
-
-    // --- 3. Configure LDO_EN_GPIO as output ---
-    gpio_config_t ldo_en_cfg = {
-        .pin_bit_mask = (1ULL << LDO_EN_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&ldo_en_cfg);
 
     // --- 4. Create the power manager task ---
     BaseType_t task_ret = xTaskCreate(power_mgr_task, "power_mgr_task", 4096, NULL, 5, &power_mgr_task_handle);

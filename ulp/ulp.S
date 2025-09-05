@@ -26,16 +26,16 @@ entry:
     ST r0, r1, 0
 
     // Read from ADC
-    ADC r0, ADC_UNIT, BAT_ADC_PAD
+    // ADC r0, ADC_UNIT, BAT_ADC_PAD
     // Load ADC value address
-    MOVE r1, adc_value
+    // MOVE r1, adc_value
     // Check if ADC value is below critical threshold
-    JUMPR suicide, BAT_ADC_CRITICAL_THRESHOLD, LT
+    // JUMPR suicide, BAT_ADC_CRITICAL_THRESHOLD, LT
     // JUMP suicide
     // Check if ADC value is above wakeup threshold
-    JUMPR exit, BAT_ADC_WAKEUP_THRESHOLD, LT
+    // JUMPR exit, BAT_ADC_WAKEUP_THRESHOLD, LT
     // Store ADC value
-    ST r0, r1, 0
+    // ST r0, r1, 0
     
     // check for low byte buttons
     READ_RTC_REG(RTC_GPIO_IN_REG, RTC_GPIO_IN_NEXT_S, 16)
@@ -88,9 +88,4 @@ exit:
     HALT
 
 suicide:
-    // disable LDO EN hold
-    WRITE_RTC_FIELD(ADC_RTCIO_REG, RTCIO_RTC_GPIO_PIN12_HOLD, 0)
-    // turn off LDO EN pin
-    WRITE_RTC_REG(RTC_GPIO_OUT_W1TC_REG, LDO_EN_RTC_GPIO_OFFSET + RTC_GPIO_OUT_DATA_W1TC_S, 1, 1)
-    WRITE_RTC_FIELD(RTC_CNTL_STATE0_REG, RTC_CNTL_ULP_CP_SLP_TIMER_EN, 0)
     HALT

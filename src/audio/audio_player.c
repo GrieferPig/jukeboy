@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include "../hid/power_mgr.h"
 #include "soc/rtc.h" // For RTC_SLOW_ATTR
+#include "pindef.h"
 
 // --- Constants and Globals ---
 static const char *TAG = "AudioPlayer";
@@ -29,6 +30,9 @@ static const char *TAG = "AudioPlayer";
 #define I2S_WRITE_CHUNK_SIZE 2048U
 #define MAX_PLAYLIST_TRACKS 256 // Maximum possible tracks (00.tja to FF.tja)
 #define RTC_STATE_MAGIC 0xDEADBEEF
+
+// Add global SD card handle
+static sdmmc_card_t *g_card = NULL;
 
 // --- RTC Persistent State ---
 typedef struct
@@ -42,7 +46,7 @@ typedef struct
     int playlist[MAX_PLAYLIST_TRACKS];
 } rtc_playback_state_t;
 
-RTC_SLOW_ATTR static rtc_playback_state_t rtc_state;
+RTC_NOINIT_ATTR static rtc_playback_state_t rtc_state;
 
 // --- Playback State Management ---
 typedef enum
@@ -52,6 +56,12 @@ typedef enum
     STATE_PAUSED
 } PlaybackState;
 
+typedef enum
+{
+    INSERTED,
+    REMOVED,
+} CartPresenceState;
+
 volatile PlaybackState g_playback_state = STATE_STOPPED;
 volatile int g_current_track = 0;
 volatile int g_total_tracks = 0;
@@ -59,6 +69,9 @@ volatile uint8_t g_volume_shift = 2; // Default to 25% volume
 volatile uint8_t g_volume_level = 4; // Volume level 1-10, 11=mute
 volatile bool g_shuffle_enabled = false;
 volatile int g_playlist_position = 0;
+
+// Add flag to track SD initialization
+static bool g_sd_initialized = false;
 
 // Shuffle playlist: holds track indices in play order
 static int *g_playlist = NULL;
@@ -76,6 +89,7 @@ i2s_chan_handle_t g_tx_handle = NULL; // Share I2S handle for pausing
 QueueHandle_t audio_command_queue = NULL;
 QueueHandle_t full_buffer_queue = NULL;
 QueueHandle_t empty_buffer_queue = NULL;
+QueueHandle_t cart_presence_notify_queue = NULL;
 EventGroupHandle_t player_event_group = NULL;
 TimerHandle_t audio_can_sleep_timer = NULL;
 
@@ -94,6 +108,8 @@ void audio_player_task(void *pvParameters);
 void sd_reader_task(void *pvParameters);
 void decoder_task(void *pvParameters);
 static void save_playback_state();
+static void init_sd_if_needed();       // Forward declaration for helper function
+static void cleanup_on_cart_removal(); // Forward declaration for helper function
 
 // --- Helper Functions ---
 
@@ -174,7 +190,7 @@ static void stop_playback()
     // Start a timer to clear the tired bit after a delay
     if (audio_can_sleep_timer != NULL)
     {
-        ESP_LOGI(TAG, "Starting 1-second idle timer before clearing tired bit.");
+        ESP_LOGI(TAG, "Starting 15-second idle timer before clearing tired bit.");
         xTimerStart(audio_can_sleep_timer, 0);
     }
 }
@@ -539,7 +555,7 @@ void decoder_task(void *pvParameters)
 esp_err_t init_sdcard()
 {
     esp_err_t ret;
-    sdmmc_card_t *card = NULL;
+    // Remove local card declaration: sdmmc_card_t *card = NULL;
     const char *mount_point = "/sdcard";
 
     // Configure the SD card mount
@@ -572,7 +588,7 @@ esp_err_t init_sdcard()
     slot_config.host_id = SPI2_HOST;
 
     // Mount the SD card
-    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &g_card);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
@@ -592,85 +608,66 @@ void audio_player_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Audio Player control task started.");
 
-    // Initialize SD card
-    if (init_sdcard() != ESP_OK)
+    // Initial cart presence check (non-blocking setup)
+    CartPresenceState current_cart_state = gpio_get_level(CART_PRESENCE_GPIO) ? REMOVED : INSERTED;
+    if (current_cart_state == INSERTED)
     {
-        ESP_LOGE(TAG, "Failed to initialize SD card.");
-        vTaskDelete(NULL);
-        return;
+        init_sd_if_needed();
     }
 
-    int track_count = 0;
-
-    DIR *dir = opendir("/sdcard");
-    if (dir == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to open directory /sdcard");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL)
-    {
-        // ESP_LOGI(TAG, "Found file: %s", entry->d_name);
-        // Check for format "xx.tja" (e.g., "0A.tja", "1F.tja")
-        if (strlen(entry->d_name) == 6 &&
-            isxdigit(entry->d_name[0]) &&
-            isxdigit(entry->d_name[1]) &&
-            strcmp(entry->d_name + 2, ".TJA") == 0)
-        {
-            track_count++;
-        }
-    }
-    closedir(dir);
-    g_total_tracks = track_count;
-    ESP_LOGI(TAG, "Found %d tracks on SD card.", g_total_tracks);
-    if (g_total_tracks == 0)
-    {
-        ESP_LOGW(TAG, "No tracks found. Player will be idle.");
-        todo("report no tracks to the main application");
-        vTaskDelay(pdMS_TO_TICKS(100)); // flush the logs
-        vTaskDelete(NULL);
-    }
-    else
-    {
-        // Load persisted state from RTC memory now that we know total tracks
-        load_playback_state();
-    }
-
-    // Initialize volume
-    update_volume_shift();
-
-    AudioCommand cmd;
-
-    ESP_LOGI(TAG, "Audio Player control task ready. Waiting for commands...");
-    // Now it is certain that the player will start playing, set tired bit
-    xEventGroupSetBits(power_mgr_tired_event_group, AUDIO_PLAYER_TIRED_BIT);
-
+    // Main daemon loop
     while (true)
     {
-        // Wait for a command from the queue OR a track finished event
-        EventBits_t bits = xEventGroupWaitBits(player_event_group, TRACK_FINISHED_BIT, pdTRUE, pdFALSE, 0); // Check without waiting
-
-        if (bits & TRACK_FINISHED_BIT)
+        // Non-blocking check for cart presence changes
+        CartPresenceState new_state;
+        if (xQueueReceive(cart_presence_notify_queue, &new_state, 0) == pdPASS)
         {
-            ESP_LOGI(TAG, "Track finished event received. Advancing to next track.");
-            stop_playback();
-            int next_track = get_next_track();
-            start_playback(next_track);
+            if (new_state == REMOVED)
+            {
+                cleanup_on_cart_removal();
+                // Start/reset 15s timer
+                if (audio_can_sleep_timer)
+                {
+                    if (xTimerIsTimerActive(audio_can_sleep_timer))
+                    {
+                        xTimerStop(audio_can_sleep_timer, 0);
+                    }
+                    xTimerChangePeriod(audio_can_sleep_timer, pdMS_TO_TICKS(15000), 0);
+                    xTimerStart(audio_can_sleep_timer, 0);
+                }
+            }
+            else
+            {
+                // Cancel timer if active
+                if (audio_can_sleep_timer && xTimerIsTimerActive(audio_can_sleep_timer))
+                {
+                    xTimerStop(audio_can_sleep_timer, 0);
+                }
+                // Set tired bit and init SD
+                xEventGroupSetBits(power_mgr_tired_event_group, AUDIO_PLAYER_TIRED_BIT);
+                init_sd_if_needed();
+            }
         }
 
-        BaseType_t res = xQueueReceive(audio_command_queue, &cmd, pdMS_TO_TICKS(50));
-
-        if (res == pdPASS)
+        // Non-blocking check for commands
+        AudioCommand cmd;
+        if (xQueueReceive(audio_command_queue, &cmd, 0) == pdPASS)
         {
+            // Only process commands if SD is initialized and tracks exist (for relevant cmds)
+            bool can_process = g_sd_initialized && g_total_tracks > 0;
             switch (cmd.type)
             {
             case CMD_PLAY_TRACK:
-                ESP_LOGI(TAG, "CMD: PLAY_TRACK %d", cmd.params.track_number);
-                stop_playback();
-                start_playback(cmd.params.track_number);
+                if (can_process)
+                {
+                    ESP_LOGI(TAG, "CMD: PLAY_TRACK %d", cmd.params.track_number);
+                    stop_playback();
+                    start_playback(cmd.params.track_number);
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "Ignoring PLAY_TRACK: No tracks available.");
+                }
                 break;
 
             case CMD_TOGGLE_PAUSE:
@@ -801,12 +798,44 @@ void audio_player_task(void *pvParameters)
                     ESP_LOGI(TAG, "CMD: VOLUME_DEC - muted");
                 }
                 break;
+
+            case CMD_SHUTDOWN: // New command for graceful exit
+                ESP_LOGI(TAG, "CMD: SHUTDOWN - Exiting daemon.");
+                stop_playback();
+                vTaskDelete(NULL);
+                break;
+
             default:
                 ESP_LOGW(TAG, "Unknown command type: %d", cmd.type);
                 break;
             }
         }
+
+        // Check for track finished event (non-blocking)
+        EventBits_t bits = xEventGroupGetBits(player_event_group);
+        if (bits & TRACK_FINISHED_BIT)
+        {
+            xEventGroupClearBits(player_event_group, TRACK_FINISHED_BIT);
+            if (g_sd_initialized && g_total_tracks > 0)
+            {
+                ESP_LOGI(TAG, "Track finished. Advancing to next.");
+                stop_playback();
+                int next_track = get_next_track();
+                start_playback(next_track);
+            }
+        }
+
+        // Small delay to prevent busy-waiting
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
+
+static void IRAM_ATTR cart_presense_gpio_isr_handler(void *arg)
+{
+    // get the current state of the pin
+    CartPresenceState state = gpio_get_level(CART_PRESENCE_GPIO) ? REMOVED : INSERTED;
+    // Cart removed, request change to idle state
+    xQueueSendFromISR(cart_presence_notify_queue, &state, NULL);
 }
 
 // --- Public API Implementation ---
@@ -841,8 +870,8 @@ void audio_player_init()
     player_event_group = xEventGroupCreate();
     panic_if(!player_event_group, "Failed to create event group.");
 
-    // Create the can sleep timer
-    audio_can_sleep_timer = xTimerCreate("audio_can_sleep_timer", pdMS_TO_TICKS(1000), pdFALSE, NULL, audio_can_sleep_timer_callback);
+    // Create the can sleep timer (now 15 seconds for both idle and cart removal)
+    audio_can_sleep_timer = xTimerCreate("audio_can_sleep_timer", pdMS_TO_TICKS(15000), pdFALSE, NULL, audio_can_sleep_timer_callback);
     panic_if(!audio_can_sleep_timer, "Failed to create audio can sleep timer");
 
     // Create buffer queues and pre-fill the empty one
@@ -853,10 +882,25 @@ void audio_player_init()
     xQueueSend(empty_buffer_queue, &buf_a_ptr, 0);
     xQueueSend(empty_buffer_queue, &buf_b_ptr, 0);
 
-    // Register an interrupt on pin CART_PRESENCE
+    // Create task status change queue
+    cart_presence_notify_queue = xQueueCreate(2, sizeof(CartPresenceState));
+
+    // Register a low to high interrupt on pin CART_PRESENCE
     // when cart is removed, kill the player task
-    gpio_set_direction(CART_PRESENCE_GPIO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(CART_PRESENCE_GPIO, GPIO_PULLUP_ONLY);
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_ANYEDGE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << CART_PRESENCE_GPIO),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE, // External pull-up
+    };
+    gpio_config(&io_conf);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(CART_PRESENCE_GPIO, cart_presense_gpio_isr_handler, NULL);
+
+    // call ISR handler once to set initial state
+    cart_presense_gpio_isr_handler(NULL);
+    panic_if(uxQueueMessagesWaiting(cart_presence_notify_queue) == 0, "Failed to get initial cart presence state");
 
     // Create and start the main player control task
     xTaskCreate(audio_player_task, "AudioPlayerTask", 4096, NULL, 8, &playerTaskHandle);
@@ -881,6 +925,12 @@ void audio_player_send_command(const AudioCommand *cmd)
         return;
     }
 
+    if (!g_sd_initialized)
+    {
+        ESP_LOGW(TAG, "Cart not inserted, ignoring command type %d", cmd->type);
+        return;
+    }
+
     BaseType_t result = xQueueSend(audio_command_queue, cmd, 0);
     if (result != pdTRUE)
     {
@@ -889,5 +939,91 @@ void audio_player_send_command(const AudioCommand *cmd)
     else
     {
         ESP_LOGI(TAG, "Command %d sent successfully", cmd->type);
+    }
+}
+
+/**
+ * @brief Cleans up on cart removal.
+ */
+static void cleanup_on_cart_removal()
+{
+    stop_playback();
+    esp_err_t err = esp_vfs_fat_sdcard_unmount("/sdcard", g_card);
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "SD card unmounted.");
+        g_card = NULL; // Reset global handle
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to unmount SD card: %s (0x%x)", esp_err_to_name(err), err);
+    }
+    // Deinit SPI bus
+    if (spi_bus_free(SPI2_HOST) == ESP_OK)
+    {
+        ESP_LOGI(TAG, "SPI bus deinitialized.");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to deinitialize SPI bus.");
+    }
+    // Optionally unmount SD if supported, but for now just mark as uninitialized
+    g_sd_initialized = false;
+    g_total_tracks = 0;
+    ESP_LOGI(TAG, "Cart removed, cleaned up playback state.");
+}
+
+/**
+ * @brief Initializes SD card and scans tracks if cart is inserted.
+ */
+static void init_sd_if_needed()
+{
+    if (!g_sd_initialized)
+    {
+        if (init_sdcard() != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to initialize SD card. Will retry on next cart insertion.");
+            return;
+        }
+        g_sd_initialized = true;
+
+        // Scan tracks
+        int track_count = 0;
+        DIR *dir = opendir("/sdcard");
+        if (dir == NULL)
+        {
+            ESP_LOGE(TAG, "Failed to open directory /sdcard");
+            return;
+        }
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL)
+        {
+            if (strlen(entry->d_name) == 6 &&
+                isxdigit(entry->d_name[0]) &&
+                isxdigit(entry->d_name[1]) &&
+                strcmp(entry->d_name + 2, ".TJA") == 0)
+            {
+                track_count++;
+            }
+        }
+        closedir(dir);
+        g_total_tracks = track_count;
+        ESP_LOGI(TAG, "Found %d tracks on SD card.", g_total_tracks);
+
+        // Load persisted state if tracks exist
+        if (g_total_tracks > 0)
+        {
+            load_playback_state();
+            // Auto-play: start from saved track or first track
+            if (g_current_track >= 0 && g_current_track < g_total_tracks)
+            {
+                start_playback(g_current_track);
+            }
+            else
+            {
+                start_playback(0); // Fallback to first track
+            }
+        }
+        update_volume_shift();
     }
 }
