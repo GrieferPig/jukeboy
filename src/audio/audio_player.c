@@ -18,6 +18,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include "../hid/power_mgr.h"
+#include "../hid/hid_event_system.h"
 #include "soc/rtc.h" // For RTC_SLOW_ATTR
 #include "pindef.h"
 
@@ -133,6 +134,161 @@ static inline void apply_gain(int16_t *pcm_buffer, size_t sample_count)
     for (size_t i = 0; i < sample_count; ++i)
     {
         pcm_buffer[i] = pcm_buffer[i] >> shift;
+    }
+}
+
+esp_err_t init_sdcard()
+{
+    esp_err_t ret;
+    // Remove local card declaration: sdmmc_card_t *card = NULL;
+    const char *mount_point = "/sdcard";
+
+    // Configure the SD card mount
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024};
+
+    // Configure SPI bus
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = SD_MOSI_PIN,
+        .miso_io_num = SD_MISO_PIN,
+        .sclk_io_num = SD_SCK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+
+    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Configure SPI device
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = SD_CS_PIN;
+    slot_config.host_id = SPI2_HOST;
+
+    // Mount the SD card
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &g_card);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
+    }
+    else
+    {
+        ESP_LOGI(TAG, "SD card mounted successfully");
+    }
+    return ret;
+}
+
+/**
+ * @brief Button event handler for audio player
+ */
+static bool audio_player_button_handler(const hid_event_data_t *event, void *user_data)
+{
+    if (!g_sd_initialized || g_total_tracks == 0)
+    {
+        return false; // Don't consume event if we can't handle it
+    }
+
+    AudioCommand cmd = {0};
+    bool should_send_command = true;
+
+    // Map GPIO numbers to commands
+    if (event->gpio_num == BTN1_GPIO && event->event_type == HID_EVENT_PRESS)
+    {
+        cmd.type = CMD_NEXT_TRACK;
+    }
+    else if (event->gpio_num == BTN2_GPIO && event->event_type == HID_EVENT_PRESS)
+    {
+        cmd.type = CMD_TOGGLE_PAUSE;
+    }
+    else if (event->gpio_num == BTN3_GPIO && event->event_type == HID_EVENT_PRESS)
+    {
+        cmd.type = CMD_PREV_TRACK;
+    }
+    else if (event->gpio_num == BTN4_GPIO && event->event_type == HID_EVENT_PRESS)
+    {
+        cmd.type = CMD_TOGGLE_SHUFFLE;
+    }
+    else if (event->gpio_num == BTN5_GPIO && event->event_type == HID_EVENT_PRESS)
+    {
+        cmd.type = CMD_VOLUME_INC;
+    }
+    else if (event->gpio_num == BTN6_GPIO && event->event_type == HID_EVENT_PRESS)
+    {
+        cmd.type = CMD_VOLUME_DEC;
+    }
+    // Handle long press for seek operations
+    else if (event->gpio_num == BTN1_GPIO && event->event_type == HID_EVENT_LONG_PRESS)
+    {
+        cmd.type = CMD_FFWD_10SEC;
+    }
+    else if (event->gpio_num == BTN3_GPIO && event->event_type == HID_EVENT_LONG_PRESS)
+    {
+        cmd.type = CMD_REWIND_5SEC;
+    }
+    else
+    {
+        should_send_command = false;
+    }
+
+    if (should_send_command)
+    {
+        cmd.params.track_number = 0; // Default value
+
+        // Send command via internal queue instead of external API
+        if (audio_command_queue)
+        {
+            BaseType_t result = xQueueSend(audio_command_queue, &cmd, 0);
+            if (result == pdTRUE)
+            {
+                ESP_LOGI(TAG, "Audio command %d queued from button event", cmd.type);
+                return true; // Event consumed
+            }
+        }
+    }
+
+    return false; // Event not consumed
+}
+
+/**
+ * @brief Register audio player as button event listener
+ */
+static void register_audio_button_handlers(void)
+{
+    // Register for all buttons with medium priority (50)
+    // Higher priority handlers (like restart combo) can override
+    gpio_num_t buttons[] = {BTN1_GPIO, BTN2_GPIO, BTN3_GPIO, BTN4_GPIO, BTN5_GPIO, BTN6_GPIO};
+
+    for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+    {
+        esp_err_t ret = hid_event_register_listener(buttons[i], audio_player_button_handler, NULL, 50);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Failed to register button handler for GPIO %d: %s", buttons[i], esp_err_to_name(ret));
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Registered audio button handler for GPIO %d", buttons[i]);
+        }
+    }
+}
+
+/**
+ * @brief Unregister audio player button handlers
+ */
+static void unregister_audio_button_handlers(void)
+{
+    gpio_num_t buttons[] = {BTN1_GPIO, BTN2_GPIO, BTN3_GPIO, BTN4_GPIO, BTN5_GPIO, BTN6_GPIO};
+
+    for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+    {
+        hid_event_unregister_listener(buttons[i], audio_player_button_handler);
     }
 }
 
@@ -552,54 +708,6 @@ void decoder_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-esp_err_t init_sdcard()
-{
-    esp_err_t ret;
-    // Remove local card declaration: sdmmc_card_t *card = NULL;
-    const char *mount_point = "/sdcard";
-
-    // Configure the SD card mount
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024};
-
-    // Configure SPI bus
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = SD_MOSI_PIN,
-        .miso_io_num = SD_MISO_PIN,
-        .sclk_io_num = SD_SCK_PIN,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
-    };
-
-    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Configure SPI device
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = SD_CS_PIN;
-    slot_config.host_id = SPI2_HOST;
-
-    // Mount the SD card
-    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &g_card);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
-    }
-    else
-    {
-        ESP_LOGI(TAG, "SD card mounted successfully");
-    }
-    return ret;
-}
-
 /**
  * @brief Main Audio Player Control Task
  * Manages state and handles commands.
@@ -902,6 +1010,9 @@ void audio_player_init()
     cart_presense_gpio_isr_handler(NULL);
     panic_if(uxQueueMessagesWaiting(cart_presence_notify_queue) == 0, "Failed to get initial cart presence state");
 
+    // Register button event handlers after successful initialization
+    register_audio_button_handlers();
+
     // Create and start the main player control task
     xTaskCreate(audio_player_task, "AudioPlayerTask", 4096, NULL, 8, &playerTaskHandle);
 
@@ -971,6 +1082,13 @@ static void cleanup_on_cart_removal()
     g_sd_initialized = false;
     g_total_tracks = 0;
     ESP_LOGI(TAG, "Cart removed, cleaned up playback state.");
+
+    // Temporarily disable audio button handlers when no cart
+    gpio_num_t buttons[] = {BTN1_GPIO, BTN2_GPIO, BTN3_GPIO, BTN4_GPIO, BTN5_GPIO, BTN6_GPIO};
+    for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+    {
+        hid_event_set_listener_enabled(buttons[i], audio_player_button_handler, false);
+    }
 }
 
 /**
@@ -1025,5 +1143,15 @@ static void init_sd_if_needed()
             }
         }
         update_volume_shift();
+
+        // Re-enable audio button handlers when cart is inserted and tracks found
+        if (g_total_tracks > 0)
+        {
+            gpio_num_t buttons[] = {BTN1_GPIO, BTN2_GPIO, BTN3_GPIO, BTN4_GPIO, BTN5_GPIO, BTN6_GPIO};
+            for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+            {
+                hid_event_set_listener_enabled(buttons[i], audio_player_button_handler, true);
+            }
+        }
     }
 }

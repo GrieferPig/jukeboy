@@ -1,18 +1,20 @@
 #include "hid_mgr.h"
+#include "hid_event_system.h"
 #include "pindef.h"
-#include "audio/audio_player.h"
 #include "led_mgr.h"
 #include "macros.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/timers.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_intr_alloc.h"
 #include "esp_system.h"
 #include <stdlib.h>
 #include "power_mgr.h"
+#include <string.h>
 
 static const char *TAG = "hid_mgr";
 
@@ -20,72 +22,284 @@ static const char *TAG = "hid_mgr";
 typedef struct
 {
     gpio_num_t gpio_num;
-    CommandType cmd_type;
     const char *name;
 } button_config_t;
 
-// Button configurations
+// Button configurations (removed command coupling)
 static const button_config_t button_configs[] = {
-    {BTN1_GPIO, CMD_NEXT_TRACK, "BTN1 (Next Track)"},
-    {BTN2_GPIO, CMD_TOGGLE_PAUSE, "BTN2 (Pause/Unpause)"},
-    {BTN3_GPIO, CMD_PREV_TRACK, "BTN3 (Previous Track)"},
-    {BTN4_GPIO, CMD_TOGGLE_SHUFFLE, "BTN4 (Toggle Shuffle)"},
-    {BTN5_GPIO, CMD_VOLUME_INC, "BTN5 (Volume Up)"},
-    {BTN6_GPIO, CMD_VOLUME_DEC, "BTN6 (Volume Down)"},
+    {BTN1_GPIO, "BTN1"},
+    {BTN2_GPIO, "BTN2"},
+    {BTN3_GPIO, "BTN3"},
+    {BTN4_GPIO, "BTN4"},
+    {BTN5_GPIO, "BTN5"},
+    {BTN6_GPIO, "BTN6"},
 };
 
 #define NUM_BUTTONS (sizeof(button_configs) / sizeof(button_config_t))
 
-// Queue for button events
-static QueueHandle_t button_queue = NULL;
-TaskHandle_t hid_task_handle = NULL;
-
-// Restart combination tracking
-static bool button_states[NUM_BUTTONS] = {false};
-static TickType_t restart_combo_start_time = 0;
-static bool restart_combo_active = false;
-
-TimerHandle_t hid_can_sleep_timer = NULL;
-#define HID_CAN_SLEEP_TIMEOUT_MS 10000
-#define RESTART_COMBO_DURATION_MS 3000
-
-// Button event structure
+// Internal event structure
 typedef struct
 {
     gpio_num_t gpio_num;
-    CommandType cmd_type;
-} button_event_t;
+    bool pressed;
+    TickType_t timestamp;
+} internal_button_event_t;
+
+// Button state tracking
+typedef struct
+{
+    bool current_state;
+    bool previous_state;
+    TickType_t press_start_time;
+    TickType_t last_release_time;
+    bool long_press_sent;
+    int press_count;
+    TimerHandle_t double_press_timer;
+    // --- added for deferred single press dispatch ---
+    bool pending_release;
+    uint32_t pending_release_duration;
+} button_state_t;
+
+// Global state
+static QueueHandle_t button_queue = NULL;
+static TaskHandle_t hid_task_handle = NULL;
+static TimerHandle_t hid_can_sleep_timer = NULL;
+static button_state_t button_states[NUM_BUTTONS];
+
+// Restart combination tracking
+static TickType_t restart_combo_start_time = 0;
+static bool restart_combo_active = false;
+
+#define HID_CAN_SLEEP_TIMEOUT_MS 10000
+
+// Forward declarations
+static void hid_task(void *pvParameters);
+static void hid_can_sleep_timer_callback(TimerHandle_t xTimer);
+static void double_press_timer_callback(TimerHandle_t xTimer);
+static void process_button_event(gpio_num_t gpio_num, bool pressed, TickType_t timestamp);
+static void check_restart_combo(void);
+static int gpio_to_button_index(gpio_num_t gpio_num);
 
 // GPIO interrupt handler
 static void IRAM_ATTR gpio_isr_handler(void *arg)
 {
-    button_event_t event;
+    internal_button_event_t event;
     event.gpio_num = (gpio_num_t)(uintptr_t)arg;
-
-    // Find the corresponding command type
-    for (int i = 0; i < NUM_BUTTONS; i++)
-    {
-        if (button_configs[i].gpio_num == event.gpio_num)
-        {
-            event.cmd_type = button_configs[i].cmd_type;
-            break;
-        }
-    }
+    event.pressed = (gpio_get_level(event.gpio_num) == 0);
+    event.timestamp = xTaskGetTickCountFromISR();
 
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xQueueSendFromISR(button_queue, &event, &xHigherPriorityTaskWoken);
 
-    // Reset the can sleep timer
+    // Reset the can sleep timer and set tired bit
     if (hid_can_sleep_timer != NULL)
     {
         xTimerResetFromISR(hid_can_sleep_timer, &xHigherPriorityTaskWoken);
-        // Set the tired bit for HID
         xEventGroupSetBitsFromISR(power_mgr_tired_event_group, HID_TIRED_BIT, &xHigherPriorityTaskWoken);
     }
 
     if (xHigherPriorityTaskWoken)
     {
         portYIELD_FROM_ISR();
+    }
+}
+
+static int gpio_to_button_index(gpio_num_t gpio_num)
+{
+    for (int i = 0; i < NUM_BUTTONS; i++)
+    {
+        if (button_configs[i].gpio_num == gpio_num)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void double_press_timer_callback(TimerHandle_t xTimer)
+{
+    for (int i = 0; i < NUM_BUTTONS; i++)
+    {
+        if (button_states[i].double_press_timer == xTimer)
+        {
+            button_state_t *st = &button_states[i];
+            if (st->press_count == 1)
+            {
+                // Confirmed single short press: dispatch PRESS then RELEASE
+                ESP_LOGI(TAG, "Single press confirmed (timer) GPIO %d", button_configs[i].gpio_num);
+                hid_event_data_t press_evt = {
+                    .gpio_num = button_configs[i].gpio_num,
+                    .event_type = HID_EVENT_PRESS,
+                    .duration_ms = 0,
+                    .combo_mask = 0};
+                hid_event_dispatch(&press_evt);
+
+                if (st->pending_release)
+                {
+                    hid_event_data_t rel_evt = {
+                        .gpio_num = button_configs[i].gpio_num,
+                        .event_type = HID_EVENT_RELEASE,
+                        .duration_ms = st->pending_release_duration,
+                        .combo_mask = 0};
+                    hid_event_dispatch(&rel_evt);
+                }
+            }
+            // reset state
+            st->press_count = 0;
+            st->pending_release = false;
+            st->pending_release_duration = 0;
+            break;
+        }
+    }
+}
+
+static void process_button_event(gpio_num_t gpio_num, bool pressed, TickType_t timestamp)
+{
+    ESP_LOGI(TAG, "process_button_event: gpio=%d pressed=%d tick=%lu", gpio_num, pressed, (unsigned long)timestamp);
+
+    int btn_idx = gpio_to_button_index(gpio_num);
+    if (btn_idx < 0)
+    {
+        ESP_LOGI(TAG, "process_button_event: gpio %d not tracked", gpio_num);
+        return;
+    }
+
+    button_state_t *state = &button_states[btn_idx];
+    bool prev = state->current_state;
+    state->previous_state = state->current_state;
+    state->current_state = pressed;
+
+    ESP_LOGI(TAG,
+             "Button idx=%d prev_state=%d curr_state=%d press_count=%d long_sent=%d",
+             btn_idx, prev, state->current_state, state->press_count, state->long_press_sent);
+
+    if (pressed && !state->previous_state)
+    {
+        // Press edge
+        state->press_start_time = timestamp;
+        state->long_press_sent = false;
+
+        ESP_LOGI(TAG,
+                 "PRESS: gpio=%d idx=%d press_start_tick=%lu press_count=%d",
+                 gpio_num, btn_idx, (unsigned long)state->press_start_time, state->press_count);
+
+        // Check if this is within double-press window
+        if (state->press_count == 1 &&
+            state->double_press_timer &&
+            xTimerIsTimerActive(state->double_press_timer))
+        {
+            // Second press detected - stop timer and increment count
+            xTimerStop(state->double_press_timer, 0);
+            state->press_count = 2;
+            ESP_LOGI(TAG, "Second press detected within window gpio=%d", gpio_num);
+        }
+        else
+        {
+            // First press or press outside window
+            state->press_count = 1;
+            ESP_LOGI(TAG, "First press detected gpio=%d", gpio_num);
+        }
+    }
+    else if (!pressed && state->previous_state)
+    {
+        // Release edge
+        state->last_release_time = timestamp;
+        uint32_t press_duration = pdTICKS_TO_MS(timestamp - state->press_start_time);
+        ESP_LOGI(TAG,
+                 "RELEASE: gpio=%d idx=%d duration_ms=%lu press_count=%d long_sent=%d",
+                 gpio_num, btn_idx, (unsigned long)press_duration, state->press_count, state->long_press_sent);
+
+        if (press_duration >= HID_LONG_PRESS_DURATION_MS)
+        {
+            ESP_LOGI(TAG, "Long press release (already reported) gpio=%d", gpio_num);
+            state->press_count = 0;
+        }
+        else if (state->press_count == 1)
+        {
+            ESP_LOGI(TAG,
+                     "First press complete - starting double-press window (%d ms) gpio=%d",
+                     HID_DOUBLE_PRESS_WINDOW_MS, gpio_num);
+            // Defer single press decision: store release, start timer
+            state->pending_release = true;
+            state->pending_release_duration = press_duration;
+            if (state->double_press_timer)
+            {
+                xTimerChangePeriod(state->double_press_timer,
+                                   pdMS_TO_TICKS(HID_DOUBLE_PRESS_WINDOW_MS), 0);
+                xTimerStart(state->double_press_timer, 0);
+            }
+            ESP_LOGI(TAG, "Short press released (deferred) gpio=%d", gpio_num);
+            // Do NOT dispatch RELEASE yet (PRESS will be generated on timer expiry)
+        }
+        else if (state->press_count == 2)
+        {
+            ESP_LOGI(TAG, "DOUBLE PRESS detected gpio=%d", gpio_num);
+
+            // Stop any active timer
+            if (state->double_press_timer && xTimerIsTimerActive(state->double_press_timer))
+            {
+                xTimerStop(state->double_press_timer, 0);
+                ESP_LOGI(TAG, "Stopped double-press timer after second press gpio=%d", gpio_num);
+            }
+
+            hid_event_data_t event = {
+                .gpio_num = gpio_num,
+                .event_type = HID_EVENT_DOUBLE_PRESS,
+                .duration_ms = press_duration,
+                .combo_mask = 0};
+            ESP_LOGI(TAG, "Dispatch HID_EVENT_DOUBLE_PRESS gpio=%d duration=%lu",
+                     gpio_num, (unsigned long)press_duration);
+            hid_event_dispatch(&event);
+
+            hid_event_data_t release_evt = {
+                .gpio_num = gpio_num,
+                .event_type = HID_EVENT_RELEASE,
+                .duration_ms = press_duration,
+                .combo_mask = 0};
+            hid_event_dispatch(&release_evt);
+
+            state->press_count = 0;
+        }
+        else
+        {
+            // Do nothing, state will be reset on next press
+        }
+    }
+    else if (pressed && state->previous_state)
+    {
+        // Held state - check for long press
+        uint32_t hold_duration = pdTICKS_TO_MS(timestamp - state->press_start_time);
+        ESP_LOGI(TAG,
+                 "HOLD: gpio=%d idx=%d hold_ms=%lu long_sent=%d",
+                 gpio_num, btn_idx, (unsigned long)hold_duration, state->long_press_sent);
+
+        if (hold_duration >= HID_LONG_PRESS_DURATION_MS && !state->long_press_sent)
+        {
+            ESP_LOGI(TAG, "LONG PRESS threshold reached gpio=%d hold_ms=%lu",
+                     gpio_num, (unsigned long)hold_duration);
+
+            // Cancel double-press detection since this is a long press
+            if (state->double_press_timer && xTimerIsTimerActive(state->double_press_timer))
+            {
+                xTimerStop(state->double_press_timer, 0);
+                ESP_LOGI(TAG, "Cancelled double-press timer due to long press gpio=%d", gpio_num);
+            }
+
+            hid_event_data_t event = {
+                .gpio_num = gpio_num,
+                .event_type = HID_EVENT_LONG_PRESS,
+                .duration_ms = hold_duration,
+                .combo_mask = 0};
+            ESP_LOGI(TAG, "Dispatch HID_EVENT_LONG_PRESS gpio=%d duration=%lu",
+                     gpio_num, (unsigned long)hold_duration);
+            hid_event_dispatch(&event);
+            state->long_press_sent = true;
+            state->press_count = 0; // Reset to prevent any further events
+        }
+    }
+    else
+    {
+        ESP_LOGI(TAG, "No state change path matched gpio=%d", gpio_num);
     }
 }
 
@@ -99,38 +313,51 @@ static void check_restart_combo(void)
 
     if (restart_combo && !restart_combo_active)
     {
-        // Start tracking the restart combination
         restart_combo_active = true;
         restart_combo_start_time = xTaskGetTickCount();
         ESP_LOGI(TAG, "Restart combination detected, starting timer...");
+
+        // Dispatch combo start event
+        hid_event_data_t event = {
+            .gpio_num = BTN1_GPIO, // Use first button as representative
+            .event_type = HID_EVENT_COMBO_START,
+            .duration_ms = 0,
+            .combo_mask = (1 << 0) | (1 << 1) | (1 << 2) // BTN1, BTN2, BTN3
+        };
+        hid_event_dispatch(&event);
     }
     else if (!restart_combo && restart_combo_active)
     {
-        // Combination released, cancel restart
         restart_combo_active = false;
         ESP_LOGI(TAG, "Restart combination cancelled");
+
+        // Dispatch combo end event
+        hid_event_data_t event = {
+            .gpio_num = BTN1_GPIO,
+            .event_type = HID_EVENT_COMBO_END,
+            .duration_ms = pdTICKS_TO_MS(xTaskGetTickCount() - restart_combo_start_time),
+            .combo_mask = (1 << 0) | (1 << 1) | (1 << 2)};
+        hid_event_dispatch(&event);
     }
     else if (restart_combo_active && restart_combo)
     {
-        // Check if combination has been held long enough
         TickType_t current_time = xTaskGetTickCount();
-        TickType_t elapsed_ticks = current_time - restart_combo_start_time;
-        uint32_t elapsed_ms = pdTICKS_TO_MS(elapsed_ticks);
+        uint32_t elapsed_ms = pdTICKS_TO_MS(current_time - restart_combo_start_time);
 
-        if (elapsed_ms >= RESTART_COMBO_DURATION_MS)
+        if (elapsed_ms >= HID_RESTART_COMBO_DURATION_MS)
         {
-            ESP_LOGW(TAG, "Restart combination held for %d ms, restarting system...", elapsed_ms);
+            ESP_LOGW(TAG, "Restart combination held for %lu ms, restarting system...", elapsed_ms);
 
             // Blink red LED for 1 second before restart
             led_color_t red_color = LED_COLOR_RED;
             led_color_t off_color = LED_COLOR_OFF;
 
-            for (int i = 0; i < 5; i++) // 5 blinks = 1 second (200ms per cycle)
+            for (int i = 0; i < 5; i++)
             {
                 led_mgr_set_color(red_color);
-                vTaskDelay(pdMS_TO_TICKS(100)); // On for 100ms
+                vTaskDelay(pdMS_TO_TICKS(100));
                 led_mgr_set_color(off_color);
-                vTaskDelay(pdMS_TO_TICKS(100)); // Off for 100ms
+                vTaskDelay(pdMS_TO_TICKS(100));
             }
 
             esp_restart();
@@ -140,83 +367,31 @@ static void check_restart_combo(void)
 
 static void hid_can_sleep_timer_callback(TimerHandle_t xTimer)
 {
-    // Timer reached, indicate that HID can sleep
     ESP_LOGI(TAG, "HID can sleep now");
-    xEventGroupClearBitsFromISR(power_mgr_tired_event_group, HID_TIRED_BIT);
+    xEventGroupClearBits(power_mgr_tired_event_group, HID_TIRED_BIT);
 }
 
-// HID manager task
 static void hid_task(void *pvParameters)
 {
-    button_event_t event;
-    AudioCommand audio_cmd;
+    internal_button_event_t event;
+    TickType_t last_combo_check = 0;
 
     ESP_LOGI(TAG, "HID task started");
 
     while (1)
     {
-        check_restart_combo();
-        // Wait for button events (with timeout to check restart combo regularly)
-        if (xQueueReceive(button_queue, &event, pdMS_TO_TICKS(100)))
+        // Process button events
+        if (xQueueReceive(button_queue, &event, pdMS_TO_TICKS(50)))
         {
-            // Skip normal button processing if restart combination is active
-            if (restart_combo_active)
-            {
-                continue;
-            }
+            process_button_event(event.gpio_num, event.pressed, event.timestamp);
+        }
 
-            // Check if button is still pressed (debounce)
-            if (gpio_get_level(event.gpio_num) == 0)
-            {
-                ESP_LOGI(TAG, "Button pressed: GPIO %d, Command: %d", event.gpio_num, event.cmd_type);
-
-                // Set LED color based on button pressed
-                led_color_t led_color;
-                switch (event.cmd_type)
-                {
-                case CMD_NEXT_TRACK:
-                    led_color = (led_color_t)LED_COLOR_BLUE;
-                    break;
-                case CMD_TOGGLE_PAUSE:
-                    led_color = (led_color_t)LED_COLOR_YELLOW;
-                    break;
-                case CMD_PREV_TRACK:
-                    led_color = (led_color_t)LED_COLOR_PURPLE;
-                    break;
-                case CMD_TOGGLE_SHUFFLE:
-                    led_color = (led_color_t)LED_COLOR_CYAN;
-                    break;
-                case CMD_VOLUME_INC:
-                    led_color = (led_color_t)LED_COLOR_GREEN;
-                    break;
-                case CMD_VOLUME_DEC:
-                    led_color = (led_color_t)LED_COLOR_RED;
-                    break;
-                default:
-                    led_color = (led_color_t)LED_COLOR_WHITE;
-                    break;
-                }
-
-                // Send color change to LED manager
-                led_mgr_set_color(led_color);
-
-                // Prepare audio command
-                audio_cmd.type = event.cmd_type;
-                audio_cmd.params.track_number = 0; // Default value, not used for most commands
-
-                // Send command to audio player
-                audio_player_send_command(&audio_cmd);
-
-                // Wait for button release to avoid multiple triggers
-                // But continue checking restart combination during the wait
-                while (gpio_get_level(event.gpio_num) == 0)
-                {
-                    check_restart_combo();
-                    vTaskDelay(pdMS_TO_TICKS(50)); // Poll every 50ms
-                }
-                // Additional debounce delay
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
+        // Check restart combo periodically
+        TickType_t now = xTaskGetTickCount();
+        if (pdTICKS_TO_MS(now - last_combo_check) >= 100)
+        {
+            check_restart_combo();
+            last_combo_check = now;
         }
     }
 }
@@ -227,7 +402,15 @@ esp_err_t hid_mgr_init(void)
 
     ESP_LOGI(TAG, "Initializing HID Manager...");
 
-    // Initialize LED Manager first
+    // Initialize HID event system
+    ret = hid_event_system_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to initialize HID event system");
+        return ret;
+    }
+
+    // Initialize LED Manager
     ret = led_mgr_init();
     if (ret != ESP_OK)
     {
@@ -235,20 +418,39 @@ esp_err_t hid_mgr_init(void)
         return ret;
     }
 
+    // Initialize button states
+    memset(button_states, 0, sizeof(button_states));
+    for (int i = 0; i < NUM_BUTTONS; i++)
+    {
+        button_states[i].double_press_timer = xTimerCreate(
+            "double_press_timer",
+            pdMS_TO_TICKS(HID_DOUBLE_PRESS_WINDOW_MS),
+            pdFALSE,
+            NULL,
+            double_press_timer_callback);
+
+        if (!button_states[i].double_press_timer)
+        {
+            ESP_LOGE(TAG, "Failed to create double press timer for button %d", i);
+            ret = ESP_FAIL;
+            goto cleanup;
+        }
+    }
+
     // Create button event queue
-    button_queue = xQueueCreate(10, sizeof(button_event_t));
+    button_queue = xQueueCreate(20, sizeof(internal_button_event_t));
     if (button_queue == NULL)
     {
         ESP_LOGE(TAG, "Failed to create button queue");
-        led_mgr_deinit();
-        return ESP_FAIL;
+        ret = ESP_FAIL;
+        goto cleanup;
     }
 
     // Configure GPIO pins for buttons
     gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_NEGEDGE, // Interrupt on falling edge (button press)
+        .intr_type = GPIO_INTR_ANYEDGE, // Both edges for press/release detection
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE, // Enable internal pull-up
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pin_bit_mask = 0};
 
@@ -286,17 +488,20 @@ esp_err_t hid_mgr_init(void)
         ESP_LOGI(TAG, "Configured %s on GPIO %d", button_configs[i].name, button_configs[i].gpio_num);
     }
 
-    // Print GPIO initial state for debugging
-    for (int i = 0; i < NUM_BUTTONS; i++)
+    // Initialize the can sleep timer
+    hid_can_sleep_timer = xTimerCreate("hid_can_sleep_timer",
+                                       pdMS_TO_TICKS(HID_CAN_SLEEP_TIMEOUT_MS),
+                                       pdFALSE,
+                                       NULL,
+                                       hid_can_sleep_timer_callback);
+    if (!hid_can_sleep_timer)
     {
-        uint32_t gpio_state = gpio_get_level(button_configs[i].gpio_num);
-        ESP_LOGI(TAG, "Initial state of %s (GPIO %d): %d", button_configs[i].name, button_configs[i].gpio_num, gpio_state);
+        ESP_LOGE(TAG, "Failed to create can sleep timer");
+        ret = ESP_FAIL;
+        goto cleanup;
     }
 
-    // Initialize the can sleep timer
-    hid_can_sleep_timer = xTimerCreate("hid_can_sleep_timer", pdMS_TO_TICKS(HID_CAN_SLEEP_TIMEOUT_MS), pdFALSE, NULL, &hid_can_sleep_timer_callback);
     xTimerStart(hid_can_sleep_timer, 0);
-    // Set the initial tired bit for HID
     xEventGroupSetBits(power_mgr_tired_event_group, HID_TIRED_BIT);
 
     // Create HID task
@@ -327,30 +532,27 @@ esp_err_t hid_mgr_deinit(void)
         hid_task_handle = NULL;
     }
 
-    // Turns out resetting pins prevents the system from being woken up
-    // Espressif, excuse me?
-    // for (int i = 0; i < NUM_BUTTONS; i++)
-    // {
-    //     gpio_reset_pin(button_configs[i].gpio_num);
-    // }
+    // Delete timers
+    if (hid_can_sleep_timer)
+    {
+        xTimerDelete(hid_can_sleep_timer, portMAX_DELAY);
+        hid_can_sleep_timer = NULL;
+    }
+
+    for (int i = 0; i < NUM_BUTTONS; i++)
+    {
+        if (button_states[i].double_press_timer)
+        {
+            xTimerDelete(button_states[i].double_press_timer, portMAX_DELAY);
+            button_states[i].double_press_timer = NULL;
+        }
+    }
 
     // Remove ISR handlers
     for (int i = 0; i < NUM_BUTTONS; i++)
     {
-        esp_err_t ret = gpio_isr_handler_remove(button_configs[i].gpio_num);
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE(TAG, "Failed to remove ISR handler for %s, ret=%d", button_configs[i].name, ret);
-        }
-        else
-        {
-            ESP_LOGI(TAG, "Removed ISR handler for %s", button_configs[i].name);
-        }
+        gpio_isr_handler_remove(button_configs[i].gpio_num);
     }
-
-    // Can't do this either
-    // Uninstall GPIO ISR service
-    // gpio_uninstall_isr_service();
 
     // Delete queue
     if (button_queue != NULL)
@@ -359,8 +561,8 @@ esp_err_t hid_mgr_deinit(void)
         button_queue = NULL;
     }
 
-    // Deinitialize LED Manager
-    // led_mgr_deinit();
+    // Deinitialize event system
+    hid_event_system_deinit();
 
     ESP_LOGI(TAG, "HID Manager deinitialized");
     return ESP_OK;

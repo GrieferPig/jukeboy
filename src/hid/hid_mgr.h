@@ -2,18 +2,18 @@
 
 #include <stdint.h>
 #include "esp_err.h"
+#include "hid_event_system.h"
+
+// Button configuration
+#define HID_LONG_PRESS_DURATION_MS 1000
+#define HID_DOUBLE_PRESS_WINDOW_MS 500
+#define HID_RESTART_COMBO_DURATION_MS 3000
 
 /**
- * @brief Initialize the HID manager and start the button monitoring task
+ * @brief Initialize the HID manager
  *
- * This function sets up GPIO interrupts for buttons BTN1-BTN6 and starts
- * a task to handle button press events. The buttons are mapped as follows:
- * - BTN1: Previous track
- * - BTN2: Pause/Unpausef
- * - BTN3: Next track
- * - BTN4: Toggle shuffle
- * - BTN5: Volume down
- * - BTN6: Volume up
+ * Sets up GPIO interrupts for configured buttons and starts the HID task.
+ * Uses the HID event system for decoupled event handling.
  *
  * @return ESP_OK on success, error code on failure
  */
