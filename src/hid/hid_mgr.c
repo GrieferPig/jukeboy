@@ -225,20 +225,44 @@ static void process_button_event(gpio_num_t gpio_num, bool pressed, TickType_t t
         }
         else if (state->press_count == 1)
         {
-            ESP_LOGI(TAG,
-                     "First press complete - starting double-press window (%d ms) gpio=%d",
-                     HID_DOUBLE_PRESS_WINDOW_MS, gpio_num);
-            // Defer single press decision: store release, start timer
-            state->pending_release = true;
-            state->pending_release_duration = press_duration;
-            if (state->double_press_timer)
+            // If no double-press listener is registered for this button, don't wait
+            if (!hid_event_has_listener(gpio_num, HID_EVENT_DOUBLE_PRESS))
             {
-                xTimerChangePeriod(state->double_press_timer,
-                                   pdMS_TO_TICKS(HID_DOUBLE_PRESS_WINDOW_MS), 0);
-                xTimerStart(state->double_press_timer, 0);
+                ESP_LOGI(TAG, "No double-press listener; dispatching single press immediately gpio=%d", gpio_num);
+
+                hid_event_data_t press_evt = {
+                    .gpio_num = gpio_num,
+                    .event_type = HID_EVENT_PRESS,
+                    .duration_ms = 0,
+                    .combo_mask = 0};
+                hid_event_dispatch(&press_evt);
+
+                hid_event_data_t rel_evt = {
+                    .gpio_num = gpio_num,
+                    .event_type = HID_EVENT_RELEASE,
+                    .duration_ms = press_duration,
+                    .combo_mask = 0};
+                hid_event_dispatch(&rel_evt);
+
+                state->press_count = 0;
             }
-            ESP_LOGI(TAG, "Short press released (deferred) gpio=%d", gpio_num);
-            // Do NOT dispatch RELEASE yet (PRESS will be generated on timer expiry)
+            else
+            {
+                ESP_LOGI(TAG,
+                         "First press complete - starting double-press window (%d ms) gpio=%d",
+                         HID_DOUBLE_PRESS_WINDOW_MS, gpio_num);
+                // Defer single press decision: store release, start timer
+                state->pending_release = true;
+                state->pending_release_duration = press_duration;
+                if (state->double_press_timer)
+                {
+                    xTimerChangePeriod(state->double_press_timer,
+                                       pdMS_TO_TICKS(HID_DOUBLE_PRESS_WINDOW_MS), 0);
+                    xTimerStart(state->double_press_timer, 0);
+                }
+                ESP_LOGI(TAG, "Short press released (deferred) gpio=%d", gpio_num);
+                // Do NOT dispatch RELEASE yet (PRESS will be generated on timer expiry)
+            }
         }
         else if (state->press_count == 2)
         {

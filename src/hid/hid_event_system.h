@@ -17,7 +17,8 @@ typedef enum
     HID_EVENT_LONG_PRESS,
     HID_EVENT_DOUBLE_PRESS,
     HID_EVENT_COMBO_START,
-    HID_EVENT_COMBO_END
+    HID_EVENT_COMBO_END,
+    HID_EVENT_TYPE_COUNT
 } hid_event_type_t;
 
 // Button event data
@@ -62,6 +63,14 @@ esp_err_t hid_event_system_deinit(void);
  * @param priority Priority (higher = called first)
  * @return ESP_OK on success, ESP_FAIL if no space available
  */
+// Register a listener for a specific event type on a GPIO
+esp_err_t hid_event_register_listener_ex(gpio_num_t gpio_num,
+                                         hid_event_type_t event_type,
+                                         hid_event_listener_t callback,
+                                         void *user_data,
+                                         int priority);
+
+// Backward-compat: register the same listener for all event types
 esp_err_t hid_event_register_listener(gpio_num_t gpio_num,
                                       hid_event_listener_t callback,
                                       void *user_data,
@@ -73,6 +82,12 @@ esp_err_t hid_event_register_listener(gpio_num_t gpio_num,
  * @param callback Callback function to remove
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if not found
  */
+// Unregister a listener for a specific event type
+esp_err_t hid_event_unregister_listener_ex(gpio_num_t gpio_num,
+                                           hid_event_type_t event_type,
+                                           hid_event_listener_t callback);
+
+// Backward-compat: unregister across all event types on the GPIO
 esp_err_t hid_event_unregister_listener(gpio_num_t gpio_num,
                                         hid_event_listener_t callback);
 
@@ -83,6 +98,13 @@ esp_err_t hid_event_unregister_listener(gpio_num_t gpio_num,
  * @param enabled True to enable, false to disable
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if not found
  */
+// Enable/disable a listener for a specific event type
+esp_err_t hid_event_set_listener_enabled_ex(gpio_num_t gpio_num,
+                                            hid_event_type_t event_type,
+                                            hid_event_listener_t callback,
+                                            bool enabled);
+
+// Backward-compat: enable/disable across all event types on the GPIO
 esp_err_t hid_event_set_listener_enabled(gpio_num_t gpio_num,
                                          hid_event_listener_t callback,
                                          bool enabled);
@@ -93,3 +115,8 @@ esp_err_t hid_event_set_listener_enabled(gpio_num_t gpio_num,
  * @return True if event was consumed, false otherwise
  */
 bool hid_event_dispatch(const hid_event_data_t *event);
+
+/**
+ * @brief Check if any active listener exists for a gpio + event type
+ */
+bool hid_event_has_listener(gpio_num_t gpio_num, hid_event_type_t event_type);

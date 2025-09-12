@@ -145,53 +145,44 @@ static inline void apply_gain(int16_t *pcm_buffer, size_t sample_count)
  */
 static bool audio_player_button_handler(const hid_event_data_t *event, void *user_data)
 {
+    if (event->event_type != HID_EVENT_PRESS)
+    {
+        return false;
+    }
     if (!g_sd_initialized || g_total_tracks == 0)
     {
         // SD not inserted/ready: on any button press, play attention animation
-        if (event->event_type == HID_EVENT_PRESS)
-        {
-            led_animations_play_action(LED_ACT_NO_SD_ATTENTION, false);
-            return true; // consume to avoid further handling
-        }
-        return false; // Don't consume non-press events
+        led_animations_play_action(LED_ACT_NO_SD_ATTENTION, false);
+        return true; // consume to avoid further handling
     }
 
     AudioCommand cmd = {0};
     bool should_send_command = true;
 
     // Map GPIO numbers to commands
-    if (event->gpio_num == BTN1_GPIO && event->event_type == HID_EVENT_PRESS)
+    if (event->gpio_num == BTN1_GPIO)
     {
         cmd.type = CMD_NEXT_TRACK;
     }
-    else if (event->gpio_num == BTN2_GPIO && event->event_type == HID_EVENT_PRESS)
+    else if (event->gpio_num == BTN2_GPIO)
     {
         cmd.type = CMD_TOGGLE_PAUSE;
     }
-    else if (event->gpio_num == BTN3_GPIO && event->event_type == HID_EVENT_PRESS)
+    else if (event->gpio_num == BTN3_GPIO)
     {
         cmd.type = CMD_PREV_TRACK;
     }
-    else if (event->gpio_num == BTN4_GPIO && event->event_type == HID_EVENT_PRESS)
+    else if (event->gpio_num == BTN4_GPIO)
     {
         cmd.type = CMD_TOGGLE_SHUFFLE;
     }
-    else if (event->gpio_num == BTN5_GPIO && event->event_type == HID_EVENT_PRESS)
+    else if (event->gpio_num == BTN5_GPIO)
     {
         cmd.type = CMD_VOLUME_INC;
     }
-    else if (event->gpio_num == BTN6_GPIO && event->event_type == HID_EVENT_PRESS)
+    else if (event->gpio_num == BTN6_GPIO)
     {
         cmd.type = CMD_VOLUME_DEC;
-    }
-    // Handle long press for seek operations
-    else if (event->gpio_num == BTN1_GPIO && event->event_type == HID_EVENT_LONG_PRESS)
-    {
-        cmd.type = CMD_FFWD_10SEC;
-    }
-    else if (event->gpio_num == BTN3_GPIO && event->event_type == HID_EVENT_LONG_PRESS)
-    {
-        cmd.type = CMD_REWIND_5SEC;
     }
     else
     {
@@ -228,7 +219,7 @@ static void register_audio_button_handlers(void)
 
     for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
     {
-        esp_err_t ret = hid_event_register_listener(buttons[i], audio_player_button_handler, NULL, 50);
+        esp_err_t ret = hid_event_register_listener_ex(buttons[i], HID_EVENT_PRESS, audio_player_button_handler, NULL, 50);
         if (ret != ESP_OK)
         {
             ESP_LOGW(TAG, "Failed to register button handler for GPIO %d: %s", buttons[i], esp_err_to_name(ret));
@@ -249,7 +240,7 @@ static void unregister_audio_button_handlers(void)
 
     for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
     {
-        hid_event_unregister_listener(buttons[i], audio_player_button_handler);
+        hid_event_unregister_listener_ex(buttons[i], HID_EVENT_PRESS, audio_player_button_handler);
     }
 }
 
@@ -1197,7 +1188,7 @@ static void cleanup_on_cart_removal()
     gpio_num_t buttons[] = {BTN1_GPIO, BTN2_GPIO, BTN3_GPIO, BTN4_GPIO, BTN5_GPIO, BTN6_GPIO};
     for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
     {
-        hid_event_set_listener_enabled(buttons[i], audio_player_button_handler, false);
+        hid_event_set_listener_enabled_ex(buttons[i], HID_EVENT_PRESS, audio_player_button_handler, false);
     }
 }
 
@@ -1262,7 +1253,7 @@ static void init_sd_if_needed()
             gpio_num_t buttons[] = {BTN1_GPIO, BTN2_GPIO, BTN3_GPIO, BTN4_GPIO, BTN5_GPIO, BTN6_GPIO};
             for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
             {
-                hid_event_set_listener_enabled(buttons[i], audio_player_button_handler, true);
+                hid_event_set_listener_enabled_ex(buttons[i], HID_EVENT_PRESS, audio_player_button_handler, true);
             }
         }
     }
