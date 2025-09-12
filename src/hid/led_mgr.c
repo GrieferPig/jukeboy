@@ -36,6 +36,7 @@ typedef struct
     // Animation interpreter state
     const led_anim_step_t *steps;
     const led_anim_step_t *pc; // program counter
+    bool current_no_skip;
 
     // Loop stack (single level is enough for our use-case, but keep small stack)
     struct
@@ -55,6 +56,15 @@ typedef struct
 
     rmt_item32_t ws2812_bit0;
     rmt_item32_t ws2812_bit1;
+
+    // Smooth transition state
+    bool transition_active;
+    led_color_t trans_from_color;
+    led_color_t trans_to_color;
+    float trans_from_brightness;
+    float trans_to_brightness;
+    uint64_t trans_start_ms;
+    uint32_t trans_duration_ms;
 } led_mgr_ctx_t;
 
 static led_mgr_ctx_t led_ctx = {0};
@@ -65,6 +75,8 @@ static void ws2812_init_rmt_items(void);
 static void ws2812_set_color_with_brightness(led_color_t color, float brightness);
 static void led_set_color_now(led_color_t color);
 static uint64_t millis(void);
+static void sample_current_output(led_color_t *out_color, float *out_brightness, uint64_t now_ms);
+static led_color_t palette_to_color(led_palette_t p);
 
 esp_err_t led_mgr_init(void)
 {
@@ -76,11 +88,14 @@ esp_err_t led_mgr_init(void)
     memset(&led_ctx, 0, sizeof(led_ctx));
     led_ctx.steps = NULL;
     led_ctx.pc = NULL;
+    led_ctx.current_no_skip = false;
     led_ctx.loop_sp = -1;
     led_ctx.sleep_until_ms = 0;
     led_ctx.default_color = (led_color_t)LED_COLOR_GREEN;
     led_ctx.current_color = (led_color_t)LED_COLOR_OFF;
     led_ctx.current_brightness = 0.0f;
+    led_ctx.transition_active = false;
+    led_ctx.trans_duration_ms = 0;
 
     // Initialize WS2812 LED
     rmt_config_t config = {
@@ -158,16 +173,73 @@ esp_err_t led_mgr_deinit(void)
     return ESP_OK;
 }
 
-esp_err_t led_mgr_play(const led_anim_step_t *steps)
+// Simple ring buffer for pending animation requests
+typedef struct
+{
+    const led_anim_step_t *steps;
+    bool no_skip;
+} led_play_req_t;
+
+#define LED_PLAY_QUEUE_SIZE 4
+static led_play_req_t play_queue[LED_PLAY_QUEUE_SIZE];
+static volatile int play_q_head = 0;
+static volatile int play_q_tail = 0;
+
+static bool play_q_is_empty(void) { return play_q_head == play_q_tail; }
+static bool play_q_is_full(void) { return ((play_q_tail + 1) % LED_PLAY_QUEUE_SIZE) == play_q_head; }
+static void play_q_push(const led_play_req_t *req)
+{
+    if (play_q_is_full())
+    {
+        // Drop oldest to make room
+        play_q_head = (play_q_head + 1) % LED_PLAY_QUEUE_SIZE;
+    }
+    play_queue[play_q_tail] = *req;
+    play_q_tail = (play_q_tail + 1) % LED_PLAY_QUEUE_SIZE;
+}
+static bool play_q_pop(led_play_req_t *out)
+{
+    if (play_q_is_empty())
+        return false;
+    *out = play_queue[play_q_head];
+    play_q_head = (play_q_head + 1) % LED_PLAY_QUEUE_SIZE;
+    return true;
+}
+
+static void start_animation(const led_anim_step_t *steps, bool no_skip)
 {
     led_ctx.steps = steps;
     led_ctx.pc = steps;
     led_ctx.loop_sp = -1;
     led_ctx.sleep_until_ms = 0;
-    // Mark as active to prevent sleep
+    led_ctx.current_no_skip = no_skip;
     if (power_mgr_tired_event_group)
         xEventGroupSetBits(power_mgr_tired_event_group, LED_TIRED_BIT);
+}
+
+esp_err_t led_mgr_play_ex(const led_anim_step_t *steps, bool no_skip)
+{
+    led_play_req_t req = {.steps = steps, .no_skip = no_skip};
+    if (led_ctx.pc == NULL)
+    {
+        start_animation(req.steps, req.no_skip);
+    }
+    else if (!led_ctx.current_no_skip)
+    {
+        // Preempt current animation
+        start_animation(req.steps, req.no_skip);
+    }
+    else
+    {
+        // Queue for later
+        play_q_push(&req);
+    }
     return ESP_OK;
+}
+
+esp_err_t led_mgr_play(const led_anim_step_t *steps)
+{
+    return led_mgr_play_ex(steps, false);
 }
 
 esp_err_t led_mgr_stop(void)
@@ -176,6 +248,8 @@ esp_err_t led_mgr_stop(void)
     led_ctx.pc = NULL;
     led_ctx.loop_sp = -1;
     led_ctx.sleep_until_ms = 0;
+    led_ctx.current_no_skip = false;
+    led_ctx.transition_active = false;
     // Turn LED off
     ws2812_set_color_with_brightness((led_color_t)LED_COLOR_OFF, 0.0f);
     if (power_mgr_tired_event_group)
@@ -199,6 +273,34 @@ static void led_task(void *pvParameters)
     while (1)
     {
         uint64_t now_ms = millis();
+
+        // If a smooth transition is active, update LED output progressively
+        if (led_ctx.transition_active)
+        {
+            uint64_t elapsed = (now_ms - led_ctx.trans_start_ms);
+            float t = 0.0f;
+            if (led_ctx.trans_duration_ms > 0)
+            {
+                t = (float)elapsed / (float)led_ctx.trans_duration_ms;
+                if (t >= 1.0f)
+                    t = 1.0f;
+            }
+
+            float br = led_ctx.trans_from_brightness + (led_ctx.trans_to_brightness - led_ctx.trans_from_brightness) * t;
+            led_color_t c;
+            c.r = (uint8_t)((int)led_ctx.trans_from_color.r + (int)((led_ctx.trans_to_color.r - led_ctx.trans_from_color.r) * t));
+            c.g = (uint8_t)((int)led_ctx.trans_from_color.g + (int)((led_ctx.trans_to_color.g - led_ctx.trans_from_color.g) * t));
+            c.b = (uint8_t)((int)led_ctx.trans_from_color.b + (int)((led_ctx.trans_to_color.b - led_ctx.trans_from_color.b) * t));
+
+            ws2812_set_color_with_brightness(c, br);
+
+            if (t >= 1.0f)
+            {
+                led_ctx.transition_active = false;
+                led_ctx.current_color = led_ctx.trans_to_color;
+                led_ctx.current_brightness = led_ctx.trans_to_brightness;
+            }
+        }
 
         if (led_ctx.pc == NULL)
         {
@@ -233,8 +335,48 @@ static void led_task(void *pvParameters)
                 {
                 case LED_ANIM_OP_SET_COLOR:
                 {
-                    led_color_t c = step->data.set.use_default ? led_ctx.default_color : step->data.set.color;
+                    led_color_t c;
+                    if (step->data.set.use_default)
+                        c = led_ctx.default_color;
+                    else if (step->data.set.use_palette)
+                        c = palette_to_color(step->data.set.palette);
+                    else
+                        c = step->data.set.color;
                     led_set_color_now(c);
+                    led_ctx.pc++;
+                    progressed = true;
+                    break;
+                }
+                case LED_ANIM_OP_SET_COLOR_SMOOTH:
+                {
+                    sample_current_output(&led_ctx.trans_from_color, &led_ctx.trans_from_brightness, now_ms);
+                    if (step->data.set.use_palette)
+                        led_ctx.trans_to_color = palette_to_color(step->data.set.palette);
+                    else if (step->data.set.use_default)
+                        led_ctx.trans_to_color = led_ctx.default_color;
+                    else
+                        led_ctx.trans_to_color = step->data.set.color;
+                    led_ctx.trans_to_brightness = LED_BRIGHTNESS_SCALE;
+                    led_ctx.trans_start_ms = now_ms;
+                    led_ctx.trans_duration_ms = 300; // 0.3s
+                    led_ctx.transition_active = true;
+                    led_ctx.pc++;
+                    progressed = true;
+                    break;
+                }
+                case LED_ANIM_OP_SET_COLOR_SMOOTH_SLOW:
+                {
+                    sample_current_output(&led_ctx.trans_from_color, &led_ctx.trans_from_brightness, now_ms);
+                    if (step->data.set.use_palette)
+                        led_ctx.trans_to_color = palette_to_color(step->data.set.palette);
+                    else if (step->data.set.use_default)
+                        led_ctx.trans_to_color = led_ctx.default_color;
+                    else
+                        led_ctx.trans_to_color = step->data.set.color;
+                    led_ctx.trans_to_brightness = LED_BRIGHTNESS_SCALE;
+                    led_ctx.trans_start_ms = now_ms;
+                    led_ctx.trans_duration_ms = 800; // 0.8s
+                    led_ctx.transition_active = true;
                     led_ctx.pc++;
                     progressed = true;
                     break;
@@ -244,6 +386,56 @@ static void led_task(void *pvParameters)
                     led_ctx.pc++;
                     progressed = true;
                     break;
+                case LED_ANIM_OP_SET_DEFAULT_SMOOTH:
+                {
+                    sample_current_output(&led_ctx.trans_from_color, &led_ctx.trans_from_brightness, now_ms);
+                    led_ctx.trans_to_color = led_ctx.default_color;
+
+                    // target brightness is nominal scale
+                    led_ctx.trans_to_brightness = LED_BRIGHTNESS_SCALE;
+                    led_ctx.trans_start_ms = now_ms;
+                    led_ctx.trans_duration_ms = 300; // 0.3s
+                    led_ctx.transition_active = true;
+                    led_ctx.pc++;
+                    progressed = true;
+                    break;
+                }
+                case LED_ANIM_OP_TURN_OFF_SMOOTH:
+                {
+                    sample_current_output(&led_ctx.trans_from_color, &led_ctx.trans_from_brightness, now_ms);
+                    led_ctx.trans_to_color = (led_color_t)LED_COLOR_OFF;
+                    led_ctx.trans_to_brightness = 0.0f;
+                    led_ctx.trans_start_ms = now_ms;
+                    led_ctx.trans_duration_ms = 300; // 0.3s
+                    led_ctx.transition_active = true;
+                    led_ctx.pc++;
+                    progressed = true;
+                    break;
+                }
+                case LED_ANIM_OP_SET_DEFAULT_SMOOTH_SLOW:
+                {
+                    sample_current_output(&led_ctx.trans_from_color, &led_ctx.trans_from_brightness, now_ms);
+                    led_ctx.trans_to_color = led_ctx.default_color;
+                    led_ctx.trans_to_brightness = LED_BRIGHTNESS_SCALE;
+                    led_ctx.trans_start_ms = now_ms;
+                    led_ctx.trans_duration_ms = 800; // 0.8s
+                    led_ctx.transition_active = true;
+                    led_ctx.pc++;
+                    progressed = true;
+                    break;
+                }
+                case LED_ANIM_OP_TURN_OFF_SMOOTH_SLOW:
+                {
+                    sample_current_output(&led_ctx.trans_from_color, &led_ctx.trans_from_brightness, now_ms);
+                    led_ctx.trans_to_color = (led_color_t)LED_COLOR_OFF;
+                    led_ctx.trans_to_brightness = 0.0f;
+                    led_ctx.trans_start_ms = now_ms;
+                    led_ctx.trans_duration_ms = 800; // 0.8s
+                    led_ctx.transition_active = true;
+                    led_ctx.pc++;
+                    progressed = true;
+                    break;
+                }
                 case LED_ANIM_OP_SLEEP_MS:
                     led_ctx.sleep_until_ms = now_ms + step->data.sleep.duration_ms;
                     led_ctx.pc++;
@@ -292,12 +484,20 @@ static void led_task(void *pvParameters)
                     }
                     break;
                 case LED_ANIM_OP_END:
-                    // End of program
+                {
+                    // End of program; try to start next queued animation
                     led_ctx.pc = NULL;
                     led_ctx.steps = NULL;
-                    // Leave LED in last state but clear tired after a small grace period handled by idle branch
+                    led_ctx.current_no_skip = false;
+                    led_play_req_t next;
+                    if (play_q_pop(&next))
+                    {
+                        start_animation(next.steps, next.no_skip);
+                    }
+                    // Leave LED state; tired bit will be cleared if idle next tick
                     progressed = true;
                     break;
+                }
                 }
             }
 
@@ -348,10 +548,53 @@ static void led_set_color_now(led_color_t color)
 {
     led_ctx.current_color = color;
     led_ctx.current_brightness = LED_BRIGHTNESS_SCALE;
+    led_ctx.transition_active = false; // cancel any ongoing transition
     ws2812_set_color_with_brightness(led_ctx.current_color, led_ctx.current_brightness);
 }
 
 static uint64_t millis(void)
 {
     return (uint64_t)esp_timer_get_time() / 1000ULL;
+}
+
+static void sample_current_output(led_color_t *out_color, float *out_brightness, uint64_t now_ms)
+{
+    if (!out_color || !out_brightness)
+        return;
+    if (led_ctx.transition_active && led_ctx.trans_duration_ms > 0)
+    {
+        uint64_t elapsed = now_ms - led_ctx.trans_start_ms;
+        float t = (float)elapsed / (float)led_ctx.trans_duration_ms;
+        if (t < 0.0f)
+            t = 0.0f;
+        if (t > 1.0f)
+            t = 1.0f;
+        out_color->r = (uint8_t)((int)led_ctx.trans_from_color.r + (int)((led_ctx.trans_to_color.r - led_ctx.trans_from_color.r) * t));
+        out_color->g = (uint8_t)((int)led_ctx.trans_from_color.g + (int)((led_ctx.trans_to_color.g - led_ctx.trans_from_color.g) * t));
+        out_color->b = (uint8_t)((int)led_ctx.trans_from_color.b + (int)((led_ctx.trans_to_color.b - led_ctx.trans_from_color.b) * t));
+        *out_brightness = led_ctx.trans_from_brightness + (led_ctx.trans_to_brightness - led_ctx.trans_from_brightness) * t;
+    }
+    else
+    {
+        *out_color = led_ctx.current_color;
+        *out_brightness = led_ctx.current_brightness;
+    }
+}
+
+static led_color_t palette_to_color(led_palette_t p)
+{
+    switch (p)
+    {
+    case LED_PAL_GREEN:
+        return (led_color_t)LED_COLOR_GREEN;
+    case LED_PAL_ORANGE:
+        return (led_color_t)LED_COLOR_ORANGE;
+    case LED_PAL_BLUE:
+        return (led_color_t)LED_COLOR_BLUE;
+    case LED_PAL_MAGENTA:
+        return (led_color_t)LED_COLOR_PURPLE;
+    case LED_PAL_RED:
+    default:
+        return (led_color_t)LED_COLOR_RED;
+    }
 }

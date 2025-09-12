@@ -66,7 +66,7 @@ void factory_app_main(void)
     if (gpio_get_level(REC_BUTTON_GPIO) == 0)
     {
         ESP_LOGI(TAG, "Recovery button detected pressed, showing default animation");
-        led_animations_play_action(LED_ACT_DEFAULT);
+        led_animations_play_action(LED_ACT_DEFAULT, false);
 
         int held = 1;
         for (int i = 0; i < 30; ++i) // 30 * 100ms = 3 seconds
@@ -196,7 +196,7 @@ void recovery_mode(void)
     ESP_LOGI(TAG, "Entering recovery mode...");
 
     // Start flashing red LED in recovery mode to notify
-    led_animations_play_action(LED_ACT_SD_FAIL);
+    led_animations_play_action(LED_ACT_SD_FAIL, false);
 
     // Initialize BLE service as the last step in recovery mode
     ble_serv_init();

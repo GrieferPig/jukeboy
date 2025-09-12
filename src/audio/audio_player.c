@@ -147,7 +147,13 @@ static bool audio_player_button_handler(const hid_event_data_t *event, void *use
 {
     if (!g_sd_initialized || g_total_tracks == 0)
     {
-        return false; // Don't consume event if we can't handle it
+        // SD not inserted/ready: on any button press, play attention animation
+        if (event->event_type == HID_EVENT_PRESS)
+        {
+            led_animations_play_action(LED_ACT_NO_SD_ATTENTION, false);
+            return true; // consume to avoid further handling
+        }
+        return false; // Don't consume non-press events
     }
 
     AudioCommand cmd = {0};
@@ -756,9 +762,21 @@ void audio_player_task(void *pvParameters)
 
     // Initial cart presence check (non-blocking setup)
     CartPresenceState current_cart_state = gpio_get_level(CART_PRESENCE_GPIO) ? REMOVED : INSERTED;
+    bool suppress_first_inserted_anim = (current_cart_state == INSERTED);
     if (current_cart_state == INSERTED)
     {
         init_sd_if_needed();
+        // After attempting SD init, play startup animation based on result
+        if (g_sd_initialized && g_total_tracks > 0)
+        {
+            led_animations_play_action(LED_ACT_DEFAULT, false);
+        }
+        // On failure, init_sd_if_needed has already shown SD_FAIL
+    }
+    else
+    {
+        // No SD on startup
+        led_animations_play_action(LED_ACT_NO_SD_ATTENTION, false);
     }
 
     // Main daemon loop
@@ -771,6 +789,8 @@ void audio_player_task(void *pvParameters)
             if (new_state == REMOVED)
             {
                 cleanup_on_cart_removal();
+                // Indicate SD removed
+                led_animations_play_action(LED_ACT_NO_SD_ATTENTION, false);
                 // Start/reset 15s timer
                 if (audio_can_sleep_timer)
                 {
@@ -791,8 +811,15 @@ void audio_player_task(void *pvParameters)
                 }
                 // Set tired bit and init SD
                 xEventGroupSetBits(power_mgr_tired_event_group, AUDIO_PLAYER_TIRED_BIT);
-                // Indicate SD inserted
-                led_animations_play_action(LED_ACT_SD_INSERTED);
+                // Indicate SD inserted (skip once on startup)
+                if (suppress_first_inserted_anim)
+                {
+                    suppress_first_inserted_anim = false;
+                }
+                else
+                {
+                    led_animations_play_action(LED_ACT_SD_INSERTED, true);
+                }
                 init_sd_if_needed();
             }
         }
@@ -842,7 +869,7 @@ void audio_player_task(void *pvParameters)
                     // Save state on pause
                     save_playback_state();
                     // Play pause animation
-                    led_animations_play_action(LED_ACT_PLAY_PAUSED);
+                    led_animations_play_action(LED_ACT_PLAY_PAUSED, false);
                     // Start a timer to clear the tired bit after a delay
                     if (audio_can_sleep_timer != NULL)
                     {
@@ -877,7 +904,7 @@ void audio_player_task(void *pvParameters)
                         ESP_LOGW(TAG, "Failed to acquire I2S mutex for resume");
                     }
                     // Play started/resumed animation (default)
-                    led_animations_play_action(LED_ACT_PLAY_STARTED);
+                    led_animations_play_action(LED_ACT_PLAY_STARTED, false);
                 }
                 break;
 
@@ -885,14 +912,14 @@ void audio_player_task(void *pvParameters)
                 ESP_LOGI(TAG, "CMD: NEXT_TRACK");
                 stop_playback();
                 start_playback(get_next_track());
-                led_animations_play_action(LED_ACT_NEXT_TRACK);
+                led_animations_play_action(LED_ACT_NEXT_TRACK, false);
                 break;
 
             case CMD_PREV_TRACK:
                 ESP_LOGI(TAG, "CMD: PREV_TRACK");
                 stop_playback();
                 start_playback(get_prev_track());
-                led_animations_play_action(LED_ACT_PREV_TRACK);
+                led_animations_play_action(LED_ACT_PREV_TRACK, false);
                 break;
 
             case CMD_SET_VOLUME_SHIFT:
@@ -910,7 +937,7 @@ void audio_player_task(void *pvParameters)
                 {
                     create_shuffled_playlist();
                 }
-                led_animations_play_action(LED_ACT_TOGGLE_SHUFFLE);
+                led_animations_play_action(LED_ACT_TOGGLE_SHUFFLE, false);
                 break;
 
             case CMD_FFWD_10SEC:
@@ -941,14 +968,14 @@ void audio_player_task(void *pvParameters)
                     g_volume_level++;
                     update_volume_shift();
                     ESP_LOGI(TAG, "CMD: VOLUME_INC - level %d", g_volume_level);
-                    led_animations_play_action(LED_ACT_VOLUME_UP);
+                    led_animations_play_action(LED_ACT_VOLUME_UP, false);
                 }
                 else if (g_volume_level == 11) // Unmute
                 {
                     g_volume_level = 1;
                     update_volume_shift();
                     ESP_LOGI(TAG, "CMD: VOLUME_INC - unmuted to level 1");
-                    led_animations_play_action(LED_ACT_VOLUME_UP);
+                    led_animations_play_action(LED_ACT_VOLUME_UP, false);
                 }
                 break;
 
@@ -963,14 +990,14 @@ void audio_player_task(void *pvParameters)
                     g_volume_level--;
                     update_volume_shift();
                     ESP_LOGI(TAG, "CMD: VOLUME_DEC - level %d", g_volume_level);
-                    led_animations_play_action(LED_ACT_VOLUME_DOWN);
+                    led_animations_play_action(LED_ACT_VOLUME_DOWN, false);
                 }
                 else if (g_volume_level == 1)
                 {
                     g_volume_level = 11; // Mute
                     update_volume_shift();
                     ESP_LOGI(TAG, "CMD: VOLUME_DEC - muted");
-                    led_animations_play_action(LED_ACT_VOLUME_DOWN);
+                    led_animations_play_action(LED_ACT_VOLUME_DOWN, false);
                 }
                 break;
 
@@ -1185,7 +1212,7 @@ static void init_sd_if_needed()
         {
             ESP_LOGE(TAG, "Failed to initialize SD card. Will retry on next cart insertion.");
             // Show SD fail animation (blink red forever) until next action
-            led_animations_play_action(LED_ACT_SD_FAIL);
+            led_animations_play_action(LED_ACT_SD_FAIL, false);
             return;
         }
         g_sd_initialized = true;

@@ -10,7 +10,7 @@ static const led_anim_step_t ANIM_SD_INSERTED[] = {
     LED_LOOP(3),
     LED_SET_DEFAULT,
     LED_SLEEP(200),
-    LED_SET_DEFAULT, // keep on for clarity (same as previous)
+    LED_OFF_STEP,
     LED_SLEEP(200),
     LED_END_LOOP,
     LED_END,
@@ -30,9 +30,9 @@ static const led_anim_step_t ANIM_SD_FAIL[] = {
 // Play paused: blink default color 10 times, 500ms on/off
 static const led_anim_step_t ANIM_PLAY_PAUSED[] = {
     LED_LOOP(10),
-    LED_SET_DEFAULT,
+    LED_SET_DEFAULT_SMOOTH,
     LED_SLEEP(500),
-    LED_OFF_STEP,
+    LED_OFF_STEP_SMOOTH,
     LED_SLEEP(500),
     LED_END_LOOP,
     LED_END,
@@ -40,9 +40,20 @@ static const led_anim_step_t ANIM_PLAY_PAUSED[] = {
 
 // Default: show default color for 5 seconds, then off
 static const led_anim_step_t ANIM_DEFAULT[] = {
-    LED_SET_DEFAULT,
+    LED_SET_DEFAULT_SMOOTH,
     LED_SLEEP(5000),
-    LED_OFF_STEP,
+    LED_OFF_STEP_SMOOTH,
+    LED_END,
+};
+
+// No SD attention: 10x slow smooth orange on/off with 1000ms sleeps
+static const led_anim_step_t ANIM_NO_SD_ATTENTION[] = {
+    LED_LOOP(10),
+    LED_SET_PAL_SMOOTH_SLOW(LED_PAL_ORANGE),
+    LED_SLEEP(1000),
+    LED_OFF_STEP_SMOOTH_SLOW,
+    LED_SLEEP(1000),
+    LED_END_LOOP,
     LED_END,
 };
 
@@ -61,16 +72,16 @@ void led_animations_set_default_from_battery(bool low_battery)
     }
 }
 
-esp_err_t led_animations_play_action(led_action_t action)
+esp_err_t led_animations_play_action(led_action_t action, bool no_skip)
 {
     switch (action)
     {
     case LED_ACT_SD_INSERTED:
-        return led_mgr_play(ANIM_SD_INSERTED);
+        return led_mgr_play_ex(ANIM_SD_INSERTED, no_skip);
     case LED_ACT_SD_FAIL:
-        return led_mgr_play(ANIM_SD_FAIL);
+        return led_mgr_play_ex(ANIM_SD_FAIL, no_skip);
     case LED_ACT_PLAY_PAUSED:
-        return led_mgr_play(ANIM_PLAY_PAUSED);
+        return led_mgr_play_ex(ANIM_PLAY_PAUSED, no_skip);
     case LED_ACT_PLAY_STARTED:
     case LED_ACT_NEXT_TRACK:
     case LED_ACT_PREV_TRACK:
@@ -78,7 +89,10 @@ esp_err_t led_animations_play_action(led_action_t action)
     case LED_ACT_VOLUME_DOWN:
     case LED_ACT_TOGGLE_SHUFFLE:
     case LED_ACT_DEFAULT:
+    case LED_ACT_NO_SD_ATTENTION:
     default:
-        return led_mgr_play(ANIM_DEFAULT);
+        if (action == LED_ACT_NO_SD_ATTENTION)
+            return led_mgr_play_ex(ANIM_NO_SD_ATTENTION, no_skip);
+        return led_mgr_play_ex(ANIM_DEFAULT, no_skip);
     }
 }
