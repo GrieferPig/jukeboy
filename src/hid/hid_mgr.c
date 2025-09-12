@@ -45,6 +45,20 @@ typedef struct
     TickType_t timestamp;
 } internal_button_event_t;
 
+// Deferred event types
+typedef enum
+{
+    DEFERRED_SINGLE_PRESS
+} deferred_event_type_t;
+
+// Deferred event structure
+typedef struct
+{
+    deferred_event_type_t type;
+    gpio_num_t gpio_num;
+    uint32_t duration_ms;
+} deferred_event_t;
+
 // Button state tracking
 typedef struct
 {
@@ -62,6 +76,7 @@ typedef struct
 
 // Global state
 static QueueHandle_t button_queue = NULL;
+static QueueHandle_t deferred_queue = NULL;
 static TaskHandle_t hid_task_handle = NULL;
 static TimerHandle_t hid_can_sleep_timer = NULL;
 static button_state_t button_states[NUM_BUTTONS];
@@ -125,23 +140,17 @@ static void double_press_timer_callback(TimerHandle_t xTimer)
             button_state_t *st = &button_states[i];
             if (st->press_count == 1)
             {
-                // Confirmed single short press: dispatch PRESS then RELEASE
+                // Confirmed single short press: send deferred event to main task
                 ESP_LOGI(TAG, "Single press confirmed (timer) GPIO %d", button_configs[i].gpio_num);
-                hid_event_data_t press_evt = {
-                    .gpio_num = button_configs[i].gpio_num,
-                    .event_type = HID_EVENT_PRESS,
-                    .duration_ms = 0,
-                    .combo_mask = 0};
-                hid_event_dispatch(&press_evt);
 
-                if (st->pending_release)
+                deferred_event_t deferred_evt = {
+                    .type = DEFERRED_SINGLE_PRESS,
+                    .gpio_num = button_configs[i].gpio_num,
+                    .duration_ms = st->pending_release_duration};
+
+                if (deferred_queue != NULL)
                 {
-                    hid_event_data_t rel_evt = {
-                        .gpio_num = button_configs[i].gpio_num,
-                        .event_type = HID_EVENT_RELEASE,
-                        .duration_ms = st->pending_release_duration,
-                        .combo_mask = 0};
-                    hid_event_dispatch(&rel_evt);
+                    xQueueSend(deferred_queue, &deferred_evt, 0);
                 }
             }
             // reset state
@@ -374,12 +383,38 @@ static void hid_can_sleep_timer_callback(TimerHandle_t xTimer)
 static void hid_task(void *pvParameters)
 {
     internal_button_event_t event;
+    deferred_event_t deferred_evt;
     TickType_t last_combo_check = 0;
 
     ESP_LOGI(TAG, "HID task started");
 
     while (1)
     {
+        // Process deferred events first (higher priority)
+        if (xQueueReceive(deferred_queue, &deferred_evt, 0))
+        {
+            switch (deferred_evt.type)
+            {
+            case DEFERRED_SINGLE_PRESS:
+                // Dispatch PRESS then RELEASE for confirmed single press
+                ESP_LOGI(TAG, "Dispatching deferred single press GPIO %d", deferred_evt.gpio_num);
+                hid_event_data_t press_evt = {
+                    .gpio_num = deferred_evt.gpio_num,
+                    .event_type = HID_EVENT_PRESS,
+                    .duration_ms = 0,
+                    .combo_mask = 0};
+                hid_event_dispatch(&press_evt);
+
+                hid_event_data_t rel_evt = {
+                    .gpio_num = deferred_evt.gpio_num,
+                    .event_type = HID_EVENT_RELEASE,
+                    .duration_ms = deferred_evt.duration_ms,
+                    .combo_mask = 0};
+                hid_event_dispatch(&rel_evt);
+                break;
+            }
+        }
+
         // Process button events
         if (xQueueReceive(button_queue, &event, pdMS_TO_TICKS(50)))
         {
@@ -442,6 +477,15 @@ esp_err_t hid_mgr_init(void)
     if (button_queue == NULL)
     {
         ESP_LOGE(TAG, "Failed to create button queue");
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+
+    // Create deferred event queue
+    deferred_queue = xQueueCreate(10, sizeof(deferred_event_t));
+    if (deferred_queue == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create deferred queue");
         ret = ESP_FAIL;
         goto cleanup;
     }
@@ -559,6 +603,13 @@ esp_err_t hid_mgr_deinit(void)
     {
         vQueueDelete(button_queue);
         button_queue = NULL;
+    }
+
+    // Delete deferred queue
+    if (deferred_queue != NULL)
+    {
+        vQueueDelete(deferred_queue);
+        deferred_queue = NULL;
     }
 
     // Deinitialize event system
