@@ -1,7 +1,7 @@
 #include "hid_mgr.h"
 #include "hid_event_system.h"
 #include "pindef.h"
-#include "led_mgr.h"
+#include "led_animations.h"
 #include "macros.h"
 
 #include "freertos/FreeRTOS.h"
@@ -357,17 +357,18 @@ static void check_restart_combo(void)
         {
             ESP_LOGW(TAG, "Restart combination held for %lu ms, restarting system...", elapsed_ms);
 
-            // Blink red LED for 1 second before restart
-            led_color_t red_color = LED_COLOR_RED;
-            led_color_t off_color = LED_COLOR_OFF;
-
-            for (int i = 0; i < 5; i++)
-            {
-                led_mgr_set_color(red_color);
-                vTaskDelay(pdMS_TO_TICKS(100));
-                led_mgr_set_color(off_color);
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
+            // Blink red LED for 1 second before restart using inline animation
+            static const led_anim_step_t RESTART_ANIM[] = {
+                LED_LOOP(5),
+                LED_SET((led_color_t)LED_COLOR_RED),
+                LED_SLEEP(100),
+                LED_OFF_STEP,
+                LED_SLEEP(100),
+                LED_END_LOOP,
+                LED_END,
+            };
+            led_mgr_play(RESTART_ANIM);
+            vTaskDelay(pdMS_TO_TICKS(1000));
 
             esp_restart();
         }

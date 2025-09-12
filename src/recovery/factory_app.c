@@ -12,7 +12,8 @@
 #include "ble_serv.h"
 #include "pindef.h"
 #include "driver/gpio.h"
-#include "led/led_mgr.h"
+#include "hid/led_mgr.h"
+#include "hid/led_animations.h"
 
 static const char *TAG = "factory_app";
 #define bootloader_ver "1.0.0"
@@ -64,9 +65,8 @@ void factory_app_main(void)
     gpio_set_direction(REC_BUTTON_GPIO, GPIO_MODE_INPUT);
     if (gpio_get_level(REC_BUTTON_GPIO) == 0)
     {
-        ESP_LOGI(TAG, "Recovery button detected pressed, setting LED to purple");
-        led_color_t purple_color = LED_COLOR_PURPLE;
-        led_mgr_set_color(purple_color);
+        ESP_LOGI(TAG, "Recovery button detected pressed, showing default animation");
+        led_animations_play_action(LED_ACT_DEFAULT);
 
         int held = 1;
         for (int i = 0; i < 30; ++i) // 30 * 100ms = 3 seconds
@@ -86,8 +86,8 @@ void factory_app_main(void)
         else
         {
             ESP_LOGI(TAG, "Recovery button released too early, not entering recovery mode.");
-            // Turn off LED since we're not entering recovery mode
-            led_mgr_turn_off();
+            // Stop LED animation since we're not entering recovery mode
+            led_mgr_stop();
         }
     }
     else
@@ -154,8 +154,8 @@ void factory_app_main(void)
             nvs_commit(nvs_handle);
             nvs_close(nvs_handle);
 
-            // Turn off LED before entering recovery mode
-            led_mgr_turn_off();
+            // Stop LED before entering recovery mode
+            led_mgr_stop();
 
             recovery_mode();
         }
@@ -171,8 +171,8 @@ void factory_app_main(void)
 
     nvs_close(nvs_handle);
 
-    // Turn off LED before continuing to OTA app
-    led_mgr_turn_off();
+    // Stop LED before continuing to OTA app
+    led_mgr_stop();
 
     // Find the next available OTA partition (which is ota_0 in our case)
     const esp_partition_t *ota_partition = esp_ota_get_next_update_partition(NULL);
@@ -185,7 +185,7 @@ void factory_app_main(void)
     ESP_LOGI(TAG, "Booting into main app (ota_0) for a single run...");
 
     // Turn off LED before restart
-    led_mgr_turn_off();
+    led_mgr_stop();
     vTaskDelay(pdMS_TO_TICKS(100)); // Small delay to ensure LED turns off
 
     esp_restart();
@@ -195,9 +195,8 @@ void recovery_mode(void)
 {
     ESP_LOGI(TAG, "Entering recovery mode...");
 
-    // Start flashing purple LED in recovery mode
-    led_color_t purple_color = LED_COLOR_PURPLE;
-    led_mgr_start_flash(purple_color);
+    // Start flashing red LED in recovery mode to notify
+    led_animations_play_action(LED_ACT_SD_FAIL);
 
     // Initialize BLE service as the last step in recovery mode
     ble_serv_init();
@@ -212,7 +211,7 @@ void recovery_mode(void)
     // Button pressed, exit recovery mode
 
     // Turn off LED before restart
-    led_mgr_turn_off();
+    led_mgr_stop();
     vTaskDelay(pdMS_TO_TICKS(100)); // Small delay to ensure LED turns off
 
     esp_restart();
