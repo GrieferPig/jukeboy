@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 #include "audio/adpcm_decoder.h" // Assuming your custom decoder library
@@ -93,6 +94,7 @@ QueueHandle_t empty_buffer_queue = NULL;
 QueueHandle_t cart_presence_notify_queue = NULL;
 EventGroupHandle_t player_event_group = NULL;
 TimerHandle_t audio_can_sleep_timer = NULL;
+SemaphoreHandle_t i2s_mutex = NULL; // Mutex to protect I2S operations
 
 // Event bits for the event group
 #define TRACK_FINISHED_BIT (1 << 0)
@@ -135,54 +137,6 @@ static inline void apply_gain(int16_t *pcm_buffer, size_t sample_count)
     {
         pcm_buffer[i] = pcm_buffer[i] >> shift;
     }
-}
-
-esp_err_t init_sdcard()
-{
-    esp_err_t ret;
-    // Remove local card declaration: sdmmc_card_t *card = NULL;
-    const char *mount_point = "/sdcard";
-
-    // Configure the SD card mount
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024};
-
-    // Configure SPI bus
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = SD_MOSI_PIN,
-        .miso_io_num = SD_MISO_PIN,
-        .sclk_io_num = SD_SCK_PIN,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
-    };
-
-    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Configure SPI device
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = SD_CS_PIN;
-    slot_config.host_id = SPI2_HOST;
-
-    // Mount the SD card
-    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &g_card);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
-    }
-    else
-    {
-        ESP_LOGI(TAG, "SD card mounted successfully");
-    }
-    return ret;
 }
 
 /**
@@ -297,6 +251,13 @@ static void unregister_audio_button_handlers(void)
  */
 static void stop_playback()
 {
+    // If already stopped, nothing to do
+    if (g_playback_state == STATE_STOPPED && !readerTaskHandle && !decoderTaskHandle)
+    {
+        ESP_LOGD(TAG, "Playback already stopped, nothing to do");
+        return;
+    }
+
     ESP_LOGI(TAG, "Stopping playback...");
 
     // Save state before stopping
@@ -641,22 +602,32 @@ void decoder_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Decoder Task started.");
 
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-    i2s_new_channel(&chan_cfg, &g_tx_handle, NULL);
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = I2S_BCK_PIN,
-            .ws = I2S_WS_PIN,
-            .dout = I2S_DOUT_PIN,
-            .din = I2S_GPIO_UNUSED,
-            .invert_flags = {.mclk_inv = false, .bclk_inv = false, .ws_inv = false},
-        },
-    };
-    i2s_channel_init_std_mode(g_tx_handle, &std_cfg);
-    i2s_channel_enable(g_tx_handle);
+    if (xSemaphoreTake(i2s_mutex, pdMS_TO_TICKS(1000)) == pdTRUE)
+    {
+        i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+        i2s_new_channel(&chan_cfg, &g_tx_handle, NULL);
+        i2s_std_config_t std_cfg = {
+            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100),
+            .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+            .gpio_cfg = {
+                .mclk = I2S_GPIO_UNUSED,
+                .bclk = I2S_BCK_PIN,
+                .ws = I2S_WS_PIN,
+                .dout = I2S_DOUT_PIN,
+                .din = I2S_GPIO_UNUSED,
+                .invert_flags = {.mclk_inv = false, .bclk_inv = false, .ws_inv = false},
+            },
+        };
+        i2s_channel_init_std_mode(g_tx_handle, &std_cfg);
+        i2s_channel_enable(g_tx_handle);
+        xSemaphoreGive(i2s_mutex);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to acquire I2S mutex for initialization");
+        vTaskDelete(NULL);
+        return;
+    }
 
     DecoderContext decoder_ctx;
 
@@ -695,17 +666,83 @@ void decoder_task(void *pvParameters)
 
             size_t bytes_written = 0;
             // State is guaranteed to be PLAYING here due to the check at the start of the loop
-            i2s_channel_write(g_tx_handle, i2s_write_chunk_buffer, pcm_bytes_decoded, &bytes_written, portMAX_DELAY);
+            if (xSemaphoreTake(i2s_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                if (g_tx_handle && g_playback_state == STATE_PLAYING)
+                {
+                    i2s_channel_write(g_tx_handle, i2s_write_chunk_buffer, pcm_bytes_decoded, &bytes_written, portMAX_DELAY);
+                }
+                xSemaphoreGive(i2s_mutex);
+            }
         }
         xQueueSend(empty_buffer_queue, &adpcm_block_to_decode, portMAX_DELAY);
     }
 
-    i2s_channel_disable(g_tx_handle);
-    i2s_del_channel(g_tx_handle);
-    g_tx_handle = NULL;
+    if (xSemaphoreTake(i2s_mutex, pdMS_TO_TICKS(500)) == pdTRUE)
+    {
+        if (g_tx_handle)
+        {
+            i2s_channel_disable(g_tx_handle);
+            i2s_del_channel(g_tx_handle);
+            g_tx_handle = NULL;
+        }
+        xSemaphoreGive(i2s_mutex);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to acquire I2S mutex for cleanup");
+    }
     ESP_LOGI(TAG, "Decoder task exiting.");
     xEventGroupSetBits(player_event_group, DECODER_TASK_EXITED_BIT);
     vTaskDelete(NULL);
+}
+
+esp_err_t init_sdcard()
+{
+    esp_err_t ret;
+    // Remove local card declaration: sdmmc_card_t *card = NULL;
+    const char *mount_point = "/sdcard";
+
+    // Configure the SD card mount
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024};
+
+    // Configure SPI bus
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = SD_MOSI_PIN,
+        .miso_io_num = SD_MISO_PIN,
+        .sclk_io_num = SD_SCK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+
+    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Configure SPI device
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = SD_CS_PIN;
+    slot_config.host_id = SPI2_HOST;
+
+    // Mount the SD card
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &g_card);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
+    }
+    else
+    {
+        ESP_LOGI(TAG, "SD card mounted successfully");
+    }
+    return ret;
 }
 
 /**
@@ -782,14 +819,22 @@ void audio_player_task(void *pvParameters)
                 if (g_playback_state == STATE_PLAYING)
                 {
                     g_playback_state = STATE_PAUSED;
-                    if (g_tx_handle)
+                    if (xSemaphoreTake(i2s_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
                     {
-                        i2s_channel_disable(g_tx_handle);
-                        ESP_LOGI(TAG, "CMD: PAUSE - I2S channel disabled.");
+                        if (g_tx_handle)
+                        {
+                            i2s_channel_disable(g_tx_handle);
+                            ESP_LOGI(TAG, "CMD: PAUSE - I2S channel disabled.");
+                        }
+                        else
+                        {
+                            ESP_LOGI(TAG, "CMD: PAUSE");
+                        }
+                        xSemaphoreGive(i2s_mutex);
                     }
                     else
                     {
-                        ESP_LOGI(TAG, "CMD: PAUSE");
+                        ESP_LOGW(TAG, "Failed to acquire I2S mutex for pause");
                     }
                     // Save state on pause
                     save_playback_state();
@@ -809,14 +854,22 @@ void audio_player_task(void *pvParameters)
                     // Set tired bit
                     xEventGroupSetBits(power_mgr_tired_event_group, AUDIO_PLAYER_TIRED_BIT);
                     g_playback_state = STATE_PLAYING;
-                    if (g_tx_handle)
+                    if (xSemaphoreTake(i2s_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
                     {
-                        i2s_channel_enable(g_tx_handle);
-                        ESP_LOGI(TAG, "CMD: RESUME - I2S channel enabled.");
+                        if (g_tx_handle)
+                        {
+                            i2s_channel_enable(g_tx_handle);
+                            ESP_LOGI(TAG, "CMD: RESUME - I2S channel enabled.");
+                        }
+                        else
+                        {
+                            ESP_LOGI(TAG, "CMD: RESUME");
+                        }
+                        xSemaphoreGive(i2s_mutex);
                     }
                     else
                     {
-                        ESP_LOGI(TAG, "CMD: RESUME");
+                        ESP_LOGW(TAG, "Failed to acquire I2S mutex for resume");
                     }
                 }
                 break;
@@ -974,6 +1027,10 @@ void audio_player_init()
     // Create command queue
     audio_command_queue = xQueueCreate(10, sizeof(AudioCommand));
     panic_if(!audio_command_queue, "Failed to create audio command queue");
+
+    // Create I2S mutex for thread-safe I2S operations
+    i2s_mutex = xSemaphoreCreateMutex();
+    panic_if(!i2s_mutex, "Failed to create I2S mutex");
     // Create event group
     player_event_group = xEventGroupCreate();
     panic_if(!player_event_group, "Failed to create event group.");
@@ -1024,6 +1081,9 @@ void audio_player_init()
  */
 void audio_player_send_command(const AudioCommand *cmd)
 {
+    static TickType_t last_command_time = 0;
+    const TickType_t min_command_interval = pdMS_TO_TICKS(50); // Minimum 50ms between commands
+
     if (cmd == NULL)
     {
         ESP_LOGE(TAG, "Cannot send NULL command");
@@ -1041,6 +1101,15 @@ void audio_player_send_command(const AudioCommand *cmd)
         ESP_LOGW(TAG, "Cart not inserted, ignoring command type %d", cmd->type);
         return;
     }
+
+    // Rate limiting: ignore commands that come too quickly
+    TickType_t current_time = xTaskGetTickCount();
+    if (current_time - last_command_time < min_command_interval)
+    {
+        ESP_LOGD(TAG, "Command %d ignored due to rate limiting", cmd->type);
+        return;
+    }
+    last_command_time = current_time;
 
     BaseType_t result = xQueueSend(audio_command_queue, cmd, 0);
     if (result != pdTRUE)
