@@ -114,6 +114,7 @@ void decoder_task(void *pvParameters);
 static void save_playback_state();
 static void init_sd_if_needed();       // Forward declaration for helper function
 static void cleanup_on_cart_removal(); // Forward declaration for helper function
+static void cart_presence_poll_task(void *pvParameters);
 
 // --- Helper Functions ---
 
@@ -756,6 +757,8 @@ void audio_player_task(void *pvParameters)
     bool suppress_first_inserted_anim = (current_cart_state == INSERTED);
     if (current_cart_state == INSERTED)
     {
+        // Delay SD initialization by 50ms after insert
+        vTaskDelay(pdMS_TO_TICKS(50));
         init_sd_if_needed();
         // After attempting SD init, play startup animation based on result
         if (g_sd_initialized && g_total_tracks > 0)
@@ -811,6 +814,8 @@ void audio_player_task(void *pvParameters)
                 {
                     led_animations_play_action(LED_ACT_SD_INSERTED, true);
                 }
+                // Delay SD initialization by 50ms after insert
+                vTaskDelay(pdMS_TO_TICKS(50));
                 init_sd_if_needed();
             }
         }
@@ -1023,12 +1028,36 @@ void audio_player_task(void *pvParameters)
     }
 }
 
-static void IRAM_ATTR cart_presense_gpio_isr_handler(void *arg)
+// Polling task for cart presence (100ms interval)
+static void cart_presence_poll_task(void *pvParameters)
 {
-    // get the current state of the pin
-    CartPresenceState state = gpio_get_level(CART_PRESENCE_GPIO) ? REMOVED : INSERTED;
-    // Cart removed, request change to idle state
-    xQueueSendFromISR(cart_presence_notify_queue, &state, NULL);
+    // Configure the GPIO as input with no interrupts
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << CART_PRESENCE_GPIO),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE, // External pull-up
+    };
+    gpio_config(&io_conf);
+
+    CartPresenceState last_state = gpio_get_level(CART_PRESENCE_GPIO) ? REMOVED : INSERTED;
+    // Send initial state
+    if (cart_presence_notify_queue)
+    {
+        xQueueOverwrite(cart_presence_notify_queue, &last_state);
+    }
+
+    for (;;)
+    {
+        CartPresenceState current = gpio_get_level(CART_PRESENCE_GPIO) ? REMOVED : INSERTED;
+        if (current != last_state && cart_presence_notify_queue)
+        {
+            xQueueOverwrite(cart_presence_notify_queue, &current);
+            last_state = current;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 // --- Public API Implementation ---
@@ -1079,25 +1108,12 @@ void audio_player_init()
     xQueueSend(empty_buffer_queue, &buf_a_ptr, 0);
     xQueueSend(empty_buffer_queue, &buf_b_ptr, 0);
 
-    // Create task status change queue
-    cart_presence_notify_queue = xQueueCreate(2, sizeof(CartPresenceState));
+    // Create cart presence queue
+    cart_presence_notify_queue = xQueueCreate(1, sizeof(CartPresenceState));
+    panic_if(!cart_presence_notify_queue, "Failed to create cart presence queue");
 
-    // Register a low to high interrupt on pin CART_PRESENCE
-    // when cart is removed, kill the player task
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_ANYEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << CART_PRESENCE_GPIO),
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_DISABLE, // External pull-up
-    };
-    gpio_config(&io_conf);
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(CART_PRESENCE_GPIO, cart_presense_gpio_isr_handler, NULL);
-
-    // call ISR handler once to set initial state
-    cart_presense_gpio_isr_handler(NULL);
-    panic_if(uxQueueMessagesWaiting(cart_presence_notify_queue) == 0, "Failed to get initial cart presence state");
+    // Start polling task for cart presence
+    xTaskCreate(cart_presence_poll_task, "CartPresencePoll", 2048, NULL, 7, NULL);
 
     // Register button event handlers after successful initialization
     register_audio_button_handlers();
