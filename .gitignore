@@ -9,3 +9,4 @@ data
 output
 adpcm_encoder
 *.wav
+efuse_data.bin

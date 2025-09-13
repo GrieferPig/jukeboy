@@ -8,6 +8,7 @@
 
 #include "pindef.h"
 #include <esp_log.h>
+#include "sys_mgr.h"
 
 const char *TAG = "main";
 
@@ -20,6 +21,9 @@ void ota_app_main()
 
     // Initialize the HID manager for button controls
     unwrap_esp_err(hid_mgr_init(), "Failed to initialize HID manager");
+
+    // Start system manager to read and log eFuse metadata
+    unwrap_esp_err(sys_mgr_init(), "Failed to initialize system manager");
 
     // Initialize the audio player. It will automatically detect tracks on the SD card.
     audio_player_init();
