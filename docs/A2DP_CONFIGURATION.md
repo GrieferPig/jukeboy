@@ -130,11 +130,13 @@ You should see Bluetooth components being compiled.
 
 ## Platform Compatibility
 
-- ✅ **ESP32**: Full support
+- ✅ **ESP32**: Full support (Bluetooth Classic + A2DP)
 - ❌ **ESP32-S2**: No Bluetooth support
-- ❌ **ESP32-S3**: Bluetooth LE only, no Classic BT
-- ❌ **ESP32-C3**: Bluetooth LE only, no Classic BT
-- ✅ **ESP32-C6**: Check ESP-IDF docs for A2DP support
+- ❌ **ESP32-S3**: Bluetooth LE only, no Classic BT/A2DP
+- ❌ **ESP32-C3**: Bluetooth LE only, no Classic BT/A2DP
+- ❌ **ESP32-C6**: Bluetooth LE only, no Classic BT/A2DP
+
+**Note**: A2DP requires Bluetooth Classic, which is only available on the original ESP32 chip.
 
 ## Testing the Module
 

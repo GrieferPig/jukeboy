@@ -290,10 +290,12 @@ esp_err_t write_audio_with_retry(const uint8_t *data, size_t size) {
 ### CPU Usage
 
 - A2DP encoding (SBC) adds CPU overhead
-- Run A2DP task on separate core if possible:
+- The A2DP task is automatically created by the module on the default core
+- To optimize, consider running your audio decoder on a separate core:
   ```c
-  xTaskCreatePinnedToCore(a2dp_task, "a2dp", 4096, NULL, 5, 
-                          &task_handle, 1); // Core 1
+  // Run audio decoder on core 0, letting A2DP use core 1
+  xTaskCreatePinnedToCore(decoder_task, "decoder", 4096, NULL, 5, 
+                          &task_handle, 0); // Core 0
   ```
 
 ### Latency
@@ -309,8 +311,8 @@ esp_err_t write_audio_with_retry(const uint8_t *data, size_t size) {
 
 1. **Test I2S Only**:
    ```c
-   // Disable A2DP
-   // set_audio_output_mode(AUDIO_OUTPUT_I2S);
+   // Test with I2S output only (do not initialize A2DP)
+   set_audio_output_mode(AUDIO_OUTPUT_I2S);
    ```
 
 2. **Test A2DP Only**:
