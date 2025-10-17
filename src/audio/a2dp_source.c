@@ -200,6 +200,20 @@ static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 
 /**
  * @brief Task to handle A2DP operations
+ * 
+ * This task receives PCM audio data from the queue and manages A2DP streaming.
+ * 
+ * TODO: For production use, implement SBC encoding here:
+ * 1. Receive PCM audio from queue (buffer.data, buffer.size)
+ * 2. Encode PCM to SBC format using an SBC encoder library
+ * 3. Send encoded SBC data using esp_a2d_media_ctrl() or appropriate API
+ * 
+ * Example SBC encoding flow:
+ *   sbc_encoder_encode(buffer.data, buffer.size, sbc_buffer, &sbc_size);
+ *   esp_a2d_media_data_send(sbc_buffer, sbc_size);
+ * 
+ * The module provides the complete framework (init, discovery, connection, queuing)
+ * and this is the integration point for the audio codec.
  */
 static void a2dp_task(void *pvParameters)
 {
@@ -210,9 +224,15 @@ static void a2dp_task(void *pvParameters)
         if (xQueueReceive(s_audio_queue, &buffer, portMAX_DELAY) == pdTRUE) {
             // Only send if we're in streaming state
             if (s_a2dp_state == A2DP_STATE_STREAMING) {
-                // Send data via A2DP (this would need proper SBC encoding in production)
-                // For now, we'll just log it
-                ESP_LOGD(TAG, "Would send %d bytes of audio data", buffer.size);
+                // TODO: Implement SBC encoding and transmission here
+                // For now, we acknowledge the write operation
+                ESP_LOGD(TAG, "Received %d bytes of PCM audio data for transmission", buffer.size);
+                
+                // In production, you would:
+                // 1. Encode buffer.data (PCM) to SBC format
+                // 2. Call ESP-IDF API to send SBC data to A2DP sink
+                // 3. Then signal write completion
+                
                 // Signal that write is complete
                 xSemaphoreGive(s_write_semaphore);
             } else if (s_a2dp_state == A2DP_STATE_CONNECTED) {

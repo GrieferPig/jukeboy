@@ -128,12 +128,13 @@ void app_main(void) {
 - The module currently supports SBC codec (default for A2DP)
 - Audio data is queued and sent asynchronously via a dedicated task
 
-## Limitations
+## Limitations and Future Work
 
 - Currently implements basic device discovery (connects to first audio sink found)
 - No device filtering or selection mechanism
-- SBC encoding needs to be implemented for full functionality
+- **SBC encoding needs to be implemented for actual audio transmission** - The module currently provides the framework and queues audio data, but the actual SBC encoding and transmission to the A2DP sink needs to be added for production use
 - Maximum audio buffer size is 2048 bytes per write
+- The module provides all the infrastructure (initialization, discovery, connection, queuing, callbacks) but requires SBC codec integration for actual audio playback
 
 ## Future Enhancements
 
