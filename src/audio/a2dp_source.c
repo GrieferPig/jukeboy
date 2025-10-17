@@ -73,18 +73,32 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
                  param->disc_res.bda[2], param->disc_res.bda[3],
                  param->disc_res.bda[4], param->disc_res.bda[5]);
         
-        // Check if device supports audio sink
-        for (int i = 0; i < param->disc_res.num_uuids; i++) {
-            // Audio Sink UUID: 0x110B
-            if (param->disc_res.eid_uuid.uuid.uuid16 == 0x110B ||
-                param->disc_res.eid_uuid.uuid.uuid16 == ESP_A2D_SINK_SERVICE_UUID) {
-                ESP_LOGI(TAG, "Found audio sink device");
-                memcpy(s_peer_bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
-                s_peer_found = true;
-                // Stop discovery
-                esp_bt_gap_cancel_discovery();
-                break;
+        // Check if device supports audio sink by examining COD (Class of Device)
+        // Major service class: Audio (bit 21)
+        // Major device class: Audio/Video (0x04)
+        uint32_t cod = param->disc_res.cod;
+        bool is_audio_device = false;
+        
+        // Check if it's an audio device
+        if (((cod >> 8) & 0x1F) == 0x04) {  // Major device class is Audio/Video
+            ESP_LOGI(TAG, "Found audio device");
+            is_audio_device = true;
+        }
+        
+        // Also check for audio service in EIR if available
+        if (param->disc_res.num_uuids > 0 && param->disc_res.eid_uuid.uuid.len == ESP_UUID_LEN_16) {
+            if (param->disc_res.eid_uuid.uuid.uuid16 == 0x110B) {  // Audio Sink
+                ESP_LOGI(TAG, "Found audio sink in EIR");
+                is_audio_device = true;
             }
+        }
+        
+        if (is_audio_device && !s_peer_found) {
+            ESP_LOGI(TAG, "Selecting this device for A2DP connection");
+            memcpy(s_peer_bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
+            s_peer_found = true;
+            // Stop discovery
+            esp_bt_gap_cancel_discovery();
         }
         break;
         

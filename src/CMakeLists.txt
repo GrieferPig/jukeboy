@@ -3,6 +3,9 @@
 
 FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.*)
 
+# Exclude example files from build
+list(FILTER app_sources EXCLUDE REGEX ".*_example\\.c$")
+
 idf_component_register(SRCS ${app_sources})
 
 set(ulp_app_name ulp_main)
