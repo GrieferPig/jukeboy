@@ -1,0 +1,9 @@
+menu "MicroPython Interpreter Configuration"
+
+    config ENABLE_TESTS
+        bool "Enable tests"
+        default n
+        help
+            This option enables tests in the MicroPython interpreter.
+
+endmenu
