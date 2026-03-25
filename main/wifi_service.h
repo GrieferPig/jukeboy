@@ -69,6 +69,13 @@ extern "C"
     /** Enable or disable 30 s periodic auto-reconnect using saved credentials. */
     esp_err_t wifi_service_set_autoreconnect(bool enable);
 
+    /**
+     * @brief Immediately attempt to reconnect using saved credentials.
+     *
+     * No-op if already connected or a connection attempt is already in progress.
+     */
+    esp_err_t wifi_service_reconnect(void);
+
     /** Thread-safe polling: current auto-reconnect status. */
     bool wifi_service_get_autoreconnect(void);
 

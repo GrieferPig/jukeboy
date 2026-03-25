@@ -77,7 +77,7 @@ EXT_RAM_BSS_ATTR static wifi_svc_scan_result_t s_scan_results;
 static esp_netif_t *s_sta_netif;
 static TimerHandle_t s_reconnect_timer;
 static volatile wifi_svc_state_t s_state = WIFI_SVC_STATE_IDLE;
-static volatile bool s_autoreconnect = false;
+static volatile bool s_autoreconnect = true;
 static bool s_sntp_initialised = false;
 static esp_netif_ip_info_t s_ip_info;
 static bool s_have_ip_info = false;
@@ -505,6 +505,14 @@ esp_err_t wifi_service_set_autoreconnect(bool enable)
 {
     wifi_svc_msg_t msg = {.cmd = CMD_SET_AUTORECONNECT,
                           .payload.autoreconnect = enable};
+    return xQueueSend(s_cmd_queue, &msg, pdMS_TO_TICKS(1000)) == pdPASS
+               ? ESP_OK
+               : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t wifi_service_reconnect(void)
+{
+    wifi_svc_msg_t msg = {.cmd = CMD_RECONNECT_TICK};
     return xQueueSend(s_cmd_queue, &msg, pdMS_TO_TICKS(1000)) == pdPASS
                ? ESP_OK
                : ESP_ERR_TIMEOUT;

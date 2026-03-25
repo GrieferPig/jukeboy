@@ -514,10 +514,14 @@ static const char *playback_mode_name(player_service_playback_mode_t mode)
 {
     switch (mode)
     {
-    case PLAYER_SVC_MODE_SEQUENTIAL:    return "sequential";
-    case PLAYER_SVC_MODE_SINGLE_REPEAT: return "single_repeat";
-    case PLAYER_SVC_MODE_SHUFFLE:       return "shuffle";
-    default:                            return "unknown";
+    case PLAYER_SVC_MODE_SEQUENTIAL:
+        return "sequential";
+    case PLAYER_SVC_MODE_SINGLE_REPEAT:
+        return "single_repeat";
+    case PLAYER_SVC_MODE_SHUFFLE:
+        return "shuffle";
+    default:
+        return "unknown";
     }
 }
 
@@ -806,6 +810,20 @@ static struct
     struct arg_end *end;
 } s_autoreconnect_args;
 
+static int wifi_reconnect_handler(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    esp_err_t err = wifi_service_reconnect();
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    printf("Reconnect requested.\n");
+    return 0;
+}
+
 static int wifi_autoreconnect_handler(int argc, char **argv)
 {
     int nerrors = arg_parse(argc, argv, (void **)&s_autoreconnect_args);
@@ -855,6 +873,7 @@ static int cmd_wifi(int argc, char **argv)
         "Usage: wifi <subcommand> [args]\n"
         "  connect <ssid> [password]   Connect to a WiFi access point\n"
         "  disconnect                  Disconnect from the current network\n"
+        "  reconnect                   Immediately reconnect using saved credentials\n"
         "  scan                        Scan for nearby access points\n"
         "  status                      Show WiFi state, IP info, and AP details\n"
         "  autoreconnect [on|off]      Get or set 30 s periodic auto-reconnect\n";
@@ -870,6 +889,8 @@ static int cmd_wifi(int argc, char **argv)
         return wifi_connect_handler(argc - 1, argv + 1);
     if (strcmp(sub, "disconnect") == 0)
         return wifi_disconnect_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "reconnect") == 0)
+        return wifi_reconnect_handler(argc - 1, argv + 1);
     if (strcmp(sub, "scan") == 0)
         return wifi_scan_handler(argc - 1, argv + 1);
     if (strcmp(sub, "status") == 0)
@@ -889,6 +910,8 @@ static int cmd_wifi(int argc, char **argv)
 
 static int cmd_reboot(int argc, char **argv)
 {
+    // Unmount SD card if mounted to ensure clean shutdown
+    cartridge_service_unmount();
     printf("Rebooting...\n");
     vTaskDelay(pdMS_TO_TICKS(100)); /* let UART flush */
     esp_restart();
@@ -1316,7 +1339,7 @@ esp_err_t console_service_init(void)
     s_audio_output_args.target = arg_str0(NULL, NULL, "<status|i2s|a2dp>", "Get status or switch audio output target");
     s_audio_output_args.end = arg_end(1);
     s_media_args.action = arg_str0(NULL, NULL, "<action>", "status|next|prev|pause|ff|rewind|vol_up|vol_down|mode");
-    s_media_args.value  = arg_str0(NULL, NULL, "<value>",  "For 'mode': sequential|single_repeat|shuffle");
+    s_media_args.value = arg_str0(NULL, NULL, "<value>", "For 'mode': sequential|single_repeat|shuffle");
     s_media_args.end = arg_end(2);
     s_telemetry_args.action = arg_str0(NULL, NULL, "<on|off>", "Enable or disable periodic memory/CPU telemetry");
     s_telemetry_args.end = arg_end(1);
