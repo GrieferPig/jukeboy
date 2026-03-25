@@ -5,7 +5,9 @@ cmake_minimum_required(VERSION 3.16)
 set(EXTRA_COMPONENT_DIRS "${CMAKE_SOURCE_DIR}/service/wifi_service"
                          "${CMAKE_SOURCE_DIR}/service/console_service"
                          "${CMAKE_SOURCE_DIR}/service/bluetooth_service"
-                         "${CMAKE_SOURCE_DIR}/service/cartridge_service")
+                         "${CMAKE_SOURCE_DIR}/service/cartridge_service"
+                         "${CMAKE_SOURCE_DIR}/service/player_service"
+                         "${CMAKE_SOURCE_DIR}/service/i2s_service")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.

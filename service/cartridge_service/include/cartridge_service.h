@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "esp_event.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -11,6 +12,16 @@
 extern "C"
 {
 #endif
+
+    ESP_EVENT_DECLARE_BASE(CARTRIDGE_SERVICE_EVENT);
+
+    typedef enum
+    {
+        CARTRIDGE_SVC_EVENT_STARTED,
+        CARTRIDGE_SVC_EVENT_INSERTED,
+        CARTRIDGE_SVC_EVENT_MOUNTED,
+        CARTRIDGE_SVC_EVENT_UNMOUNTED,
+    } cartridge_service_event_id_t;
 
     /**
      * Hardware configuration for the SD card SDMMC peripheral.
@@ -57,6 +68,11 @@ extern "C"
     esp_err_t cartridge_service_unmount(void);
 
     /**
+     * Return the configured VFS mount point for the cartridge filesystem.
+     */
+    const char *cartridge_service_get_mount_point(void);
+
+    /**
      * Returns whether a cartridge (SD card) is physically present.
      * This is currently a stub that always returns true; replace with a
      * card-detect GPIO read when hardware support is available.
@@ -70,7 +86,7 @@ extern "C"
 
     /**
      * Start an asynchronous 128KB read from the given file at the specified
-     * byte offset. The offset must be 4KB-aligned. The service manages file
+     * byte offset. The service manages file
      * open/close internally: if filename differs from the currently open file,
      * the old file is closed and the new one opened.
      *
@@ -82,7 +98,7 @@ extern "C"
      * Only one async read may be in flight at a time.
      *
      * @param filename     File path (relative to mount point root, e.g. "test.opu")
-     * @param offset       4KB-aligned byte offset into the file
+     * @param offset       byte offset into the file
      * @param notify_task  Task handle to notify on completion
      * @return ESP_OK if the request was accepted
      */

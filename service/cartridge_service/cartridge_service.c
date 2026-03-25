@@ -15,6 +15,8 @@
 
 static const char *TAG = "cartridge_svc";
 
+ESP_EVENT_DEFINE_BASE(CARTRIDGE_SERVICE_EVENT);
+
 static cartridge_service_config_t s_config;
 static bool s_initialised = false;
 static bool s_mounted = false;
@@ -46,6 +48,11 @@ typedef struct
 
 static QueueHandle_t s_read_queue = NULL;
 static TaskHandle_t s_reader_task = NULL;
+
+static void cartridge_service_post_event(cartridge_service_event_id_t event_id)
+{
+    esp_event_post(CARTRIDGE_SERVICE_EVENT, event_id, NULL, 0, 0);
+}
 
 static void cartridge_reader_task(void *param)
 {
@@ -157,6 +164,11 @@ esp_err_t cartridge_service_init(const cartridge_service_config_t *config)
     ESP_LOGI(TAG, "cartridge service init (CLK=%d CMD=%d D0=%d mount=%s)",
              s_config.clk_gpio, s_config.cmd_gpio,
              s_config.d0_gpio, s_config.mount_point);
+    cartridge_service_post_event(CARTRIDGE_SVC_EVENT_STARTED);
+    if (cartridge_service_is_inserted())
+    {
+        cartridge_service_post_event(CARTRIDGE_SVC_EVENT_INSERTED);
+    }
     return ESP_OK;
 }
 
@@ -210,6 +222,7 @@ esp_err_t cartridge_service_mount(void)
     s_mounted = true;
     sdmmc_card_print_info(stdout, s_card);
     ESP_LOGI(TAG, "SD card mounted at %s", s_config.mount_point);
+    cartridge_service_post_event(CARTRIDGE_SVC_EVENT_MOUNTED);
     return ESP_OK;
 }
 
@@ -224,7 +237,13 @@ esp_err_t cartridge_service_unmount(void)
     s_card = NULL;
     s_mounted = false;
     ESP_LOGI(TAG, "SD card unmounted");
+    cartridge_service_post_event(CARTRIDGE_SVC_EVENT_UNMOUNTED);
     return ESP_OK;
+}
+
+const char *cartridge_service_get_mount_point(void)
+{
+    return s_config.mount_point;
 }
 
 bool cartridge_service_is_inserted(void)
@@ -244,12 +263,6 @@ esp_err_t cartridge_service_read_chunk_async(const char *filename,
 {
     if (!filename || !notify_task)
     {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if ((offset & 0xFFFU) != 0)
-    {
-        ESP_LOGE(TAG, "offset %u is not 4KB-aligned", (unsigned)offset);
         return ESP_ERR_INVALID_ARG;
     }
 
