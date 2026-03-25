@@ -17,6 +17,8 @@
 #include "wifi_service.h"
 #include "console_service.h"
 #include "cartridge_service.h"
+#include "audio_output_switch.h"
+#include "player_service.h"
 
 static const char *TAG = "console_svc";
 
@@ -432,6 +434,114 @@ static int bt_bonded_handler(int argc, char **argv)
     }
 
     free(devices);
+    return 0;
+}
+
+static const char *media_control_name(player_service_control_t control)
+{
+    switch (control)
+    {
+    case PLAYER_SVC_CONTROL_NEXT:
+        return "next";
+    case PLAYER_SVC_CONTROL_PREVIOUS:
+        return "prev";
+    case PLAYER_SVC_CONTROL_FAST_FORWARD:
+        return "ff";
+    case PLAYER_SVC_CONTROL_FAST_BACKWARD:
+        return "rewind";
+    case PLAYER_SVC_CONTROL_VOLUME_UP:
+        return "vol_up";
+    case PLAYER_SVC_CONTROL_VOLUME_DOWN:
+        return "vol_down";
+    case PLAYER_SVC_CONTROL_PAUSE:
+        return "pause";
+    default:
+        return "unknown";
+    }
+}
+
+static bool media_parse_control(const char *value, player_service_control_t *control)
+{
+    if (!value || !control)
+    {
+        return false;
+    }
+
+    if (strcmp(value, "next") == 0)
+    {
+        *control = PLAYER_SVC_CONTROL_NEXT;
+    }
+    else if (strcmp(value, "prev") == 0 || strcmp(value, "previous") == 0)
+    {
+        *control = PLAYER_SVC_CONTROL_PREVIOUS;
+    }
+    else if (strcmp(value, "ff") == 0 || strcmp(value, "fast_forward") == 0)
+    {
+        *control = PLAYER_SVC_CONTROL_FAST_FORWARD;
+    }
+    else if (strcmp(value, "rewind") == 0 || strcmp(value, "backward") == 0)
+    {
+        *control = PLAYER_SVC_CONTROL_FAST_BACKWARD;
+    }
+    else if (strcmp(value, "vol_up") == 0 || strcmp(value, "volume_up") == 0)
+    {
+        *control = PLAYER_SVC_CONTROL_VOLUME_UP;
+    }
+    else if (strcmp(value, "vol_down") == 0 || strcmp(value, "volume_down") == 0)
+    {
+        *control = PLAYER_SVC_CONTROL_VOLUME_DOWN;
+    }
+    else if (strcmp(value, "pause") == 0 || strcmp(value, "play_pause") == 0 || strcmp(value, "toggle") == 0)
+    {
+        *control = PLAYER_SVC_CONTROL_PAUSE;
+    }
+    else
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static struct
+{
+    struct arg_str *action;
+    struct arg_end *end;
+} s_media_args;
+
+static int cmd_media(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&s_media_args);
+    player_service_control_t control;
+    esp_err_t err;
+
+    if (nerrors)
+    {
+        arg_print_errors(stderr, s_media_args.end, argv[0]);
+        return 1;
+    }
+
+    if (s_media_args.action->count == 0 || strcmp(s_media_args.action->sval[0], "status") == 0)
+    {
+        printf("Playback: %s\n", player_service_is_paused() ? "paused" : "running");
+        printf("Volume:   %u%%\n", (unsigned)player_service_get_volume_percent());
+        return 0;
+    }
+
+    if (!media_parse_control(s_media_args.action->sval[0], &control))
+    {
+        printf("Usage: media [status|next|prev|pause|ff|rewind|vol_up|vol_down]\n");
+        return 1;
+    }
+
+    err = player_service_request_control(control);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Media control queued: %s\n", media_control_name(control));
     return 0;
 }
 
@@ -888,6 +998,59 @@ static int cmd_sd(int argc, char **argv)
 }
 
 /* ════════════════════════════════════════════════════════════════════ *
+ *  Audio output commands                                              *
+ * ════════════════════════════════════════════════════════════════════ */
+
+static struct
+{
+    struct arg_str *target;
+    struct arg_end *end;
+} s_audio_output_args;
+
+static int cmd_audio_output(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&s_audio_output_args);
+    if (nerrors)
+    {
+        arg_print_errors(stderr, s_audio_output_args.end, argv[0]);
+        return 1;
+    }
+
+    if (s_audio_output_args.target->count == 0 || strcmp(s_audio_output_args.target->sval[0], "status") == 0)
+    {
+        printf("Audio output: %s\n", audio_output_switch_target_name(audio_output_switch_get_target()));
+        printf("A2DP connected: %s\n", bluetooth_service_is_a2dp_connected() ? "yes" : "no");
+        return 0;
+    }
+
+    const char *target = s_audio_output_args.target->sval[0];
+    audio_output_target_t next_target;
+    if (strcmp(target, "i2s") == 0)
+    {
+        next_target = AUDIO_OUTPUT_TARGET_I2S;
+    }
+    else if (strcmp(target, "a2dp") == 0)
+    {
+        next_target = AUDIO_OUTPUT_TARGET_BLUETOOTH;
+    }
+    else
+    {
+        printf("Usage: audio_output [status|i2s|a2dp]\n");
+        return 1;
+    }
+
+    esp_err_t err = audio_output_switch_select(next_target);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Audio output switched to %s\n", audio_output_switch_target_name(next_target));
+    return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════ *
  *  Console service init                                               *
  * ════════════════════════════════════════════════════════════════════ */
 
@@ -912,6 +1075,10 @@ esp_err_t console_service_init(void)
     s_connect_args.end = arg_end(2);
     s_autoreconnect_args.action = arg_str0(NULL, NULL, "<on|off>", "Enable or disable");
     s_autoreconnect_args.end = arg_end(1);
+    s_audio_output_args.target = arg_str0(NULL, NULL, "<status|i2s|a2dp>", "Get status or switch audio output target");
+    s_audio_output_args.end = arg_end(1);
+    s_media_args.action = arg_str0(NULL, NULL, "<status|next|prev|pause|ff|rewind|vol_up|vol_down>", "Get status or control the local player");
+    s_media_args.end = arg_end(1);
     s_telemetry_args.action = arg_str0(NULL, NULL, "<on|off>", "Enable or disable periodic memory/CPU telemetry");
     s_telemetry_args.end = arg_end(1);
 
@@ -941,6 +1108,24 @@ esp_err_t console_service_init(void)
         .func = cmd_sd,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sd_cmd));
+
+    const esp_console_cmd_t audio_output_cmd = {
+        .command = "audio_output",
+        .help = "Audio output: audio_output [status|i2s|a2dp]",
+        .hint = NULL,
+        .func = cmd_audio_output,
+        .argtable = &s_audio_output_args,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&audio_output_cmd));
+
+    const esp_console_cmd_t media_cmd = {
+        .command = "media",
+        .help = "Local media control: media [status|next|prev|pause|ff|rewind|vol_up|vol_down]",
+        .hint = NULL,
+        .func = cmd_media,
+        .argtable = &s_media_args,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&media_cmd));
 
     /* System commands */
     register_reboot();

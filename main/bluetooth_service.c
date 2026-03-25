@@ -18,6 +18,7 @@
 #include "esp_spp_api.h"
 
 #include "bluetooth_service.h"
+#include "player_service.h"
 
 #define BT_SVC_TASK_STACK_SIZE 2048
 #define BT_SVC_TASK_PRIORITY 5
@@ -45,6 +46,11 @@ typedef enum
     BT_SVC_CMD_A2DP_CONNECTION_STATE,
     BT_SVC_CMD_A2DP_AUDIO_STATE,
     BT_SVC_CMD_AVRCP_PASSTHROUGH_RSP,
+    BT_SVC_CMD_AVRCP_PASSTHROUGH_CMD,
+    BT_SVC_CMD_AVRCP_SET_ABS_VOL,
+    BT_SVC_CMD_AVRCP_REG_VOL_NOTIFY,
+    BT_SVC_CMD_AVRCP_CT_VOL_CHANGE,
+    BT_SVC_CMD_AVRCP_CT_RN_CAPS,
     BT_SVC_CMD_SPP_CONNECTED,
     BT_SVC_CMD_SPP_DISCONNECTED,
 } bluetooth_service_cmd_t;
@@ -89,6 +95,24 @@ typedef struct
         } avrc_rsp;
         struct
         {
+            uint8_t key_code;
+            uint8_t key_state;
+        } avrc_cmd;
+        struct
+        {
+            uint8_t volume;
+        } abs_vol;
+        struct
+        {
+            uint8_t event_id;
+        } reg_ntf;
+        struct
+        {
+            uint8_t volume; /* 0..127 from remote TG */
+        } ct_vol_change;
+        esp_avrc_rn_evt_cap_mask_t ct_rn_caps;
+        struct
+        {
             esp_bd_addr_t remote_bda;
         } spp_remote;
         uint8_t media_key;
@@ -105,6 +129,8 @@ static bool s_discovery_running;
 static bool s_a2dp_connected;
 static esp_bd_addr_t s_connected_bda;
 static uint8_t s_avrc_tl;
+static bool s_avrc_rn_vol_registered;
+static bool s_avrc_ct_vol_registered;
 static uint32_t s_spp_handle;
 static esp_bd_addr_t s_spp_remote_bda;
 EXT_RAM_BSS_ATTR static bluetooth_service_discovery_result_t s_discovered[BT_SVC_MAX_DISCOVERED_DEVICES];
@@ -417,12 +443,100 @@ static void bt_svc_avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t 
                  "AVRCP %s " ESP_BD_ADDR_STR,
                  param->conn_stat.connected ? "connected" : "disconnected",
                  ESP_BD_ADDR_HEX(param->conn_stat.remote_bda));
+        if (param->conn_stat.connected)
+        {
+            s_avrc_ct_vol_registered = false;
+            s_avrc_tl = (s_avrc_tl + 1) & 0x0F;
+            esp_avrc_ct_send_get_rn_capabilities_cmd(s_avrc_tl);
+        }
+        break;
+    case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT:
+        msg.cmd = BT_SVC_CMD_AVRCP_CT_RN_CAPS;
+        msg.data.ct_rn_caps = param->get_rn_caps_rsp.evt_set;
+        bt_svc_queue_send(&msg);
+        break;
+    case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
+        if (param->change_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE)
+        {
+            msg.cmd = BT_SVC_CMD_AVRCP_CT_VOL_CHANGE;
+            msg.data.ct_vol_change.volume = param->change_ntf.event_parameter.volume;
+            bt_svc_queue_send(&msg);
+        }
         break;
     case ESP_AVRC_CT_PASSTHROUGH_RSP_EVT:
         msg.cmd = BT_SVC_CMD_AVRCP_PASSTHROUGH_RSP;
         msg.data.avrc_rsp.key_code = param->psth_rsp.key_code;
         msg.data.avrc_rsp.key_state = param->psth_rsp.key_state;
         msg.data.avrc_rsp.rsp_code = param->psth_rsp.rsp_code;
+        bt_svc_queue_send(&msg);
+        break;
+    default:
+        break;
+    }
+}
+
+static player_service_control_t bt_svc_player_control_from_key(uint8_t key_code, bool *handled)
+{
+    if (handled)
+    {
+        *handled = true;
+    }
+
+    switch (key_code)
+    {
+    case ESP_AVRC_PT_CMD_FORWARD:
+        return PLAYER_SVC_CONTROL_NEXT;
+    case ESP_AVRC_PT_CMD_BACKWARD:
+        return PLAYER_SVC_CONTROL_PREVIOUS;
+    case ESP_AVRC_PT_CMD_FAST_FORWARD:
+        return PLAYER_SVC_CONTROL_FAST_FORWARD;
+    case ESP_AVRC_PT_CMD_REWIND:
+        return PLAYER_SVC_CONTROL_FAST_BACKWARD;
+    case ESP_AVRC_PT_CMD_VOL_UP:
+        return PLAYER_SVC_CONTROL_VOLUME_UP;
+    case ESP_AVRC_PT_CMD_VOL_DOWN:
+        return PLAYER_SVC_CONTROL_VOLUME_DOWN;
+    case ESP_AVRC_PT_CMD_PAUSE:
+    case ESP_AVRC_PT_CMD_PLAY:
+    case ESP_AVRC_PT_CMD_STOP:
+        return PLAYER_SVC_CONTROL_PAUSE;
+    default:
+        if (handled)
+        {
+            *handled = false;
+        }
+        return PLAYER_SVC_CONTROL_PAUSE;
+    }
+}
+
+static void bt_svc_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
+{
+    bluetooth_service_msg_t msg = {0};
+
+    switch (event)
+    {
+    case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+        ESP_LOGI(TAG,
+                 "AVRCP TG %s " ESP_BD_ADDR_STR,
+                 param->conn_stat.connected ? "connected" : "disconnected",
+                 ESP_BD_ADDR_HEX(param->conn_stat.remote_bda));
+        break;
+    case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
+        msg.cmd = BT_SVC_CMD_AVRCP_PASSTHROUGH_CMD;
+        msg.data.avrc_cmd.key_code = param->psth_cmd.key_code;
+        msg.data.avrc_cmd.key_state = param->psth_cmd.key_state;
+        bt_svc_queue_send(&msg);
+        break;
+    case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
+        ESP_LOGI(TAG, "AVRCP TG set_abs_vol=%u (remote CT->our TG)",
+                 (unsigned)param->set_abs_vol.volume);
+        msg.cmd = BT_SVC_CMD_AVRCP_SET_ABS_VOL;
+        msg.data.abs_vol.volume = param->set_abs_vol.volume;
+        bt_svc_queue_send(&msg);
+        break;
+    case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT:
+        msg.cmd = BT_SVC_CMD_AVRCP_REG_VOL_NOTIFY;
+        msg.data.reg_ntf.event_id = param->reg_ntf.event_id;
         bt_svc_queue_send(&msg);
         break;
     default:
@@ -597,6 +711,88 @@ static void bt_svc_task(void *arg)
                                s_media_key_cb_ctx);
             }
             break;
+        case BT_SVC_CMD_AVRCP_PASSTHROUGH_CMD:
+            if (msg.data.avrc_cmd.key_state == ESP_AVRC_PT_CMD_STATE_PRESSED)
+            {
+                bool handled = false;
+                player_service_control_t control = bt_svc_player_control_from_key(msg.data.avrc_cmd.key_code, &handled);
+                if (handled)
+                {
+                    esp_err_t err = player_service_request_control(control);
+                    if (err != ESP_OK)
+                    {
+                        ESP_LOGW(TAG,
+                                 "player media control failed for key %u: %s",
+                                 (unsigned)msg.data.avrc_cmd.key_code,
+                                 esp_err_to_name(err));
+                    }
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "ignoring unsupported AVRCP target key %u", (unsigned)msg.data.avrc_cmd.key_code);
+                }
+            }
+            break;
+        case BT_SVC_CMD_AVRCP_SET_ABS_VOL:
+        {
+            uint8_t avrc_vol = msg.data.abs_vol.volume;
+            ESP_LOGI(TAG, "AVRCP absolute volume set: %u/127", (unsigned)avrc_vol);
+            player_service_set_volume_absolute(avrc_vol);
+            if (s_avrc_rn_vol_registered)
+            {
+                esp_avrc_rn_param_t rn = {0};
+                rn.volume = avrc_vol;
+                esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE,
+                                        ESP_AVRC_RN_RSP_CHANGED, &rn);
+                s_avrc_rn_vol_registered = false;
+            }
+        }
+        break;
+        case BT_SVC_CMD_AVRCP_CT_RN_CAPS:
+            if (esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST,
+                                                   &msg.data.ct_rn_caps,
+                                                   ESP_AVRC_RN_VOLUME_CHANGE))
+            {
+                ESP_LOGI(TAG, "remote TG supports VOLUME_CHANGE, registering for notifications");
+                s_avrc_tl = (s_avrc_tl + 1) & 0x0F;
+                esp_avrc_ct_send_register_notification_cmd(s_avrc_tl,
+                                                           ESP_AVRC_RN_VOLUME_CHANGE,
+                                                           0);
+                s_avrc_ct_vol_registered = true;
+            }
+            else
+            {
+                ESP_LOGI(TAG, "remote TG does not support VOLUME_CHANGE notifications");
+            }
+            break;
+        case BT_SVC_CMD_AVRCP_CT_VOL_CHANGE:
+        {
+            uint8_t remote_vol = msg.data.ct_vol_change.volume;
+            ESP_LOGI(TAG, "remote TG volume change: %u/127", (unsigned)remote_vol);
+            player_service_set_volume_absolute(remote_vol);
+            /* Re-register for the next notification */
+            if (s_avrc_ct_vol_registered)
+            {
+                s_avrc_tl = (s_avrc_tl + 1) & 0x0F;
+                esp_avrc_ct_send_register_notification_cmd(s_avrc_tl,
+                                                           ESP_AVRC_RN_VOLUME_CHANGE,
+                                                           0);
+            }
+        }
+        break;
+        case BT_SVC_CMD_AVRCP_REG_VOL_NOTIFY:
+            if (msg.data.reg_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE)
+            {
+                s_avrc_rn_vol_registered = true;
+                uint8_t vol_pct = player_service_get_volume_percent();
+                esp_avrc_rn_param_t rn = {0};
+                rn.volume = (uint8_t)((uint32_t)vol_pct * 127U / 100U);
+                esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE,
+                                        ESP_AVRC_RN_RSP_INTERIM, &rn);
+                ESP_LOGI(TAG, "AVRCP volume change notification registered, interim vol=%u",
+                         (unsigned)rn.volume);
+            }
+            break;
         case BT_SVC_CMD_SPP_CONNECTED:
             bt_svc_invoke_connection_callback(BLUETOOTH_SVC_CONNECTION_EVENT_SPP_CONNECTED,
                                               msg.data.spp_remote.remote_bda);
@@ -653,11 +849,28 @@ esp_err_t bluetooth_service_init(void)
     ESP_ERROR_CHECK(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE));
     ESP_ERROR_CHECK(esp_bt_gap_set_pin(ESP_BT_PIN_TYPE_FIXED, 4, pin_code));
 
+    ESP_ERROR_CHECK(esp_avrc_tg_init());
+    ESP_ERROR_CHECK(esp_avrc_tg_register_callback(bt_svc_avrc_tg_cb));
     ESP_ERROR_CHECK(esp_avrc_ct_init());
     ESP_ERROR_CHECK(esp_avrc_ct_register_callback(bt_svc_avrc_cb));
     ESP_ERROR_CHECK(esp_a2d_register_callback(bt_svc_a2dp_cb));
     ESP_ERROR_CHECK(esp_a2d_source_register_data_callback(bt_svc_a2dp_data_cb));
     ESP_ERROR_CHECK(esp_a2d_source_init());
+
+    esp_avrc_psth_bit_mask_t cmd_mask = {0};
+    esp_avrc_rn_evt_cap_mask_t evt_mask = {0};
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_mask, ESP_AVRC_PT_CMD_PLAY);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_mask, ESP_AVRC_PT_CMD_PAUSE);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_mask, ESP_AVRC_PT_CMD_STOP);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_mask, ESP_AVRC_PT_CMD_FORWARD);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_mask, ESP_AVRC_PT_CMD_BACKWARD);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_mask, ESP_AVRC_PT_CMD_FAST_FORWARD);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_mask, ESP_AVRC_PT_CMD_REWIND);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_mask, ESP_AVRC_PT_CMD_VOL_UP);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_mask, ESP_AVRC_PT_CMD_VOL_DOWN);
+    ESP_ERROR_CHECK(esp_avrc_tg_set_psth_cmd_filter(ESP_AVRC_PSTH_FILTER_SUPPORTED_CMD, &cmd_mask));
+    esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evt_mask, ESP_AVRC_RN_VOLUME_CHANGE);
+    ESP_ERROR_CHECK(esp_avrc_tg_set_rn_evt_cap(&evt_mask));
 
     static const esp_spp_cfg_t spp_cfg = {
         .mode = ESP_SPP_MODE_CB,
@@ -752,6 +965,16 @@ void bluetooth_service_register_media_key_callback(bluetooth_service_media_key_c
 {
     s_media_key_cb = callback;
     s_media_key_cb_ctx = user_ctx;
+}
+
+bool bluetooth_service_is_initialised(void)
+{
+    return s_initialised;
+}
+
+bool bluetooth_service_is_a2dp_connected(void)
+{
+    return s_a2dp_connected;
 }
 
 size_t bluetooth_service_get_bonded_device_count(void)

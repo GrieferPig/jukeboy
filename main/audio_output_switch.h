@@ -18,8 +18,11 @@ extern "C"
         AUDIO_OUTPUT_TARGET_I2S,
     } audio_output_target_t;
 
+    esp_err_t audio_output_switch_init(void);
     esp_err_t audio_output_switch_set_provider(audio_output_pcm_provider_t provider, void *user_ctx);
-    audio_output_register_pcm_provider_fn audio_output_switch_select(audio_output_target_t target);
+    esp_err_t audio_output_switch_select(audio_output_target_t target);
+    audio_output_target_t audio_output_switch_get_target(void);
+    const char *audio_output_switch_target_name(audio_output_target_t target);
 
 #ifdef __cplusplus
 }

@@ -55,6 +55,8 @@ extern "C"
     esp_err_t bluetooth_service_register_pcm_provider(bluetooth_service_pcm_provider_t provider, void *user_ctx);
     void bluetooth_service_register_connection_callback(bluetooth_service_connection_cb_t callback, void *user_ctx);
     void bluetooth_service_register_media_key_callback(bluetooth_service_media_key_cb_t callback, void *user_ctx);
+    bool bluetooth_service_is_initialised(void);
+    bool bluetooth_service_is_a2dp_connected(void);
     size_t bluetooth_service_get_bonded_device_count(void);
     esp_err_t bluetooth_service_get_bonded_devices(size_t *count, esp_bd_addr_t *devices);
 

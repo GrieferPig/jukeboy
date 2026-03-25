@@ -38,12 +38,12 @@ void app_main(void)
     ESP_ERROR_CHECK(bluetooth_service_init());
     ESP_ERROR_CHECK(wifi_service_init());
     ESP_ERROR_CHECK(i2s_service_init());
+    ESP_ERROR_CHECK(audio_output_switch_init());
 
     ESP_ERROR_CHECK(bluetooth_service_register_48k_sbc_endpoint());
 
     ESP_ERROR_CHECK(audio_output_switch_set_provider(player_service_pcm_provider, NULL));
-    audio_output_switch_select(AUDIO_OUTPUT_TARGET_I2S);
-    ESP_ERROR_CHECK(i2s_service_start_audio());
+    ESP_ERROR_CHECK(audio_output_switch_select(AUDIO_OUTPUT_TARGET_I2S));
 
     ESP_ERROR_CHECK(player_service_init());
     ESP_ERROR_CHECK(console_service_init());
