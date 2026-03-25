@@ -66,7 +66,7 @@ extern "C"
     /** Enqueue an async scan command. Listen for WIFI_SVC_EVENT_SCAN_DONE. */
     esp_err_t wifi_service_scan(void);
 
-    /** Enable or disable 30 s periodic auto-reconnect (+ auto-scan). */
+    /** Enable or disable 30 s periodic auto-reconnect using saved credentials. */
     esp_err_t wifi_service_set_autoreconnect(bool enable);
 
     /** Thread-safe polling: current auto-reconnect status. */

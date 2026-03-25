@@ -1,11 +1,10 @@
-#include <ctype.h>
-#include <dirent.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -17,17 +16,21 @@
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_crc.h"
 
 #include "decoder/esp_audio_dec.h"
 #include "decoder/impl/esp_opus_dec.h"
 #include "esp_audio_types.h"
 
 #include "cartridge_service.h"
+#include "jukeboy_formats.h"
 #include "player_service.h"
+
+#include "esp_random.h"
 
 #define PLAYER_SVC_PCM_STREAM_BUF_SIZE (16 * 1024)
 #define PLAYER_SVC_CHUNK_BUF_COUNT 2
-#define PLAYER_SVC_CHUNK_MAX_BYTES 4096
+#define PLAYER_SVC_CHUNK_MAX_BYTES (24 * 1024)
 #define PLAYER_SVC_READER_TASK_STACK 4096
 #define PLAYER_SVC_READER_TASK_PRIORITY 5
 #define PLAYER_SVC_DECODER_TASK_STACK (8192 + 4096)
@@ -35,12 +38,21 @@
 #define PLAYER_SVC_TASK_STACK 4096
 #define PLAYER_SVC_TASK_PRIORITY 5
 #define PLAYER_SVC_QUEUE_DEPTH 8
-#define PLAYER_SVC_MAX_TRACKS 128
-#define PLAYER_SVC_MAX_TRACK_NAME_LEN 256
+#define PLAYER_SVC_MAX_TRACK_FILENAME_LEN 16
+#define PLAYER_SVC_MAX_TRACK_TITLE_LEN JUKEBOY_JBM_TRACK_NAME_BYTES
+#define PLAYER_SVC_FULL_PATH_LEN 32
 #define PLAYER_SVC_PCM_FRAME_BYTES (48000 * 2 * 20 / 1000 * (int)sizeof(int16_t))
-#define PLAYER_SVC_FAST_SEEK_DIVISOR 20
+#define PLAYER_SVC_FAST_SEEK_SECONDS 5U
+#define PLAYER_SVC_PREVIOUS_RESTART_SECONDS 7U
+#define PLAYER_SVC_STATUS_SAVE_INTERVAL_SECONDS 10U
 #define PLAYER_SVC_VOLUME_Q8_SHIFT 8
 #define PLAYER_SVC_VOLUME_Q8_ONE (1U << PLAYER_SVC_VOLUME_Q8_SHIFT)
+#define PLAYER_SVC_CHUNK_CRC_BYTES sizeof(uint32_t)
+#define PLAYER_SVC_QUEUE_POLL_MS 50
+#define PLAYER_SVC_CMD_TIMEOUT_MS 1000
+#define PLAYER_SVC_STOP_POLL_MS 10
+#define PLAYER_SVC_STOP_TIMEOUT_LOOPS 200
+#define PLAYER_SVC_OPUS_MAX_FRAME_LEN 1275
 
 #define PLAYER_SVC_VOLUME_LEVEL_COUNT 11
 #define PLAYER_SVC_DEFAULT_VOLUME_LEVEL (PLAYER_SVC_VOLUME_LEVEL_COUNT - 1)
@@ -62,12 +74,6 @@ static const uint16_t s_volume_gain_q8[PLAYER_SVC_VOLUME_LEVEL_COUNT] = {
 
 ESP_EVENT_DEFINE_BASE(PLAYER_SERVICE_EVENT);
 
-typedef struct __attribute__((packed))
-{
-    uint32_t header_len_in_blocks;
-    uint32_t lookup_table_len;
-} player_service_opu_file_header_t;
-
 typedef struct
 {
     uint8_t *data;
@@ -80,6 +86,7 @@ typedef struct
 typedef enum
 {
     PLAYER_SVC_CMD_CARTRIDGE_INSERTED,
+    PLAYER_SVC_CMD_CARTRIDGE_REMOVED,
     PLAYER_SVC_CMD_TRACK_COMPLETE,
     PLAYER_SVC_CMD_CONTROL,
 } player_service_cmd_t;
@@ -93,9 +100,16 @@ typedef struct
 
 typedef struct
 {
-    char filename[PLAYER_SVC_MAX_TRACK_NAME_LEN];
+    char filename[PLAYER_SVC_MAX_TRACK_FILENAME_LEN];
+    char title[PLAYER_SVC_MAX_TRACK_TITLE_LEN];
+} player_service_playlist_entry_t;
+
+typedef struct
+{
+    char filename[PLAYER_SVC_MAX_TRACK_FILENAME_LEN];
     uint32_t *lookup_table;
     size_t lookup_table_len;
+    size_t previous_restart_offset;
     size_t data_offset;
     size_t total_file_size;
 } player_service_track_info_t;
@@ -120,7 +134,7 @@ static size_t s_playlist_count;
 static size_t s_playlist_index;
 static size_t s_resume_chunk;
 static volatile size_t s_current_chunk;
-static char s_current_track[PLAYER_SVC_MAX_TRACK_NAME_LEN];
+static char s_current_track[PLAYER_SVC_MAX_TRACK_TITLE_LEN];
 static uint8_t s_decoder_pcm_buf[PLAYER_SVC_PCM_FRAME_BYTES];
 static esp_audio_dec_info_t s_decoder_info;
 static esp_audio_dec_out_frame_t s_decoder_out_frame;
@@ -129,7 +143,13 @@ static volatile bool s_stop_requested;
 static uint32_t s_active_generation;
 static uint32_t s_cancelled_generation;
 static uint8_t s_volume_level = PLAYER_SVC_DEFAULT_VOLUME_LEVEL;
-EXT_RAM_BSS_ATTR static char s_playlist[PLAYER_SVC_MAX_TRACKS][PLAYER_SVC_MAX_TRACK_NAME_LEN];
+static size_t s_last_saved_track_index = SIZE_MAX;
+static size_t s_last_saved_sec = SIZE_MAX;
+static player_service_playback_mode_t s_playback_mode = PLAYER_SVC_MODE_SEQUENTIAL;
+static player_service_playlist_entry_t *s_playlist = NULL;
+static size_t s_playlist_capacity = 0;
+static size_t *s_shuffle_order = NULL; /* PSRAM array; length == s_playlist_count */
+static size_t s_shuffle_position = 0; /* position of current track in s_shuffle_order; SIZE_MAX = not started */
 
 static void player_service_post_event(player_service_event_id_t event_id, const void *data, size_t len)
 {
@@ -158,6 +178,31 @@ static bool player_service_queue_track_complete(uint32_t generation)
         .generation = generation,
     };
     return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
+}
+
+static const char *player_service_playlist_filename(size_t index)
+{
+    if (index >= s_playlist_count)
+    {
+        return NULL;
+    }
+
+    return s_playlist[index].filename;
+}
+
+static const char *player_service_playlist_title(size_t index)
+{
+    if (index >= s_playlist_count)
+    {
+        return NULL;
+    }
+
+    if (s_playlist[index].title[0] != '\0')
+    {
+        return s_playlist[index].title;
+    }
+
+    return s_playlist[index].filename;
 }
 
 static bool player_service_should_stop(uint32_t generation)
@@ -193,7 +238,7 @@ static void player_service_reset_pipeline(void)
 
 static bool player_service_queue_chunk_message(const player_service_chunk_msg_t *msg, uint32_t generation)
 {
-    while (xQueueSend(s_chunk_queue, msg, pdMS_TO_TICKS(50)) != pdPASS)
+    while (xQueueSend(s_chunk_queue, msg, pdMS_TO_TICKS(PLAYER_SVC_QUEUE_POLL_MS)) != pdPASS)
     {
         if (player_service_should_stop(generation))
         {
@@ -212,7 +257,7 @@ static bool player_service_send_eof_message(uint32_t generation)
 
 static bool player_service_wait_for_notification(uint32_t generation)
 {
-    while (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50)) == 0)
+    while (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(PLAYER_SVC_QUEUE_POLL_MS)) == 0)
     {
         if (player_service_should_stop(generation))
         {
@@ -233,6 +278,11 @@ static void player_service_free_track_info(void)
     memset(&s_track_info, 0, sizeof(s_track_info));
 }
 
+static inline uint32_t player_service_crc32(const uint8_t *data, size_t len)
+{
+    return esp_rom_crc32_le(0, data, (uint32_t)len);
+}
+
 static size_t player_service_clamp_chunk_index(size_t chunk_index)
 {
     if (s_track_info.lookup_table_len == 0)
@@ -250,16 +300,211 @@ static size_t player_service_clamp_chunk_index(size_t chunk_index)
 
 static size_t player_service_fast_seek_step(void)
 {
-    size_t step;
+    if (s_track_info.lookup_table_len == 0)
+    {
+        return 0;
+    }
+
+    return PLAYER_SVC_FAST_SEEK_SECONDS;
+}
+
+static size_t player_service_current_file_offset(void)
+{
+    size_t chunk_index;
 
     if (s_track_info.lookup_table_len == 0)
     {
         return 0;
     }
 
-    step = (s_track_info.lookup_table_len + (PLAYER_SVC_FAST_SEEK_DIVISOR / 2U)) /
-           PLAYER_SVC_FAST_SEEK_DIVISOR;
-    return step > 0 ? step : 1;
+    chunk_index = s_paused ? s_resume_chunk : s_current_chunk;
+    chunk_index = player_service_clamp_chunk_index(chunk_index);
+    return s_track_info.lookup_table[chunk_index];
+}
+
+static size_t player_service_current_second(void)
+{
+    if (s_track_info.lookup_table_len == 0)
+    {
+        return 0;
+    }
+
+    return s_paused ? player_service_clamp_chunk_index(s_resume_chunk)
+                    : player_service_clamp_chunk_index(s_current_chunk);
+}
+
+static bool player_service_should_restart_current_track(void)
+{
+    if (s_track_info.lookup_table_len <= PLAYER_SVC_PREVIOUS_RESTART_SECONDS)
+    {
+        return false;
+    }
+
+    return player_service_current_file_offset() > s_track_info.previous_restart_offset;
+}
+
+static esp_err_t player_service_write_playback_status(size_t track_index, size_t current_sec)
+{
+    char full_path[PLAYER_SVC_FULL_PATH_LEN];
+    char tmp_path[PLAYER_SVC_FULL_PATH_LEN];
+    FILE *status_file;
+    jukeboy_jbs_status_t status = {
+        .version = JUKEBOY_JBS_VERSION,
+        .current_track_num = (uint32_t)track_index,
+        .current_sec = (uint32_t)current_sec,
+    };
+
+    if (!cartridge_service_is_mounted())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    snprintf(full_path, sizeof(full_path), "%s/%s", cartridge_service_get_mount_point(), JUKEBOY_JBS_FILENAME);
+    snprintf(tmp_path, sizeof(tmp_path), "%s/playback.tmp", cartridge_service_get_mount_point());
+    status_file = fopen(tmp_path, "wb");
+    if (!status_file)
+    {
+        ESP_LOGE(TAG, "failed to open %s for playback status write", tmp_path);
+        return ESP_FAIL;
+    }
+
+    if (fwrite(&status, 1, sizeof(status), status_file) != sizeof(status))
+    {
+        ESP_LOGE(TAG, "failed to write playback status to %s", tmp_path);
+        fclose(status_file);
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+
+    if (fclose(status_file) != 0)
+    {
+        ESP_LOGE(TAG, "failed to close playback status file %s", tmp_path);
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+
+    /* FAT rename is not always atomic; delete the destination first so the
+     * filesystem never sees two entries with the same name. */
+    remove(full_path);
+    if (rename(tmp_path, full_path) != 0)
+    {
+        ESP_LOGE(TAG, "failed to rename %s to %s", tmp_path, full_path);
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+
+    s_last_saved_track_index = track_index;
+    s_last_saved_sec = current_sec;
+    return ESP_OK;
+}
+
+static void player_service_save_current_playback_status(void)
+{
+    if (!s_playing || s_playlist_count == 0)
+    {
+        return;
+    }
+
+    if (player_service_write_playback_status(s_playlist_index, player_service_current_second()) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to persist playback status");
+    }
+}
+
+static void player_service_maybe_save_playback_status(void)
+{
+    size_t current_sec;
+
+    if (!s_playing || s_paused || s_playlist_count == 0)
+    {
+        return;
+    }
+
+    current_sec = player_service_current_second();
+    if (current_sec == 0 || (current_sec % PLAYER_SVC_STATUS_SAVE_INTERVAL_SECONDS) != 0)
+    {
+        return;
+    }
+
+    if (s_last_saved_track_index == s_playlist_index && s_last_saved_sec == current_sec)
+    {
+        return;
+    }
+
+    if (player_service_write_playback_status(s_playlist_index, current_sec) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to persist playback status at %u s", (unsigned)current_sec);
+    }
+}
+
+static bool player_service_load_saved_playback_status(size_t *track_index, size_t *start_chunk)
+{
+    char full_path[PLAYER_SVC_FULL_PATH_LEN];
+    FILE *status_file;
+    jukeboy_jbs_status_t status;
+
+    if (!track_index || !start_chunk || !cartridge_service_is_mounted())
+    {
+        return false;
+    }
+
+    snprintf(full_path, sizeof(full_path), "%s/%s", cartridge_service_get_mount_point(), JUKEBOY_JBS_FILENAME);
+
+    /* If a .tmp file exists from a previous interrupted write, it is the
+     * most-recent data.  Promote it to the final path before reading. */
+    {
+        char tmp_path[PLAYER_SVC_FULL_PATH_LEN];
+        struct stat tmp_st;
+        snprintf(tmp_path, sizeof(tmp_path), "%s/playback.tmp", cartridge_service_get_mount_point());
+        if (stat(tmp_path, &tmp_st) == 0)
+        {
+            ESP_LOGI(TAG, "found uncommitted write %s; promoting to %s", tmp_path, full_path);
+            remove(full_path);
+            if (rename(tmp_path, full_path) != 0)
+            {
+                ESP_LOGW(TAG, "failed to promote %s; discarding", tmp_path);
+                remove(tmp_path);
+            }
+        }
+    }
+
+    struct stat st;
+    if (stat(full_path, &st) != 0 || st.st_size != sizeof(status))
+    {
+        ESP_LOGW(TAG, "ignoring missing or malformed playback status file %s", full_path);
+        return false;
+    }
+
+    status_file = fopen(full_path, "rb");
+    if (!status_file)
+    {
+        return false;
+    }
+
+    if (fread(&status, 1, sizeof(status), status_file) != sizeof(status))
+    {
+        fclose(status_file);
+        ESP_LOGW(TAG, "failed to read playback status from %s", full_path);
+        return false;
+    }
+
+    fclose(status_file);
+
+    if (status.version != JUKEBOY_JBS_VERSION)
+    {
+        ESP_LOGW(TAG, "ignoring playback status with unsupported version %lu", (unsigned long)status.version);
+        return false;
+    }
+
+    if ((size_t)status.current_track_num >= s_playlist_count)
+    {
+        ESP_LOGW(TAG, "ignoring playback status with invalid track index %lu", (unsigned long)status.current_track_num);
+        return false;
+    }
+
+    *track_index = (size_t)status.current_track_num;
+    *start_chunk = (size_t)status.current_sec;
+    return true;
 }
 
 static size_t player_service_get_seek_target(bool forward)
@@ -294,7 +539,7 @@ static size_t player_service_get_seek_target(bool forward)
 
 static esp_err_t player_service_load_track_info(const char *filename, player_service_track_info_t *info)
 {
-    char full_path[PLAYER_SVC_MAX_TRACK_NAME_LEN + 64];
+    char full_path[PLAYER_SVC_FULL_PATH_LEN];
     uint32_t *lookup_table = NULL;
     const uint8_t *buf = NULL;
     size_t buf_len = 0;
@@ -321,14 +566,20 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
     }
 
     err = cartridge_service_get_read_result(&buf, &buf_len);
-    if (err != ESP_OK || buf_len < sizeof(player_service_opu_file_header_t))
+    if (err != ESP_OK || buf_len < sizeof(jukeboy_jba_header_t))
     {
         ESP_LOGE(TAG, "failed to read file header for %s", filename);
         return err == ESP_OK ? ESP_FAIL : err;
     }
 
-    player_service_opu_file_header_t header;
+    jukeboy_jba_header_t header;
     memcpy(&header, buf, sizeof(header));
+
+    if (header.version != JUKEBOY_JBA_VERSION)
+    {
+        ESP_LOGE(TAG, "unsupported file version %u for %s", (unsigned)header.version, filename);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
     info->data_offset = (size_t)header.header_len_in_blocks * 512U;
     info->lookup_table_len = header.lookup_table_len;
@@ -339,6 +590,7 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
     }
 
     size_t lt_bytes = info->lookup_table_len * sizeof(uint32_t);
+    size_t min_header_bytes = sizeof(jukeboy_jba_header_t) + lt_bytes;
     lookup_table = (uint32_t *)heap_caps_malloc(lt_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!lookup_table)
     {
@@ -347,24 +599,15 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
     }
 
     snprintf(full_path, sizeof(full_path), "%s/%s", cartridge_service_get_mount_point(), filename);
-    FILE *opus_file = fopen(full_path, "rb");
-    if (!opus_file)
+    struct stat st;
+    if (stat(full_path, &st) != 0)
     {
-        ESP_LOGE(TAG, "failed to open %s for file size", full_path);
+        ESP_LOGE(TAG, "failed to stat %s for file size", full_path);
         free(lookup_table);
         return ESP_ERR_NOT_FOUND;
     }
 
-    if (fseek(opus_file, 0, SEEK_END) != 0)
-    {
-        ESP_LOGE(TAG, "failed to seek %s", full_path);
-        fclose(opus_file);
-        free(lookup_table);
-        return ESP_FAIL;
-    }
-
-    long file_size = ftell(opus_file);
-    fclose(opus_file);
+    long file_size = st.st_size;
     if (file_size <= 0 || (size_t)file_size <= info->data_offset)
     {
         ESP_LOGE(TAG, "invalid file size %ld for %s", file_size, full_path);
@@ -373,7 +616,14 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
     }
     total_file_size = (size_t)file_size;
 
-    size_t lt_offset = sizeof(player_service_opu_file_header_t);
+    if (info->data_offset < min_header_bytes)
+    {
+        ESP_LOGE(TAG, "data offset too small for %s", filename);
+        free(lookup_table);
+        return ESP_FAIL;
+    }
+
+    size_t lt_offset = sizeof(jukeboy_jba_header_t);
     if (lt_offset + lt_bytes <= buf_len)
     {
         memcpy(lookup_table, buf + lt_offset, lt_bytes);
@@ -429,9 +679,47 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
         }
     }
 
+    size_t total_data_bytes = total_file_size - info->data_offset;
+    if (lookup_table[0] != 0)
+    {
+        ESP_LOGE(TAG, "lookup table must start at offset 0 for %s", filename);
+        free(lookup_table);
+        return ESP_FAIL;
+    }
+
+    for (size_t index = 0; index < info->lookup_table_len; ++index)
+    {
+        size_t chunk_start = lookup_table[index];
+        size_t chunk_end = (index + 1U < info->lookup_table_len) ? lookup_table[index + 1U] : total_data_bytes;
+
+        if (chunk_start > total_data_bytes || chunk_end > total_data_bytes || chunk_end < chunk_start)
+        {
+            ESP_LOGE(TAG, "invalid lookup table entry %u for %s", (unsigned)index, filename);
+            free(lookup_table);
+            return ESP_FAIL;
+        }
+
+        if ((chunk_end - chunk_start) <= PLAYER_SVC_CHUNK_CRC_BYTES)
+        {
+            ESP_LOGE(TAG, "chunk %u too small for crc32 in %s", (unsigned)index, filename);
+            free(lookup_table);
+            return ESP_FAIL;
+        }
+
+        if ((chunk_end - chunk_start) > PLAYER_SVC_CHUNK_MAX_BYTES)
+        {
+            ESP_LOGE(TAG, "chunk %u exceeds max size in %s", (unsigned)index, filename);
+            free(lookup_table);
+            return ESP_FAIL;
+        }
+    }
+
     strncpy(info->filename, filename, sizeof(info->filename) - 1);
     info->filename[sizeof(info->filename) - 1] = '\0';
     info->lookup_table = lookup_table;
+    info->previous_restart_offset = (info->lookup_table_len > PLAYER_SVC_PREVIOUS_RESTART_SECONDS)
+                                        ? lookup_table[PLAYER_SVC_PREVIOUS_RESTART_SECONDS]
+                                        : 0;
     info->total_file_size = total_file_size;
     return ESP_OK;
 }
@@ -440,18 +728,25 @@ static esp_err_t player_service_ensure_track_loaded(size_t index)
 {
     player_service_track_info_t new_info;
     esp_err_t err;
+    const char *filename;
 
     if (index >= s_playlist_count)
     {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (s_track_info.lookup_table && strcmp(s_track_info.filename, s_playlist[index]) == 0)
+    filename = player_service_playlist_filename(index);
+    if (!filename)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (s_track_info.lookup_table && strcmp(s_track_info.filename, filename) == 0)
     {
         return ESP_OK;
     }
 
-    err = player_service_load_track_info(s_playlist[index], &new_info);
+    err = player_service_load_track_info(filename, &new_info);
     if (err != ESP_OK)
     {
         return err;
@@ -466,9 +761,9 @@ static void player_service_wait_for_playback_stop(void)
 {
     uint32_t wait_loops = 0;
 
-    while ((s_reader_task || s_decoder_task) && wait_loops < 200)
+    while ((s_reader_task || s_decoder_task) && wait_loops < PLAYER_SVC_STOP_TIMEOUT_LOOPS)
     {
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(PLAYER_SVC_STOP_POLL_MS));
         wait_loops++;
     }
 
@@ -497,37 +792,11 @@ static void player_service_stop_playback(bool cancelled)
     player_service_wait_for_playback_stop();
 }
 
-static int16_t player_service_scale_sample(int16_t sample, uint16_t gain_q8)
+static inline int16_t player_service_scale_sample(int16_t sample, uint16_t gain_q8)
 {
-    int32_t scaled;
-
-    if (gain_q8 >= PLAYER_SVC_VOLUME_Q8_ONE)
-    {
-        return sample;
-    }
-
-    scaled = (int32_t)sample * (int32_t)gain_q8;
-    int32_t half_one = (int32_t)PLAYER_SVC_VOLUME_Q8_ONE / 2;
-    if (scaled >= 0)
-    {
-        scaled = (scaled + half_one) / (int32_t)PLAYER_SVC_VOLUME_Q8_ONE;
-    }
-    else
-    {
-        scaled = (scaled - half_one) / (int32_t)PLAYER_SVC_VOLUME_Q8_ONE;
-    }
-
-    if (scaled > INT16_MAX)
-    {
-        return INT16_MAX;
-    }
-
-    if (scaled < INT16_MIN)
-    {
-        return INT16_MIN;
-    }
-
-    return (int16_t)scaled;
+    /* gain_q8 is guaranteed to be <= 256.
+       We can safely multiply and right-shift without clipping. */
+    return (int16_t)(((int32_t)sample * gain_q8) >> PLAYER_SVC_VOLUME_Q8_SHIFT);
 }
 
 static void player_service_apply_volume(uint8_t *data, size_t len)
@@ -555,101 +824,149 @@ static void player_service_apply_volume(uint8_t *data, size_t len)
     }
 }
 
-static bool player_service_has_opu_extension(const char *name)
+static bool player_service_format_track_filename(char *buffer, size_t buffer_len, uint32_t file_num)
 {
-    size_t len;
-
-    if (!name)
+    if (!buffer || buffer_len == 0 || file_num > JUKEBOY_MAX_TRACK_FILES)
     {
         return false;
     }
 
-    len = strlen(name);
-    if (len < 4)
-    {
-        return false;
-    }
-
-    return tolower((unsigned char)name[len - 4]) == '.' &&
-           tolower((unsigned char)name[len - 3]) == 'o' &&
-           tolower((unsigned char)name[len - 2]) == 'p' &&
-           tolower((unsigned char)name[len - 1]) == 'u';
+    return snprintf(buffer, buffer_len, "%03lu.jba", (unsigned long)file_num) > 0;
 }
 
-static int player_service_casecmp(const char *lhs, const char *rhs)
+/**
+ * @brief (Re-)generate a Fisher-Yates shuffled permutation of [0, s_playlist_count).
+ *
+ * After the call, s_shuffle_order[0..s_playlist_count-1] holds every playlist
+ * index exactly once in a random order.  The first entry is guaranteed to differ
+ * from s_playlist_index (when s_playlist_count > 1) so that entering or wrapping
+ * within shuffle mode never immediately repeats the current track.
+ *
+ * No-op if s_shuffle_order is NULL or the playlist is empty.
+ */
+static void player_service_build_shuffle_order(void)
 {
-    while (*lhs && *rhs)
+    if (!s_shuffle_order || s_playlist_count == 0)
     {
-        int lhs_char = tolower((unsigned char)*lhs);
-        int rhs_char = tolower((unsigned char)*rhs);
-        if (lhs_char != rhs_char)
-        {
-            return lhs_char - rhs_char;
-        }
-        lhs++;
-        rhs++;
+        return;
     }
-    return tolower((unsigned char)*lhs) - tolower((unsigned char)*rhs);
+
+    for (size_t i = 0; i < s_playlist_count; i++)
+    {
+        s_shuffle_order[i] = i;
+    }
+    for (size_t i = s_playlist_count - 1; i > 0; i--)
+    {
+        size_t j = (size_t)(esp_random() % (uint32_t)(i + 1));
+        size_t tmp = s_shuffle_order[i];
+        s_shuffle_order[i] = s_shuffle_order[j];
+        s_shuffle_order[j] = tmp;
+    }
+
+    /* If the first entry would immediately repeat the current track, swap it
+     * with a random other position. */
+    if (s_playlist_count > 1 && s_shuffle_order[0] == s_playlist_index)
+    {
+        size_t j = 1 + (size_t)(esp_random() % (uint32_t)(s_playlist_count - 1));
+        size_t tmp = s_shuffle_order[0];
+        s_shuffle_order[0] = s_shuffle_order[j];
+        s_shuffle_order[j] = tmp;
+    }
 }
 
-static int player_service_playlist_compare(const void *lhs, const void *rhs)
+static void player_service_free_playlist(void)
 {
-    return player_service_casecmp((const char *)lhs, (const char *)rhs);
+    if (s_playlist)
+    {
+        heap_caps_free(s_playlist);
+        s_playlist = NULL;
+    }
+
+    if (s_shuffle_order)
+    {
+        heap_caps_free(s_shuffle_order);
+        s_shuffle_order = NULL;
+    }
+
+    s_playlist_count = 0;
+    s_playlist_capacity = 0;
+    s_shuffle_position = 0;
 }
 
 static void player_service_scan_playlist(void)
 {
-    DIR *dir;
-    struct dirent *entry;
-    const char *mount_point = cartridge_service_get_mount_point();
+    size_t metadata_track_count = cartridge_service_get_metadata_track_count();
 
-    s_playlist_count = 0;
+    player_service_free_playlist();
     s_playlist_index = 0;
 
-    if (!mount_point)
+    if (metadata_track_count == 0)
     {
-        ESP_LOGE(TAG, "cartridge mount point unavailable");
+        ESP_LOGW(TAG, "metadata contains no tracks");
         return;
     }
 
-    dir = opendir(mount_point);
-    if (!dir)
+    s_playlist = heap_caps_calloc(metadata_track_count, sizeof(player_service_playlist_entry_t),
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_playlist)
     {
-        ESP_LOGE(TAG, "failed to open playlist root %s", mount_point);
+        ESP_LOGE(TAG, "failed to allocate playlist for %u tracks", (unsigned)metadata_track_count);
         return;
     }
+    s_playlist_capacity = metadata_track_count;
 
-    while ((entry = readdir(dir)) != NULL)
+    for (size_t index = 0; index < metadata_track_count; ++index)
     {
-        if (entry->d_name[0] == '.')
+        const jukeboy_jbm_track_t *track = cartridge_service_get_metadata_track(index);
+        if (!track)
         {
             continue;
         }
 
-        if (!player_service_has_opu_extension(entry->d_name))
+        if (!player_service_format_track_filename(s_playlist[s_playlist_count].filename,
+                                                  sizeof(s_playlist[s_playlist_count].filename),
+                                                  track->file_num))
         {
+            ESP_LOGW(TAG, "skipping metadata track %u with invalid file_num %lu",
+                     (unsigned)index,
+                     (unsigned long)track->file_num);
             continue;
         }
 
-        if (s_playlist_count >= PLAYER_SVC_MAX_TRACKS)
+        if (track->track_name[0] != '\0')
         {
-            ESP_LOGW(TAG, "playlist full, ignoring remaining files");
-            break;
+            strncpy(s_playlist[s_playlist_count].title,
+                    track->track_name,
+                    sizeof(s_playlist[s_playlist_count].title) - 1);
+            s_playlist[s_playlist_count].title[sizeof(s_playlist[s_playlist_count].title) - 1] = '\0';
+        }
+        else
+        {
+            strncpy(s_playlist[s_playlist_count].title,
+                    s_playlist[s_playlist_count].filename,
+                    sizeof(s_playlist[s_playlist_count].title) - 1);
+            s_playlist[s_playlist_count].title[sizeof(s_playlist[s_playlist_count].title) - 1] = '\0';
         }
 
-        strncpy(s_playlist[s_playlist_count], entry->d_name, PLAYER_SVC_MAX_TRACK_NAME_LEN - 1);
-        s_playlist[s_playlist_count][PLAYER_SVC_MAX_TRACK_NAME_LEN - 1] = '\0';
         s_playlist_count++;
     }
 
-    closedir(dir);
-
-    if (s_playlist_count > 1)
+    if (s_playlist_count > 0)
     {
-        qsort(s_playlist, s_playlist_count, sizeof(s_playlist[0]), player_service_playlist_compare);
+        s_shuffle_order = heap_caps_malloc(s_playlist_count * sizeof(size_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_shuffle_order)
+        {
+            player_service_build_shuffle_order();
+        }
+        else
+        {
+            ESP_LOGW(TAG, "failed to allocate shuffle order; shuffle falls back to random-per-step");
+        }
     }
+    s_shuffle_position = SIZE_MAX;
 
-    ESP_LOGI(TAG, "playlist contains %u .opu file(s)", (unsigned)s_playlist_count);
+    ESP_LOGI(TAG, "playlist contains %u metadata track(s)", (unsigned)s_playlist_count);
     player_service_post_event(PLAYER_SVC_EVENT_PLAYLIST_READY, &s_playlist_count, sizeof(s_playlist_count));
 }
 
@@ -694,7 +1011,7 @@ static void player_service_reader_task(void *param)
         configASSERT(chunk_end >= chunk_start && (chunk_end - chunk_start) <= PLAYER_SVC_CHUNK_MAX_BYTES);
 
         size_t chunk_len = chunk_end - chunk_start;
-        if (chunk_len == 0)
+        if (chunk_len <= PLAYER_SVC_CHUNK_CRC_BYTES)
         {
             continue;
         }
@@ -848,7 +1165,7 @@ static void player_service_decoder_task(void *param)
             break;
         }
 
-        if (xQueueReceive(s_chunk_queue, &msg, pdMS_TO_TICKS(50)) != pdTRUE)
+        if (xQueueReceive(s_chunk_queue, &msg, pdMS_TO_TICKS(PLAYER_SVC_QUEUE_POLL_MS)) != pdTRUE)
         {
             continue;
         }
@@ -867,8 +1184,30 @@ static void player_service_decoder_task(void *param)
 
         s_current_chunk = msg.chunk_index;
 
+        if (msg.len <= PLAYER_SVC_CHUNK_CRC_BYTES)
+        {
+            ESP_LOGE(TAG, "chunk %u missing crc32", (unsigned)msg.chunk_index);
+            continue;
+        }
+
+        uint32_t expected_crc = 0;
+        memcpy(&expected_crc, msg.data, sizeof(expected_crc));
+
+        const uint8_t *chunk_data = msg.data + PLAYER_SVC_CHUNK_CRC_BYTES;
+        size_t chunk_len = msg.len - PLAYER_SVC_CHUNK_CRC_BYTES;
+        uint32_t actual_crc = player_service_crc32(chunk_data, chunk_len);
+        if (actual_crc != expected_crc)
+        {
+            ESP_LOGE(TAG,
+                     "crc32 mismatch in chunk %u: expected 0x%08lx got 0x%08lx",
+                     (unsigned)msg.chunk_index,
+                     (unsigned long)expected_crc,
+                     (unsigned long)actual_crc);
+            continue;
+        }
+
         size_t cursor = 0;
-        while (cursor < msg.len)
+        while (cursor < chunk_len)
         {
             if (player_service_should_stop(generation))
             {
@@ -876,12 +1215,12 @@ static void player_service_decoder_task(void *param)
                 break;
             }
 
-            const uint8_t *pkt = msg.data + cursor;
+            const uint8_t *pkt = chunk_data + cursor;
             uint8_t byte1 = pkt[0];
             size_t hdr_size = 1;
             size_t frame_len;
 
-            if ((msg.len - cursor) < 1)
+            if ((chunk_len - cursor) < 1)
             {
                 break;
             }
@@ -892,13 +1231,22 @@ static void player_service_decoder_task(void *param)
             }
             else
             {
-                if ((msg.len - cursor) < 2)
+                if ((chunk_len - cursor) < 2)
                 {
                     ESP_LOGE(TAG, "partial packet header in chunk %u", (unsigned)msg.chunk_index);
                     break;
                 }
                 hdr_size = 2;
                 frame_len = (pkt[1] * 4) + byte1;
+            }
+
+            if (frame_len > PLAYER_SVC_OPUS_MAX_FRAME_LEN)
+            {
+                ESP_LOGE(TAG, "opus frame length %u exceeds maximum %u in chunk %u",
+                         (unsigned)frame_len,
+                         (unsigned)PLAYER_SVC_OPUS_MAX_FRAME_LEN,
+                         (unsigned)msg.chunk_index);
+                break;
             }
 
             size_t pkt_size = hdr_size + frame_len;
@@ -908,11 +1256,11 @@ static void player_service_decoder_task(void *param)
                 continue;
             }
 
-            if (pkt_size > (msg.len - cursor))
+            if (pkt_size > (chunk_len - cursor))
             {
                 ESP_LOGE(TAG, "packet size %u exceeds remaining chunk data %u in chunk %u",
                          (unsigned)pkt_size,
-                         (unsigned)(msg.len - cursor),
+                         (unsigned)(chunk_len - cursor),
                          (unsigned)msg.chunk_index);
                 break;
             }
@@ -977,7 +1325,9 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
     err = player_service_ensure_track_loaded(index);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "failed to load track metadata for %s: %s", s_playlist[index], esp_err_to_name(err));
+        ESP_LOGE(TAG, "failed to load track metadata for %s: %s",
+                 player_service_playlist_filename(index),
+                 esp_err_to_name(err));
         return err;
     }
 
@@ -1002,7 +1352,7 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
     reader_params->generation = s_active_generation;
     reader_params->start_chunk = start_chunk;
 
-    strncpy(s_current_track, s_playlist[index], sizeof(s_current_track) - 1);
+    strncpy(s_current_track, player_service_playlist_title(index), sizeof(s_current_track) - 1);
     s_current_track[sizeof(s_current_track) - 1] = '\0';
     s_playlist_index = index;
     s_playing = true;
@@ -1058,33 +1408,114 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
 
 static void player_service_handle_cartridge_inserted(void)
 {
+    cartridge_status_t cartridge_status;
+    size_t start_index = 0;
+    size_t start_chunk = 0;
+
     player_service_stop_playback(true);
     player_service_free_track_info();
     s_paused = false;
     s_playing = false;
     s_current_track[0] = '\0';
+    s_last_saved_track_index = SIZE_MAX;
+    s_last_saved_sec = SIZE_MAX;
+
+    cartridge_status = cartridge_service_get_status();
+    if (cartridge_status == CARTRIDGE_STATUS_EMPTY || cartridge_status == CARTRIDGE_STATUS_INVALID)
+    {
+        ESP_LOGW(TAG, "cartridge not playable (status=%s)",
+                 cartridge_service_status_name(cartridge_status));
+        return;
+    }
 
     if (!cartridge_service_is_mounted())
     {
-        esp_err_t err = cartridge_service_mount();
-        if (err != ESP_OK)
-        {
-            ESP_LOGE(TAG, "failed to mount cartridge filesystem: %s", esp_err_to_name(err));
-            return;
-        }
+        ESP_LOGW(TAG, "cartridge reported ready but is not mounted");
+        return;
     }
 
     player_service_scan_playlist();
     if (s_playlist_count == 0)
     {
-        ESP_LOGW(TAG, "no .opu files found in cartridge root");
+        ESP_LOGW(TAG, "no .jba files found in cartridge root");
         s_playing = false;
         return;
     }
 
-    if (player_service_start_track(0, 0) != ESP_OK)
+    if (player_service_load_saved_playback_status(&start_index, &start_chunk))
+    {
+        ESP_LOGI(TAG, "resuming from saved playback status: track=%u sec=%u",
+                 (unsigned)start_index,
+                 (unsigned)start_chunk);
+    }
+
+    if (player_service_start_track(start_index, start_chunk) != ESP_OK)
     {
         s_playing = false;
+    }
+}
+
+/**
+ * @brief Compute the next playlist index.
+ *
+ * @param is_manual  True when triggered by an explicit NEXT control; false for
+ *                   automatic end-of-track advance.  The distinction matters only
+ *                   for @c PLAYER_SVC_MODE_SINGLE_REPEAT, where a manual NEXT
+ *                   skips to the sequential next track instead of repeating.
+ * @return Next playlist index (0 when the playlist is empty).
+ */
+static size_t player_service_next_index(bool is_manual)
+{
+    if (s_playlist_count == 0)
+    {
+        return 0;
+    }
+
+    switch (s_playback_mode)
+    {
+    case PLAYER_SVC_MODE_SINGLE_REPEAT:
+        if (is_manual)
+        {
+            /* Manual skip overrides the repeat — advance sequentially. */
+            return (s_playlist_index + 1U < s_playlist_count) ? (s_playlist_index + 1U) : 0;
+        }
+        return s_playlist_index;
+
+    case PLAYER_SVC_MODE_SHUFFLE:
+        if (s_playlist_count == 1)
+        {
+            return 0;
+        }
+        if (s_shuffle_order)
+        {
+            /* Advance through the pre-shuffled order; rebuild when one pass ends. */
+            size_t next_pos;
+            if (s_shuffle_position == SIZE_MAX || s_shuffle_position + 1 >= s_playlist_count)
+            {
+                /* Finished a full pass (or first use after mode switch): reshuffle. */
+                player_service_build_shuffle_order();
+                next_pos = 0;
+            }
+            else
+            {
+                next_pos = s_shuffle_position + 1;
+            }
+            s_shuffle_position = next_pos;
+            return s_shuffle_order[s_shuffle_position];
+        }
+        /* Fallback when shuffle order allocation failed. */
+        {
+            size_t r;
+            do
+            {
+                r = (size_t)(esp_random() % (uint32_t)s_playlist_count);
+            } while (r == s_playlist_index);
+            return r;
+        }
+
+    case PLAYER_SVC_MODE_SEQUENTIAL:
+    default:
+        return (s_playlist_index + 1U < s_playlist_count) ? (s_playlist_index + 1U) : 0;
     }
 }
 
@@ -1113,8 +1544,8 @@ static void player_service_handle_track_complete(uint32_t generation)
         return;
     }
 
-    next_index = (s_playlist_index + 1U < s_playlist_count) ? (s_playlist_index + 1U) : 0;
-    if (next_index == 0 && s_playlist_count > 1)
+    next_index = player_service_next_index(false);
+    if (s_playback_mode == PLAYER_SVC_MODE_SEQUENTIAL && next_index == 0 && s_playlist_count > 1)
     {
         ESP_LOGI(TAG, "playlist complete, restarting from first track");
     }
@@ -1137,12 +1568,16 @@ static void player_service_handle_control(player_service_control_t control)
         {
             break;
         }
-        target_index = (s_playlist_index + 1U < s_playlist_count) ? (s_playlist_index + 1U) : 0;
+        target_index = player_service_next_index(true);
         s_paused = false;
         player_service_stop_playback(true);
         if (player_service_start_track(target_index, 0) != ESP_OK)
         {
             s_playing = false;
+        }
+        else
+        {
+            player_service_save_current_playback_status();
         }
         break;
     case PLAYER_SVC_CONTROL_PREVIOUS:
@@ -1150,12 +1585,23 @@ static void player_service_handle_control(player_service_control_t control)
         {
             break;
         }
-        target_index = (s_playlist_index > 0) ? (s_playlist_index - 1U) : (s_playlist_count - 1U);
         s_paused = false;
         player_service_stop_playback(true);
+        if (player_service_should_restart_current_track())
+        {
+            target_index = s_playlist_index;
+        }
+        else
+        {
+            target_index = (s_playlist_index > 0) ? (s_playlist_index - 1U) : (s_playlist_count - 1U);
+        }
         if (player_service_start_track(target_index, 0) != ESP_OK)
         {
             s_playing = false;
+        }
+        else
+        {
+            player_service_save_current_playback_status();
         }
         break;
     case PLAYER_SVC_CONTROL_FAST_FORWARD:
@@ -1209,10 +1655,24 @@ static void player_service_handle_control(player_service_control_t control)
             player_service_stop_playback(true);
             s_paused = true;
         }
+        player_service_save_current_playback_status();
         break;
     default:
         break;
     }
+}
+
+static void player_service_handle_cartridge_removed(void)
+{
+    player_service_stop_playback(true);
+    player_service_free_track_info();
+    player_service_free_playlist();
+    s_paused = false;
+    s_playing = false;
+    s_current_track[0] = '\0';
+    s_last_saved_track_index = SIZE_MAX;
+    s_last_saved_sec = SIZE_MAX;
+    ESP_LOGI(TAG, "cartridge removed, playback stopped");
 }
 
 static void player_service_task(void *param)
@@ -1222,8 +1682,9 @@ static void player_service_task(void *param)
 
     for (;;)
     {
-        if (xQueueReceive(s_cmd_queue, &msg, portMAX_DELAY) != pdPASS)
+        if (xQueueReceive(s_cmd_queue, &msg, pdMS_TO_TICKS(PLAYER_SVC_CMD_TIMEOUT_MS)) != pdPASS)
         {
+            player_service_maybe_save_playback_status();
             continue;
         }
 
@@ -1231,6 +1692,9 @@ static void player_service_task(void *param)
         {
         case PLAYER_SVC_CMD_CARTRIDGE_INSERTED:
             player_service_handle_cartridge_inserted();
+            break;
+        case PLAYER_SVC_CMD_CARTRIDGE_REMOVED:
+            player_service_handle_cartridge_removed();
             break;
         case PLAYER_SVC_CMD_TRACK_COMPLETE:
             player_service_handle_track_complete(msg.generation);
@@ -1241,6 +1705,8 @@ static void player_service_task(void *param)
         default:
             break;
         }
+
+        player_service_maybe_save_playback_status();
     }
 }
 
@@ -1255,6 +1721,13 @@ static void player_service_on_cartridge_event(void *arg, esp_event_base_t base, 
         if (!player_service_queue_cmd(PLAYER_SVC_CMD_CARTRIDGE_INSERTED))
         {
             ESP_LOGW(TAG, "dropped cartridge inserted event");
+        }
+    }
+    else if (id == CARTRIDGE_SVC_EVENT_UNMOUNTED)
+    {
+        if (!player_service_queue_cmd(PLAYER_SVC_CMD_CARTRIDGE_REMOVED))
+        {
+            ESP_LOGW(TAG, "dropped cartridge removed event");
         }
     }
 }
@@ -1296,6 +1769,11 @@ esp_err_t player_service_init(void)
 
     ESP_ERROR_CHECK(esp_event_handler_register(CARTRIDGE_SERVICE_EVENT,
                                                CARTRIDGE_SVC_EVENT_INSERTED,
+                                               player_service_on_cartridge_event,
+                                               NULL));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(CARTRIDGE_SERVICE_EVENT,
+                                               CARTRIDGE_SVC_EVENT_UNMOUNTED,
                                                player_service_on_cartridge_event,
                                                NULL));
 
@@ -1345,6 +1823,32 @@ void player_service_set_volume_absolute(uint8_t avrc_vol)
     }
     s_volume_level = level;
     ESP_LOGI(TAG, "volume set to %u%% (AVRCP %u)", player_service_get_volume_percent(), avrc_vol);
+}
+
+esp_err_t player_service_set_playback_mode(player_service_playback_mode_t mode)
+{
+    if (mode != PLAYER_SVC_MODE_SEQUENTIAL &&
+        mode != PLAYER_SVC_MODE_SINGLE_REPEAT &&
+        mode != PLAYER_SVC_MODE_SHUFFLE)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_playback_mode = mode;
+    if (mode == PLAYER_SVC_MODE_SHUFFLE)
+    {
+        /* Rebuild the shuffle order so the next track is freshly randomised. */
+        s_shuffle_position = SIZE_MAX;
+        player_service_build_shuffle_order();
+    }
+    ESP_LOGI(TAG, "playback mode -> %s",
+             mode == PLAYER_SVC_MODE_SINGLE_REPEAT ? "single_repeat" :
+             mode == PLAYER_SVC_MODE_SHUFFLE       ? "shuffle"       : "sequential");
+    return ESP_OK;
+}
+
+player_service_playback_mode_t player_service_get_playback_mode(void)
+{
+    return s_playback_mode;
 }
 
 int32_t player_service_pcm_provider(uint8_t *data, int32_t len, void *user_ctx)

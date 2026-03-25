@@ -882,6 +882,13 @@ esp_err_t bluetooth_service_init(void)
     s_initialised = true;
     bt_svc_post_event(BLUETOOTH_SVC_EVENT_STARTED, NULL, 0);
     ESP_LOGI(TAG, "Bluetooth service started");
+
+    err = bluetooth_service_connect_last_bonded_a2dp_device();
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "boot-time Bluetooth reconnect queue failed: %s", esp_err_to_name(err));
+    }
+
     return ESP_OK;
 }
 

@@ -21,6 +21,19 @@ extern "C"
         PLAYER_SVC_EVENT_TRACK_FINISHED,
     } player_service_event_id_t;
 
+    /**
+     * @brief Playback sequence mode.
+     *
+     * Controls how the player selects the next track after one finishes or
+     * when the user requests the next track.
+     */
+    typedef enum
+    {
+        PLAYER_SVC_MODE_SEQUENTIAL,    /**< Play all tracks in order, wrapping to the first when the last finishes. Default. */
+        PLAYER_SVC_MODE_SINGLE_REPEAT, /**< Repeat the current track indefinitely. An explicit NEXT/PREV still advances sequentially. */
+        PLAYER_SVC_MODE_SHUFFLE,       /**< Pick the next track at random (different from the current one). */
+    } player_service_playback_mode_t;
+
     typedef enum
     {
         PLAYER_SVC_CONTROL_NEXT,
@@ -38,6 +51,21 @@ extern "C"
     uint8_t player_service_get_volume_percent(void);
     void player_service_set_volume_absolute(uint8_t avrc_vol);
     int32_t player_service_pcm_provider(uint8_t *data, int32_t len, void *user_ctx);
+
+    /**
+     * @brief Set the playback sequence mode.
+     *
+     * Safe to call from any task; the change takes effect on the next track
+     * selection (auto-advance or explicit NEXT).
+     *
+     * @param mode  One of @c PLAYER_SVC_MODE_SEQUENTIAL, @c PLAYER_SVC_MODE_SINGLE_REPEAT,
+     *              or @c PLAYER_SVC_MODE_SHUFFLE.
+     * @return ESP_OK on success, ESP_ERR_INVALID_ARG for an unknown mode.
+     */
+    esp_err_t player_service_set_playback_mode(player_service_playback_mode_t mode);
+
+    /** @brief Return the currently active playback mode. */
+    player_service_playback_mode_t player_service_get_playback_mode(void);
 
 #ifdef __cplusplus
 }

@@ -506,8 +506,45 @@ static bool media_parse_control(const char *value, player_service_control_t *con
 static struct
 {
     struct arg_str *action;
+    struct arg_str *value;
     struct arg_end *end;
 } s_media_args;
+
+static const char *playback_mode_name(player_service_playback_mode_t mode)
+{
+    switch (mode)
+    {
+    case PLAYER_SVC_MODE_SEQUENTIAL:    return "sequential";
+    case PLAYER_SVC_MODE_SINGLE_REPEAT: return "single_repeat";
+    case PLAYER_SVC_MODE_SHUFFLE:       return "shuffle";
+    default:                            return "unknown";
+    }
+}
+
+static bool media_parse_mode(const char *value, player_service_playback_mode_t *mode)
+{
+    if (!value || !mode)
+    {
+        return false;
+    }
+    if (strcmp(value, "sequential") == 0)
+    {
+        *mode = PLAYER_SVC_MODE_SEQUENTIAL;
+    }
+    else if (strcmp(value, "single_repeat") == 0 || strcmp(value, "repeat") == 0)
+    {
+        *mode = PLAYER_SVC_MODE_SINGLE_REPEAT;
+    }
+    else if (strcmp(value, "shuffle") == 0 || strcmp(value, "random") == 0)
+    {
+        *mode = PLAYER_SVC_MODE_SHUFFLE;
+    }
+    else
+    {
+        return false;
+    }
+    return true;
+}
 
 static int cmd_media(int argc, char **argv)
 {
@@ -525,12 +562,37 @@ static int cmd_media(int argc, char **argv)
     {
         printf("Playback: %s\n", player_service_is_paused() ? "paused" : "running");
         printf("Volume:   %u%%\n", (unsigned)player_service_get_volume_percent());
+        printf("Mode:     %s\n", playback_mode_name(player_service_get_playback_mode()));
+        return 0;
+    }
+
+    if (strcmp(s_media_args.action->sval[0], "mode") == 0)
+    {
+        if (s_media_args.value->count == 0)
+        {
+            printf("Mode: %s\n", playback_mode_name(player_service_get_playback_mode()));
+            return 0;
+        }
+        player_service_playback_mode_t mode;
+        if (!media_parse_mode(s_media_args.value->sval[0], &mode))
+        {
+            printf("Unknown mode '%s'. Use: sequential, single_repeat, shuffle\n",
+                   s_media_args.value->sval[0]);
+            return 1;
+        }
+        err = player_service_set_playback_mode(mode);
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("Playback mode set to: %s\n", playback_mode_name(mode));
         return 0;
     }
 
     if (!media_parse_control(s_media_args.action->sval[0], &control))
     {
-        printf("Usage: media [status|next|prev|pause|ff|rewind|vol_up|vol_down]\n");
+        printf("Usage: media [status|next|prev|pause|ff|rewind|vol_up|vol_down|mode [sequential|single_repeat|shuffle]]\n");
         return 1;
     }
 
@@ -952,6 +1014,26 @@ static int sd_mount_handler(int argc, char **argv)
     return 0;
 }
 
+static bool sd_parse_index(const char *value, size_t *index)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!value || !index)
+    {
+        return false;
+    }
+
+    parsed = strtoul(value, &end, 10);
+    if (!end || *end != '\0')
+    {
+        return false;
+    }
+
+    *index = (size_t)parsed;
+    return true;
+}
+
 static int sd_unmount_handler(int argc, char **argv)
 {
     esp_err_t err = cartridge_service_unmount();
@@ -968,7 +1050,160 @@ static int sd_status_handler(int argc, char **argv)
 {
     printf("Inserted: %s\n", cartridge_service_is_inserted() ? "yes" : "no");
     printf("Mounted:  %s\n", cartridge_service_is_mounted() ? "yes" : "no");
+    printf("Status:   %s\n", cartridge_service_status_name(cartridge_service_get_status()));
+    printf("Tracks:   %u\n", (unsigned)cartridge_service_get_metadata_track_count());
     return 0;
+}
+
+static int sd_meta_handler(int argc, char **argv)
+{
+    static const char *usage =
+        "Usage: sd meta <field> [index]\n"
+        "  fields:\n"
+        "    version\n"
+        "    checksum\n"
+        "    album_name\n"
+        "    album_description\n"
+        "    artist\n"
+        "    year\n"
+        "    duration_sec\n"
+        "    genre\n"
+        "    tag <0-4>\n"
+        "    track_count\n"
+        "    track_name <track_index>\n"
+        "    track_artists <track_index>\n"
+        "    track_duration_sec <track_index>\n"
+        "    file_num <track_index>\n";
+    const char *field;
+    const char *string_value;
+    size_t index = 0;
+
+    if (argc < 2)
+    {
+        printf("%s", usage);
+        return 1;
+    }
+
+    if (cartridge_service_get_status() != CARTRIDGE_STATUS_READY)
+    {
+        printf("Metadata unavailable. Cartridge status: %s\n",
+               cartridge_service_status_name(cartridge_service_get_status()));
+        return 1;
+    }
+
+    field = argv[1];
+    if (strcmp(field, "version") == 0)
+    {
+        printf("%lu\n", (unsigned long)cartridge_service_get_metadata_version());
+        return 0;
+    }
+    if (strcmp(field, "checksum") == 0)
+    {
+        printf("0x%08lx\n", (unsigned long)cartridge_service_get_metadata_checksum());
+        return 0;
+    }
+    if (strcmp(field, "album_name") == 0)
+    {
+        printf("%s\n", cartridge_service_get_album_name());
+        return 0;
+    }
+    if (strcmp(field, "album_description") == 0)
+    {
+        printf("%s\n", cartridge_service_get_album_description());
+        return 0;
+    }
+    if (strcmp(field, "artist") == 0)
+    {
+        printf("%s\n", cartridge_service_get_album_artist());
+        return 0;
+    }
+    if (strcmp(field, "year") == 0)
+    {
+        printf("%lu\n", (unsigned long)cartridge_service_get_album_year());
+        return 0;
+    }
+    if (strcmp(field, "duration_sec") == 0)
+    {
+        printf("%lu\n", (unsigned long)cartridge_service_get_album_duration_sec());
+        return 0;
+    }
+    if (strcmp(field, "genre") == 0)
+    {
+        printf("%s\n", cartridge_service_get_album_genre());
+        return 0;
+    }
+    if (strcmp(field, "track_count") == 0)
+    {
+        printf("%u\n", (unsigned)cartridge_service_get_metadata_track_count());
+        return 0;
+    }
+
+    if (argc < 3 || !sd_parse_index(argv[2], &index))
+    {
+        printf("%s", usage);
+        return 1;
+    }
+
+    if (strcmp(field, "tag") == 0)
+    {
+        string_value = cartridge_service_get_album_tag(index);
+        if (!string_value)
+        {
+            printf("Invalid tag index\n");
+            return 1;
+        }
+        printf("%s\n", string_value);
+        return 0;
+    }
+
+    if (strcmp(field, "track_name") == 0)
+    {
+        string_value = cartridge_service_get_track_name(index);
+        if (!string_value)
+        {
+            printf("Invalid track index\n");
+            return 1;
+        }
+        printf("%s\n", string_value);
+        return 0;
+    }
+
+    if (strcmp(field, "track_artists") == 0)
+    {
+        string_value = cartridge_service_get_track_artists(index);
+        if (!string_value)
+        {
+            printf("Invalid track index\n");
+            return 1;
+        }
+        printf("%s\n", string_value);
+        return 0;
+    }
+
+    if (strcmp(field, "track_duration_sec") == 0)
+    {
+        if (!cartridge_service_get_metadata_track(index))
+        {
+            printf("Invalid track index\n");
+            return 1;
+        }
+        printf("%lu\n", (unsigned long)cartridge_service_get_track_duration_sec(index));
+        return 0;
+    }
+
+    if (strcmp(field, "file_num") == 0)
+    {
+        if (!cartridge_service_get_metadata_track(index))
+        {
+            printf("Invalid track index\n");
+            return 1;
+        }
+        printf("%lu\n", (unsigned long)cartridge_service_get_track_file_num(index));
+        return 0;
+    }
+
+    printf("%s", usage);
+    return 1;
 }
 
 static int cmd_sd(int argc, char **argv)
@@ -977,7 +1212,8 @@ static int cmd_sd(int argc, char **argv)
         "Usage: sd <subcommand>\n"
         "  mount     Mount the SD card FAT filesystem\n"
         "  unmount   Unmount the SD card\n"
-        "  status    Show insertion and mount state\n";
+        "  status    Show insertion, mount, and metadata state\n"
+        "  meta      Inspect album.jbm fields\n";
 
     if (argc < 2)
     {
@@ -992,6 +1228,8 @@ static int cmd_sd(int argc, char **argv)
         return sd_unmount_handler(argc - 1, argv + 1);
     if (strcmp(sub, "status") == 0)
         return sd_status_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "meta") == 0)
+        return sd_meta_handler(argc - 1, argv + 1);
 
     printf("Unknown subcommand '%s'.\n%s", sub, usage);
     return 1;
@@ -1077,8 +1315,9 @@ esp_err_t console_service_init(void)
     s_autoreconnect_args.end = arg_end(1);
     s_audio_output_args.target = arg_str0(NULL, NULL, "<status|i2s|a2dp>", "Get status or switch audio output target");
     s_audio_output_args.end = arg_end(1);
-    s_media_args.action = arg_str0(NULL, NULL, "<status|next|prev|pause|ff|rewind|vol_up|vol_down>", "Get status or control the local player");
-    s_media_args.end = arg_end(1);
+    s_media_args.action = arg_str0(NULL, NULL, "<action>", "status|next|prev|pause|ff|rewind|vol_up|vol_down|mode");
+    s_media_args.value  = arg_str0(NULL, NULL, "<value>",  "For 'mode': sequential|single_repeat|shuffle");
+    s_media_args.end = arg_end(2);
     s_telemetry_args.action = arg_str0(NULL, NULL, "<on|off>", "Enable or disable periodic memory/CPU telemetry");
     s_telemetry_args.end = arg_end(1);
 
@@ -1120,7 +1359,7 @@ esp_err_t console_service_init(void)
 
     const esp_console_cmd_t media_cmd = {
         .command = "media",
-        .help = "Local media control: media [status|next|prev|pause|ff|rewind|vol_up|vol_down]",
+        .help = "Local media control: media [status|next|prev|pause|ff|rewind|vol_up|vol_down|mode [sequential|single_repeat|shuffle]]",
         .hint = NULL,
         .func = cmd_media,
         .argtable = &s_media_args,

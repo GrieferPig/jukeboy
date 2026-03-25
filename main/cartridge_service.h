@@ -8,6 +8,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "jukeboy_formats.h"
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -22,6 +24,13 @@ extern "C"
         CARTRIDGE_SVC_EVENT_MOUNTED,
         CARTRIDGE_SVC_EVENT_UNMOUNTED,
     } cartridge_service_event_id_t;
+
+    typedef enum
+    {
+        CARTRIDGE_STATUS_EMPTY,
+        CARTRIDGE_STATUS_READY,
+        CARTRIDGE_STATUS_INVALID,
+    } cartridge_status_t;
 
     /**
      * Hardware configuration for the SD card SDMMC peripheral.
@@ -85,6 +94,46 @@ extern "C"
     bool cartridge_service_is_mounted(void);
 
     /**
+     * Return the current cartridge metadata status.
+     */
+    cartridge_status_t cartridge_service_get_status(void);
+
+    /**
+     * Return a human-readable name for the cartridge status.
+     */
+    const char *cartridge_service_status_name(cartridge_status_t status);
+
+    /**
+     * Return the loaded metadata header, or NULL if metadata is unavailable.
+     * The returned pointer remains valid until the cartridge is reloaded or unmounted.
+     */
+    const jukeboy_jbm_header_t *cartridge_service_get_metadata_header(void);
+    uint32_t cartridge_service_get_metadata_version(void);
+    uint32_t cartridge_service_get_metadata_checksum(void);
+
+    /**
+     * Return the number of loaded metadata tracks.
+     */
+    size_t cartridge_service_get_metadata_track_count(void);
+
+    /**
+     * Return the metadata track at the given index, or NULL if unavailable.
+     */
+    const jukeboy_jbm_track_t *cartridge_service_get_metadata_track(size_t index);
+
+    const char *cartridge_service_get_album_name(void);
+    const char *cartridge_service_get_album_description(void);
+    const char *cartridge_service_get_album_artist(void);
+    uint32_t cartridge_service_get_album_year(void);
+    uint32_t cartridge_service_get_album_duration_sec(void);
+    const char *cartridge_service_get_album_genre(void);
+    const char *cartridge_service_get_album_tag(size_t index);
+    const char *cartridge_service_get_track_name(size_t index);
+    const char *cartridge_service_get_track_artists(size_t index);
+    uint32_t cartridge_service_get_track_duration_sec(size_t index);
+    uint32_t cartridge_service_get_track_file_num(size_t index);
+
+    /**
      * Start an asynchronous 128KB read from the given file at the specified
      * byte offset. The service manages file
      * open/close internally: if filename differs from the currently open file,
@@ -97,7 +146,7 @@ extern "C"
      *
      * Only one async read may be in flight at a time.
      *
-     * @param filename     File path (relative to mount point root, e.g. "test.opu")
+     * @param filename     File path (relative to mount point root, e.g. "000.jba")
      * @param offset       byte offset into the file
      * @param notify_task  Task handle to notify on completion
      * @return ESP_OK if the request was accepted

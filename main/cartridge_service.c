@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
@@ -7,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
+#include "esp_rom_crc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -21,6 +23,11 @@ static cartridge_service_config_t s_config;
 static bool s_initialised = false;
 static bool s_mounted = false;
 static sdmmc_card_t *s_card = NULL;
+static cartridge_status_t s_status = CARTRIDGE_STATUS_EMPTY;
+static uint8_t *s_metadata_blob = NULL;
+static size_t s_metadata_blob_len = 0;
+static const jukeboy_jbm_header_t *s_metadata_header = NULL;
+static const jukeboy_jbm_track_t *s_metadata_tracks = NULL;
 
 /* ---- Double-buffer async read state ---- */
 
@@ -48,6 +55,164 @@ typedef struct
 
 static QueueHandle_t s_read_queue = NULL;
 static TaskHandle_t s_reader_task = NULL;
+
+static uint32_t cartridge_service_crc32(const uint8_t *data, size_t len)
+{
+    return esp_rom_crc32_le(0, data, (uint32_t)len);
+}
+
+static void cartridge_service_set_status(cartridge_status_t status)
+{
+    s_status = status;
+}
+
+static void cartridge_service_free_metadata(void)
+{
+    if (s_metadata_blob)
+    {
+        free(s_metadata_blob);
+    }
+
+    s_metadata_blob = NULL;
+    s_metadata_blob_len = 0;
+    s_metadata_header = NULL;
+    s_metadata_tracks = NULL;
+}
+
+static esp_err_t cartridge_service_validate_metadata(uint8_t *blob, size_t blob_len)
+{
+    jukeboy_jbm_header_t *header;
+    size_t expected_size;
+    uint32_t stored_checksum;
+    uint32_t computed_checksum;
+
+    if (!blob || blob_len < sizeof(jukeboy_jbm_header_t))
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    header = (jukeboy_jbm_header_t *)blob;
+    if (header->version != JUKEBOY_JBM_VERSION)
+    {
+        ESP_LOGE(TAG, "unsupported metadata version %lu", (unsigned long)header->version);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (header->track_count > JUKEBOY_MAX_TRACK_FILES)
+    {
+        ESP_LOGE(TAG, "metadata track count %lu exceeds max %u",
+                 (unsigned long)header->track_count,
+                 (unsigned)JUKEBOY_MAX_TRACK_FILES);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    expected_size = sizeof(jukeboy_jbm_header_t) +
+                    ((size_t)header->track_count * sizeof(jukeboy_jbm_track_t));
+    if (blob_len != expected_size)
+    {
+        ESP_LOGE(TAG, "metadata size mismatch: expected %u got %u",
+                 (unsigned)expected_size,
+                 (unsigned)blob_len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    stored_checksum = header->checksum;
+    header->checksum = 0;
+    computed_checksum = cartridge_service_crc32(blob, blob_len);
+    header->checksum = stored_checksum;
+    if (computed_checksum != stored_checksum)
+    {
+        ESP_LOGE(TAG, "metadata crc32 mismatch: expected 0x%08lx got 0x%08lx",
+                 (unsigned long)stored_checksum,
+                 (unsigned long)computed_checksum);
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t cartridge_service_load_metadata(void)
+{
+    char full_path[320];
+    FILE *metadata_file = NULL;
+    uint8_t *blob = NULL;
+    long file_size;
+    esp_err_t err;
+
+    cartridge_service_free_metadata();
+    if (!s_mounted)
+    {
+        cartridge_service_set_status(CARTRIDGE_STATUS_EMPTY);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    snprintf(full_path, sizeof(full_path), "%s/%s", s_config.mount_point, JUKEBOY_JBM_FILENAME);
+    metadata_file = fopen(full_path, "rb");
+    if (!metadata_file)
+    {
+        ESP_LOGE(TAG, "metadata file not found: %s", full_path);
+        cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (fseek(metadata_file, 0, SEEK_END) != 0)
+    {
+        fclose(metadata_file);
+        cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
+        return ESP_FAIL;
+    }
+
+    file_size = ftell(metadata_file);
+    if (file_size <= 0)
+    {
+        fclose(metadata_file);
+        cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (fseek(metadata_file, 0, SEEK_SET) != 0)
+    {
+        fclose(metadata_file);
+        cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
+        return ESP_FAIL;
+    }
+
+    blob = (uint8_t *)heap_caps_malloc((size_t)file_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!blob)
+    {
+        fclose(metadata_file);
+        cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (fread(blob, 1, (size_t)file_size, metadata_file) != (size_t)file_size)
+    {
+        fclose(metadata_file);
+        free(blob);
+        cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
+        return ESP_FAIL;
+    }
+
+    fclose(metadata_file);
+
+    err = cartridge_service_validate_metadata(blob, (size_t)file_size);
+    if (err != ESP_OK)
+    {
+        free(blob);
+        cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
+        return err;
+    }
+
+    s_metadata_blob = blob;
+    s_metadata_blob_len = (size_t)file_size;
+    s_metadata_header = (const jukeboy_jbm_header_t *)blob;
+    s_metadata_tracks = (const jukeboy_jbm_track_t *)(blob + sizeof(jukeboy_jbm_header_t));
+    cartridge_service_set_status(CARTRIDGE_STATUS_READY);
+    ESP_LOGI(TAG, "metadata loaded: %lu track(s), %u bytes",
+             (unsigned long)s_metadata_header->track_count,
+             (unsigned)s_metadata_blob_len);
+    return ESP_OK;
+}
 
 static void cartridge_service_post_event(cartridge_service_event_id_t event_id)
 {
@@ -165,8 +330,15 @@ esp_err_t cartridge_service_init(const cartridge_service_config_t *config)
              s_config.clk_gpio, s_config.cmd_gpio,
              s_config.d0_gpio, s_config.mount_point);
     cartridge_service_post_event(CARTRIDGE_SVC_EVENT_STARTED);
+    cartridge_service_set_status(CARTRIDGE_STATUS_EMPTY);
     if (cartridge_service_is_inserted())
     {
+        esp_err_t err = cartridge_service_mount();
+        if (err != ESP_OK)
+        {
+            cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
+            ESP_LOGE(TAG, "failed to prepare inserted cartridge: %s", esp_err_to_name(err));
+        }
         cartridge_service_post_event(CARTRIDGE_SVC_EVENT_INSERTED);
     }
     return ESP_OK;
@@ -183,6 +355,7 @@ esp_err_t cartridge_service_mount(void)
     if (s_mounted)
     {
         ESP_LOGW(TAG, "already mounted at %s", s_config.mount_point);
+        (void)cartridge_service_load_metadata();
         return ESP_OK;
     }
 
@@ -222,6 +395,10 @@ esp_err_t cartridge_service_mount(void)
     s_mounted = true;
     sdmmc_card_print_info(stdout, s_card);
     ESP_LOGI(TAG, "SD card mounted at %s", s_config.mount_point);
+    if (cartridge_service_load_metadata() != ESP_OK)
+    {
+        ESP_LOGW(TAG, "cartridge metadata is invalid");
+    }
     cartridge_service_post_event(CARTRIDGE_SVC_EVENT_MOUNTED);
     return ESP_OK;
 }
@@ -234,8 +411,11 @@ esp_err_t cartridge_service_unmount(void)
     }
 
     esp_vfs_fat_sdcard_unmount(s_config.mount_point, s_card);
+    cartridge_service_close_file();
+    cartridge_service_free_metadata();
     s_card = NULL;
     s_mounted = false;
+    cartridge_service_set_status(CARTRIDGE_STATUS_EMPTY);
     ESP_LOGI(TAG, "SD card unmounted");
     cartridge_service_post_event(CARTRIDGE_SVC_EVENT_UNMOUNTED);
     return ESP_OK;
@@ -255,6 +435,120 @@ bool cartridge_service_is_inserted(void)
 bool cartridge_service_is_mounted(void)
 {
     return s_mounted;
+}
+
+cartridge_status_t cartridge_service_get_status(void)
+{
+    return s_status;
+}
+
+const char *cartridge_service_status_name(cartridge_status_t status)
+{
+    switch (status)
+    {
+    case CARTRIDGE_STATUS_EMPTY:
+        return "empty";
+    case CARTRIDGE_STATUS_READY:
+        return "ready";
+    case CARTRIDGE_STATUS_INVALID:
+        return "invalid";
+    default:
+        return "unknown";
+    }
+}
+
+const jukeboy_jbm_header_t *cartridge_service_get_metadata_header(void)
+{
+    return s_metadata_header;
+}
+
+uint32_t cartridge_service_get_metadata_version(void)
+{
+    return s_metadata_header ? s_metadata_header->version : 0;
+}
+
+uint32_t cartridge_service_get_metadata_checksum(void)
+{
+    return s_metadata_header ? s_metadata_header->checksum : 0;
+}
+
+size_t cartridge_service_get_metadata_track_count(void)
+{
+    return s_metadata_header ? (size_t)s_metadata_header->track_count : 0;
+}
+
+const jukeboy_jbm_track_t *cartridge_service_get_metadata_track(size_t index)
+{
+    if (!s_metadata_header || index >= s_metadata_header->track_count)
+    {
+        return NULL;
+    }
+
+    return &s_metadata_tracks[index];
+}
+
+const char *cartridge_service_get_album_name(void)
+{
+    return s_metadata_header ? s_metadata_header->album_name : NULL;
+}
+
+const char *cartridge_service_get_album_description(void)
+{
+    return s_metadata_header ? s_metadata_header->album_description : NULL;
+}
+
+const char *cartridge_service_get_album_artist(void)
+{
+    return s_metadata_header ? s_metadata_header->artist : NULL;
+}
+
+uint32_t cartridge_service_get_album_year(void)
+{
+    return s_metadata_header ? s_metadata_header->year : 0;
+}
+
+uint32_t cartridge_service_get_album_duration_sec(void)
+{
+    return s_metadata_header ? s_metadata_header->duration_sec : 0;
+}
+
+const char *cartridge_service_get_album_genre(void)
+{
+    return s_metadata_header ? s_metadata_header->genre : NULL;
+}
+
+const char *cartridge_service_get_album_tag(size_t index)
+{
+    if (!s_metadata_header || index >= JUKEBOY_JBM_TAG_COUNT)
+    {
+        return NULL;
+    }
+
+    return s_metadata_header->tag[index];
+}
+
+const char *cartridge_service_get_track_name(size_t index)
+{
+    const jukeboy_jbm_track_t *track = cartridge_service_get_metadata_track(index);
+    return track ? track->track_name : NULL;
+}
+
+const char *cartridge_service_get_track_artists(size_t index)
+{
+    const jukeboy_jbm_track_t *track = cartridge_service_get_metadata_track(index);
+    return track ? track->artists : NULL;
+}
+
+uint32_t cartridge_service_get_track_duration_sec(size_t index)
+{
+    const jukeboy_jbm_track_t *track = cartridge_service_get_metadata_track(index);
+    return track ? track->duration_sec : 0;
+}
+
+uint32_t cartridge_service_get_track_file_num(size_t index)
+{
+    const jukeboy_jbm_track_t *track = cartridge_service_get_metadata_track(index);
+    return track ? track->file_num : 0;
 }
 
 esp_err_t cartridge_service_read_chunk_async(const char *filename,

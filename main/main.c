@@ -47,6 +47,4 @@ void app_main(void)
 
     ESP_ERROR_CHECK(player_service_init());
     ESP_ERROR_CHECK(console_service_init());
-
-    bluetooth_service_connect_last_bonded_a2dp_device();
 }

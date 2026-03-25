@@ -79,7 +79,6 @@ static TimerHandle_t s_reconnect_timer;
 static volatile wifi_svc_state_t s_state = WIFI_SVC_STATE_IDLE;
 static volatile bool s_autoreconnect = false;
 static bool s_sntp_initialised = false;
-static bool s_reconnect_scan_pending = false;
 static esp_netif_ip_info_t s_ip_info;
 static bool s_have_ip_info = false;
 
@@ -128,6 +127,44 @@ static void post_event(wifi_svc_event_id_t id, const void *data, size_t len)
 static bool queue_internal_cmd(const wifi_svc_msg_t *msg)
 {
     return s_cmd_queue && xQueueSend(s_cmd_queue, msg, 0) == pdPASS;
+}
+
+static esp_err_t wifi_service_connect_saved_credentials(void)
+{
+    char ssid[33] = {0};
+    char password[65] = {0};
+    wifi_config_t cfg = {0};
+    esp_err_t err = nvs_load_creds(ssid, sizeof(ssid), password, sizeof(password));
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "no saved WiFi credentials available for reconnect: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
+    strncpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password) - 1);
+
+    err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "failed to apply saved WiFi config: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = esp_wifi_connect();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_connect failed using saved credentials: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "connecting using saved credentials for SSID '%s'", ssid);
+    s_state = WIFI_SVC_STATE_CONNECTING;
+    s_have_ip_info = false;
+    memset(&s_ip_info, 0, sizeof(s_ip_info));
+    post_event(WIFI_SVC_EVENT_CONNECTING, NULL, 0);
+    return ESP_OK;
 }
 
 /* ── DNS connectivity test (runs in service task context) ───────────── */
@@ -285,7 +322,6 @@ static void wifi_service_task(void *arg)
                 if (!en)
                 {
                     xTimerStop(s_reconnect_timer, 0);
-                    s_reconnect_scan_pending = false;
                 }
                 post_event(WIFI_SVC_EVENT_AUTORECONNECT_CHANGED, &en, sizeof(en));
                 break;
@@ -298,10 +334,11 @@ static void wifi_service_task(void *arg)
                     st != WIFI_SVC_STATE_CONNECTING &&
                     s_autoreconnect)
                 {
-                    ESP_LOGI(TAG, "auto-reconnect tick: scanning for saved SSID");
-                    s_reconnect_scan_pending = true;
-                    s_state = WIFI_SVC_STATE_SCANNING;
-                    esp_wifi_scan_start(NULL, false);
+                    ESP_LOGI(TAG, "auto-reconnect tick: connecting with saved credentials");
+                    if (wifi_service_connect_saved_credentials() != ESP_OK)
+                    {
+                        s_state = WIFI_SVC_STATE_DISCONNECTED;
+                    }
                 }
                 break;
             }
@@ -338,35 +375,6 @@ static void wifi_service_task(void *arg)
                     xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
                     s_scan_results.count = 0;
                     xSemaphoreGive(s_scan_mutex);
-                }
-
-                if (s_reconnect_scan_pending)
-                {
-                    char ssid[33] = {0};
-                    char pass[65] = {0};
-                    s_reconnect_scan_pending = false;
-                    if (nvs_load_creds(ssid, sizeof(ssid), pass, sizeof(pass)) == ESP_OK)
-                    {
-                        for (uint16_t index = 0; index < count; index++)
-                        {
-                            if (strcmp((char *)records[index].ssid, ssid) == 0)
-                            {
-                                ESP_LOGI(TAG, "auto-reconnect: found saved SSID '%s', connecting", ssid);
-                                wifi_config_t cfg = {0};
-                                strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
-                                strncpy((char *)cfg.sta.password, pass, sizeof(cfg.sta.password) - 1);
-                                esp_wifi_set_config(WIFI_IF_STA, &cfg);
-                                esp_wifi_connect();
-                                s_state = WIFI_SVC_STATE_CONNECTING;
-                                post_event(WIFI_SVC_EVENT_CONNECTING, NULL, 0);
-                                break;
-                            }
-                        }
-                        if (s_state == WIFI_SVC_STATE_SCANNING)
-                        {
-                            ESP_LOGW(TAG, "auto-reconnect: saved SSID '%s' not found in scan", ssid);
-                        }
-                    }
                 }
 
                 if (s_state == WIFI_SVC_STATE_SCANNING)
@@ -450,6 +458,13 @@ esp_err_t wifi_service_init(void)
 
     post_event(WIFI_SVC_EVENT_STARTED, NULL, 0);
     ESP_LOGI(TAG, "WiFi service started");
+
+    err = wifi_service_connect_saved_credentials();
+    if (err != ESP_OK)
+    {
+        ESP_LOGI(TAG, "boot-time WiFi connect skipped: %s", esp_err_to_name(err));
+    }
+
     return ESP_OK;
 }
 

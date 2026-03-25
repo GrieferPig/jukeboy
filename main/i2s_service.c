@@ -13,8 +13,6 @@
 #define I2S_SVC_TASK_STACK_SIZE 2048
 #define I2S_SVC_TASK_PRIORITY 5
 #define I2S_SVC_QUEUE_DEPTH 4
-#define I2S_SVC_PULL_BYTES 3840
-#define I2S_SVC_PULL_PERIOD_MS 20
 
 static const char *TAG = "i2s_svc";
 
@@ -34,10 +32,6 @@ typedef struct
 
 static QueueHandle_t s_cmd_queue;
 static TaskHandle_t s_task_handle;
-static bool s_running;
-static i2s_service_pcm_provider_t s_provider;
-static void *s_provider_ctx;
-static uint8_t s_scratch[I2S_SVC_PULL_BYTES];
 
 static void i2s_service_task(void *param)
 {
@@ -46,29 +40,17 @@ static void i2s_service_task(void *param)
 
     for (;;)
     {
-        if (xQueueReceive(s_cmd_queue, &msg, pdMS_TO_TICKS(I2S_SVC_PULL_PERIOD_MS)) == pdPASS)
-        {
-            switch (msg.cmd)
-            {
-            case I2S_SVC_CMD_START:
-                s_running = true;
-                break;
-            case I2S_SVC_CMD_SUSPEND:
-                s_running = false;
-                break;
-            case I2S_SVC_CMD_REGISTER_PROVIDER:
-                s_provider = msg.provider;
-                s_provider_ctx = msg.user_ctx;
-                break;
-            default:
-                break;
-            }
-        }
+        xQueueReceive(s_cmd_queue, &msg, portMAX_DELAY);
 
-        if (s_running && s_provider)
+        switch (msg.cmd)
         {
-            memset(s_scratch, 0, sizeof(s_scratch));
-            s_provider(s_scratch, (int32_t)sizeof(s_scratch), s_provider_ctx);
+        case I2S_SVC_CMD_START:
+        case I2S_SVC_CMD_SUSPEND:
+        case I2S_SVC_CMD_REGISTER_PROVIDER:
+            /* Stub: no real I2S hardware — just consume and discard commands. */
+            break;
+        default:
+            break;
         }
     }
 }
