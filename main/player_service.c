@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/event_groups.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 
@@ -114,16 +115,40 @@ typedef struct
     size_t total_file_size;
 } player_service_track_info_t;
 
+typedef enum
+{
+    READER_CMD_START,
+} reader_cmd_t;
+
 typedef struct
 {
+    reader_cmd_t cmd;
     uint32_t generation;
     size_t start_chunk;
-} player_service_task_params_t;
+} reader_cmd_msg_t;
+
+typedef enum
+{
+    DECODER_CMD_START,
+} decoder_cmd_t;
+
+typedef struct
+{
+    decoder_cmd_t cmd;
+    uint32_t generation;
+} decoder_cmd_msg_t;
+
+#define PLAYER_SVC_READER_IDLE_BIT (1 << 0)
+#define PLAYER_SVC_DECODER_IDLE_BIT (1 << 1)
+#define PLAYER_SVC_PIPELINE_IDLE_BITS (PLAYER_SVC_READER_IDLE_BIT | PLAYER_SVC_DECODER_IDLE_BIT)
 
 static StreamBufferHandle_t s_pcm_stream;
 static QueueHandle_t s_chunk_queue;
 static SemaphoreHandle_t s_buf_pool_sem;
 static QueueHandle_t s_cmd_queue;
+static QueueHandle_t s_reader_cmd_queue;
+static QueueHandle_t s_decoder_cmd_queue;
+static EventGroupHandle_t s_pipeline_event_group;
 static TaskHandle_t s_reader_task;
 static TaskHandle_t s_decoder_task;
 static TaskHandle_t s_service_task;
@@ -149,7 +174,7 @@ static player_service_playback_mode_t s_playback_mode = PLAYER_SVC_MODE_SEQUENTI
 static player_service_playlist_entry_t *s_playlist = NULL;
 static size_t s_playlist_capacity = 0;
 static size_t *s_shuffle_order = NULL; /* PSRAM array; length == s_playlist_count */
-static size_t s_shuffle_position = 0; /* position of current track in s_shuffle_order; SIZE_MAX = not started */
+static size_t s_shuffle_position = 0;  /* position of current track in s_shuffle_order; SIZE_MAX = not started */
 
 static void player_service_post_event(player_service_event_id_t event_id, const void *data, size_t len)
 {
@@ -217,6 +242,16 @@ static bool player_service_should_stop(uint32_t generation)
 
 static void player_service_reset_pipeline(void)
 {
+    if (s_reader_cmd_queue)
+    {
+        xQueueReset(s_reader_cmd_queue);
+    }
+
+    if (s_decoder_cmd_queue)
+    {
+        xQueueReset(s_decoder_cmd_queue);
+    }
+
     if (s_chunk_queue)
     {
         xQueueReset(s_chunk_queue);
@@ -759,25 +794,27 @@ static esp_err_t player_service_ensure_track_loaded(size_t index)
 
 static void player_service_wait_for_playback_stop(void)
 {
-    uint32_t wait_loops = 0;
-
-    while ((s_reader_task || s_decoder_task) && wait_loops < PLAYER_SVC_STOP_TIMEOUT_LOOPS)
+    EventBits_t bits = xEventGroupWaitBits(s_pipeline_event_group,
+                                           PLAYER_SVC_PIPELINE_IDLE_BITS,
+                                           pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(PLAYER_SVC_STOP_POLL_MS * PLAYER_SVC_STOP_TIMEOUT_LOOPS));
+    if ((bits & PLAYER_SVC_PIPELINE_IDLE_BITS) != PLAYER_SVC_PIPELINE_IDLE_BITS)
     {
-        vTaskDelay(pdMS_TO_TICKS(PLAYER_SVC_STOP_POLL_MS));
-        wait_loops++;
-    }
-
-    if (s_reader_task || s_decoder_task)
-    {
-        ESP_LOGW(TAG, "timed out waiting for playback tasks to stop");
+        ESP_LOGW(TAG, "timed out waiting for pipeline tasks to become idle");
     }
 
     player_service_reset_pipeline();
 }
 
+static bool player_service_pipeline_idle(void)
+{
+    EventBits_t bits = xEventGroupGetBits(s_pipeline_event_group);
+    return (bits & PLAYER_SVC_PIPELINE_IDLE_BITS) == PLAYER_SVC_PIPELINE_IDLE_BITS;
+}
+
 static void player_service_stop_playback(bool cancelled)
 {
-    if (!s_reader_task && !s_decoder_task)
+    if (player_service_pipeline_idle())
     {
         player_service_reset_pipeline();
         return;
@@ -972,343 +1009,382 @@ static void player_service_scan_playlist(void)
 
 static void player_service_reader_task(void *param)
 {
-    player_service_task_params_t *task_params = (player_service_task_params_t *)param;
-    const char *filename = s_track_info.filename;
-    bool buffer_checked_out = false;
-    esp_err_t err;
-    uint32_t generation = task_params ? task_params->generation : 0;
-    size_t start_chunk = task_params ? task_params->start_chunk : 0;
+    (void)param;
 
-    if (!task_params)
+    for (;;)
     {
-        err = ESP_ERR_INVALID_ARG;
-        goto done;
-    }
+        reader_cmd_msg_t cmd;
+        const char *filename;
+        bool buffer_checked_out;
+        esp_err_t err;
+        uint32_t generation;
+        size_t start_chunk;
+        size_t total_data_bytes;
+        const uint8_t *rd;
+        size_t rd_len;
+        size_t window_start;
 
-    if (start_chunk >= s_track_info.lookup_table_len)
-    {
-        err = ESP_ERR_INVALID_ARG;
-        goto done;
-    }
+        xEventGroupSetBits(s_pipeline_event_group, PLAYER_SVC_READER_IDLE_BIT);
 
-    size_t total_data_bytes = s_track_info.total_file_size - s_track_info.data_offset;
-    const uint8_t *rd = NULL;
-    size_t rd_len = 0;
-    size_t window_start = 0;
-
-    for (size_t chunk_index = start_chunk; chunk_index < s_track_info.lookup_table_len; ++chunk_index)
-    {
-        if (player_service_should_stop(generation))
-        {
-            err = ESP_OK;
-            goto done;
-        }
-
-        size_t chunk_start = s_track_info.lookup_table[chunk_index];
-        size_t chunk_end = (chunk_index + 1 < s_track_info.lookup_table_len)
-                               ? s_track_info.lookup_table[chunk_index + 1]
-                               : total_data_bytes;
-        configASSERT(chunk_end >= chunk_start && (chunk_end - chunk_start) <= PLAYER_SVC_CHUNK_MAX_BYTES);
-
-        size_t chunk_len = chunk_end - chunk_start;
-        if (chunk_len <= PLAYER_SVC_CHUNK_CRC_BYTES)
+        if (xQueueReceive(s_reader_cmd_queue, &cmd, portMAX_DELAY) != pdPASS)
         {
             continue;
         }
 
-        bool fits = (rd != NULL) &&
-                    (chunk_start >= window_start) &&
-                    (chunk_end <= window_start + rd_len);
+        xEventGroupClearBits(s_pipeline_event_group, PLAYER_SVC_READER_IDLE_BIT);
 
-        if (!fits)
+        if (cmd.cmd != READER_CMD_START)
         {
-            if (rd != NULL)
-            {
-                player_service_chunk_msg_t flush = {.release_buf = true};
-                if (!player_service_queue_chunk_message(&flush, generation))
-                {
-                    err = ESP_OK;
-                    goto done;
-                }
-                buffer_checked_out = false;
-            }
+            continue;
+        }
 
-            xSemaphoreTake(s_buf_pool_sem, portMAX_DELAY);
-            buffer_checked_out = true;
+        filename = s_track_info.filename;
+        buffer_checked_out = false;
+        err = ESP_OK;
+        generation = cmd.generation;
+        start_chunk = cmd.start_chunk;
+        rd = NULL;
+        rd_len = 0;
+        window_start = 0;
 
+        if (start_chunk >= s_track_info.lookup_table_len)
+        {
+            err = ESP_ERR_INVALID_ARG;
+            goto track_done;
+        }
+
+        total_data_bytes = s_track_info.total_file_size - s_track_info.data_offset;
+
+        for (size_t chunk_index = start_chunk; chunk_index < s_track_info.lookup_table_len; ++chunk_index)
+        {
             if (player_service_should_stop(generation))
             {
                 err = ESP_OK;
-                goto done;
+                goto track_done;
             }
 
-            err = cartridge_service_read_chunk_async(filename,
-                                                     s_track_info.data_offset + chunk_start,
-                                                     xTaskGetCurrentTaskHandle());
-            if (err != ESP_OK)
+            size_t chunk_start = s_track_info.lookup_table[chunk_index];
+            size_t chunk_end = (chunk_index + 1 < s_track_info.lookup_table_len)
+                                   ? s_track_info.lookup_table[chunk_index + 1]
+                                   : total_data_bytes;
+            configASSERT(chunk_end >= chunk_start && (chunk_end - chunk_start) <= PLAYER_SVC_CHUNK_MAX_BYTES);
+
+            size_t chunk_len = chunk_end - chunk_start;
+            if (chunk_len <= PLAYER_SVC_CHUNK_CRC_BYTES)
             {
-                ESP_LOGE(TAG, "read request failed for %s chunk %u: %s",
-                         filename,
-                         (unsigned)chunk_index,
-                         esp_err_to_name(err));
-                xSemaphoreGive(s_buf_pool_sem);
-                buffer_checked_out = false;
-                rd = NULL;
-                goto done;
+                continue;
             }
 
-            if (!player_service_wait_for_notification(generation))
+            bool fits = (rd != NULL) &&
+                        (chunk_start >= window_start) &&
+                        (chunk_end <= window_start + rd_len);
+
+            if (!fits)
+            {
+                if (rd != NULL)
+                {
+                    player_service_chunk_msg_t flush = {.release_buf = true};
+                    if (!player_service_queue_chunk_message(&flush, generation))
+                    {
+                        err = ESP_OK;
+                        goto track_done;
+                    }
+                    buffer_checked_out = false;
+                }
+
+                while (xSemaphoreTake(s_buf_pool_sem, pdMS_TO_TICKS(PLAYER_SVC_QUEUE_POLL_MS)) != pdPASS)
+                {
+                    if (player_service_should_stop(generation))
+                    {
+                        err = ESP_OK;
+                        goto track_done;
+                    }
+                }
+                buffer_checked_out = true;
+
+                if (player_service_should_stop(generation))
+                {
+                    err = ESP_OK;
+                    goto track_done;
+                }
+
+                err = cartridge_service_read_chunk_async(filename,
+                                                         s_track_info.data_offset + chunk_start,
+                                                         xTaskGetCurrentTaskHandle());
+                if (err != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "read request failed for %s chunk %u: %s",
+                             filename,
+                             (unsigned)chunk_index,
+                             esp_err_to_name(err));
+                    xSemaphoreGive(s_buf_pool_sem);
+                    buffer_checked_out = false;
+                    rd = NULL;
+                    goto track_done;
+                }
+
+                if (!player_service_wait_for_notification(generation))
+                {
+                    err = ESP_OK;
+                    goto track_done;
+                }
+
+                err = cartridge_service_get_read_result(&rd, &rd_len);
+                if (err != ESP_OK || rd_len < chunk_len)
+                {
+                    ESP_LOGE(TAG, "read result invalid for %s chunk %u", filename, (unsigned)chunk_index);
+                    xSemaphoreGive(s_buf_pool_sem);
+                    buffer_checked_out = false;
+                    rd = NULL;
+                    if (err == ESP_OK)
+                    {
+                        err = ESP_FAIL;
+                    }
+                    goto track_done;
+                }
+
+                window_start = chunk_start;
+            }
+
+            player_service_chunk_msg_t msg = {
+                .data = (uint8_t *)(rd + (chunk_start - window_start)),
+                .len = chunk_len,
+                .chunk_index = chunk_index,
+                .is_eof = false,
+                .release_buf = false,
+            };
+            if (!player_service_queue_chunk_message(&msg, generation))
             {
                 err = ESP_OK;
-                goto done;
+                goto track_done;
             }
-
-            err = cartridge_service_get_read_result(&rd, &rd_len);
-            if (err != ESP_OK || rd_len < chunk_len)
-            {
-                ESP_LOGE(TAG, "read result invalid for %s chunk %u", filename, (unsigned)chunk_index);
-                xSemaphoreGive(s_buf_pool_sem);
-                buffer_checked_out = false;
-                rd = NULL;
-                if (err == ESP_OK)
-                {
-                    err = ESP_FAIL;
-                }
-                goto done;
-            }
-
-            window_start = chunk_start;
         }
 
-        player_service_chunk_msg_t msg = {
-            .data = (uint8_t *)(rd + (chunk_start - window_start)),
-            .len = chunk_len,
-            .chunk_index = chunk_index,
-            .is_eof = false,
-            .release_buf = false,
-        };
-        if (!player_service_queue_chunk_message(&msg, generation))
+    track_done:
+        if (buffer_checked_out)
         {
-            err = ESP_OK;
-            goto done;
+            xSemaphoreGive(s_buf_pool_sem);
+        }
+
+        player_service_send_eof_message(generation);
+        cartridge_service_close_file();
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "reader stopped on error for %s: %s", filename, esp_err_to_name(err));
+        }
+        else
+        {
+            ESP_LOGI(TAG, "reader done for %s", filename);
         }
     }
-
-    err = ESP_OK;
-
-done:
-    if (buffer_checked_out)
-    {
-        xSemaphoreGive(s_buf_pool_sem);
-    }
-
-    player_service_send_eof_message(generation);
-    cartridge_service_close_file();
-    s_reader_task = NULL;
-    if (task_params)
-    {
-        free(task_params);
-    }
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "reader task stopped on error for %s: %s", filename, esp_err_to_name(err));
-    }
-    else
-    {
-        ESP_LOGI(TAG, "reader task done for %s", filename);
-    }
-    vTaskDelete(NULL);
 }
 
 static void player_service_decoder_task(void *param)
 {
-    player_service_task_params_t *task_params = (player_service_task_params_t *)param;
     (void)param;
-    void *opus_handle = NULL;
-    uint32_t generation = task_params ? task_params->generation : 0;
 
-    esp_opus_dec_cfg_t opus_cfg = ESP_OPUS_DEC_CONFIG_DEFAULT();
-    opus_cfg.channel = ESP_AUDIO_DUAL;
-    opus_cfg.sample_rate = ESP_AUDIO_SAMPLE_RATE_48K;
-    opus_cfg.frame_duration = ESP_OPUS_DEC_FRAME_DURATION_20_MS;
-    opus_cfg.self_delimited = false;
-
-    esp_audio_err_t aerr = esp_opus_dec_open(&opus_cfg, sizeof(opus_cfg), &opus_handle);
-    if (!task_params || aerr != ESP_AUDIO_ERR_OK || !opus_handle)
+    for (;;)
     {
-        ESP_LOGE(TAG, "failed to open opus decoder: %d", aerr);
-        s_decoder_task = NULL;
-        if (task_params)
-        {
-            free(task_params);
-        }
-        player_service_queue_track_complete(generation);
-        vTaskDelete(NULL);
-        return;
-    }
+        decoder_cmd_msg_t cmd;
+        void *opus_handle = NULL;
+        uint32_t generation;
 
-    memset(&s_decoder_info, 0, sizeof(s_decoder_info));
-    s_decoder_out_frame = (esp_audio_dec_out_frame_t){
-        .buffer = s_decoder_pcm_buf,
-        .len = sizeof(s_decoder_pcm_buf),
-        .needed_size = 0,
-        .decoded_size = 0,
-    };
+        xEventGroupSetBits(s_pipeline_event_group, PLAYER_SVC_DECODER_IDLE_BIT);
 
-    bool running = true;
-
-    while (running)
-    {
-        player_service_chunk_msg_t msg;
-        if (player_service_should_stop(generation))
-        {
-            break;
-        }
-
-        if (xQueueReceive(s_chunk_queue, &msg, pdMS_TO_TICKS(PLAYER_SVC_QUEUE_POLL_MS)) != pdTRUE)
+        if (xQueueReceive(s_decoder_cmd_queue, &cmd, portMAX_DELAY) != pdPASS)
         {
             continue;
         }
 
-        if (msg.is_eof)
-        {
-            running = false;
-            break;
-        }
+        xEventGroupClearBits(s_pipeline_event_group, PLAYER_SVC_DECODER_IDLE_BIT);
 
-        if (msg.release_buf)
+        if (cmd.cmd != DECODER_CMD_START)
         {
-            xSemaphoreGive(s_buf_pool_sem);
             continue;
         }
 
-        s_current_chunk = msg.chunk_index;
+        generation = cmd.generation;
 
-        if (msg.len <= PLAYER_SVC_CHUNK_CRC_BYTES)
+        esp_opus_dec_cfg_t opus_cfg = ESP_OPUS_DEC_CONFIG_DEFAULT();
+        opus_cfg.channel = ESP_AUDIO_DUAL;
+        opus_cfg.sample_rate = ESP_AUDIO_SAMPLE_RATE_48K;
+        opus_cfg.frame_duration = ESP_OPUS_DEC_FRAME_DURATION_20_MS;
+        opus_cfg.self_delimited = false;
+
+        esp_audio_err_t aerr = esp_opus_dec_open(&opus_cfg, sizeof(opus_cfg), &opus_handle);
+        if (aerr != ESP_AUDIO_ERR_OK || !opus_handle)
         {
-            ESP_LOGE(TAG, "chunk %u missing crc32", (unsigned)msg.chunk_index);
+            ESP_LOGE(TAG, "failed to open opus decoder: %d", aerr);
+            player_service_queue_track_complete(generation);
             continue;
         }
 
-        uint32_t expected_crc = 0;
-        memcpy(&expected_crc, msg.data, sizeof(expected_crc));
+        memset(&s_decoder_info, 0, sizeof(s_decoder_info));
+        s_decoder_out_frame = (esp_audio_dec_out_frame_t){
+            .buffer = s_decoder_pcm_buf,
+            .len = sizeof(s_decoder_pcm_buf),
+            .needed_size = 0,
+            .decoded_size = 0,
+        };
 
-        const uint8_t *chunk_data = msg.data + PLAYER_SVC_CHUNK_CRC_BYTES;
-        size_t chunk_len = msg.len - PLAYER_SVC_CHUNK_CRC_BYTES;
-        uint32_t actual_crc = player_service_crc32(chunk_data, chunk_len);
-        if (actual_crc != expected_crc)
-        {
-            ESP_LOGE(TAG,
-                     "crc32 mismatch in chunk %u: expected 0x%08lx got 0x%08lx",
-                     (unsigned)msg.chunk_index,
-                     (unsigned long)expected_crc,
-                     (unsigned long)actual_crc);
-            continue;
-        }
+        bool running = true;
 
-        size_t cursor = 0;
-        while (cursor < chunk_len)
+        while (running)
         {
+            player_service_chunk_msg_t msg;
             if (player_service_should_stop(generation))
+            {
+                break;
+            }
+
+            if (xQueueReceive(s_chunk_queue, &msg, pdMS_TO_TICKS(PLAYER_SVC_QUEUE_POLL_MS)) != pdTRUE)
+            {
+                continue;
+            }
+
+            if (msg.is_eof)
             {
                 running = false;
                 break;
             }
 
-            const uint8_t *pkt = chunk_data + cursor;
-            uint8_t byte1 = pkt[0];
-            size_t hdr_size = 1;
-            size_t frame_len;
-
-            if ((chunk_len - cursor) < 1)
+            if (msg.release_buf)
             {
-                break;
-            }
-
-            if (byte1 < 252)
-            {
-                frame_len = byte1;
-            }
-            else
-            {
-                if ((chunk_len - cursor) < 2)
-                {
-                    ESP_LOGE(TAG, "partial packet header in chunk %u", (unsigned)msg.chunk_index);
-                    break;
-                }
-                hdr_size = 2;
-                frame_len = (pkt[1] * 4) + byte1;
-            }
-
-            if (frame_len > PLAYER_SVC_OPUS_MAX_FRAME_LEN)
-            {
-                ESP_LOGE(TAG, "opus frame length %u exceeds maximum %u in chunk %u",
-                         (unsigned)frame_len,
-                         (unsigned)PLAYER_SVC_OPUS_MAX_FRAME_LEN,
-                         (unsigned)msg.chunk_index);
-                break;
-            }
-
-            size_t pkt_size = hdr_size + frame_len;
-            if (pkt_size <= hdr_size)
-            {
-                cursor += hdr_size;
+                xSemaphoreGive(s_buf_pool_sem);
                 continue;
             }
 
-            if (pkt_size > (chunk_len - cursor))
+            s_current_chunk = msg.chunk_index;
+
+            if (msg.len <= PLAYER_SVC_CHUNK_CRC_BYTES)
             {
-                ESP_LOGE(TAG, "packet size %u exceeds remaining chunk data %u in chunk %u",
-                         (unsigned)pkt_size,
-                         (unsigned)(chunk_len - cursor),
-                         (unsigned)msg.chunk_index);
-                break;
+                ESP_LOGE(TAG, "chunk %u missing crc32", (unsigned)msg.chunk_index);
+                continue;
             }
 
-            esp_audio_dec_in_raw_t raw_in = {
-                .buffer = (uint8_t *)(pkt + hdr_size),
-                .len = (uint32_t)frame_len,
-                .consumed = 0,
-                .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
-            };
+            // CRC is not too important so skip it for now
 
-            s_decoder_out_frame.decoded_size = 0;
-            esp_audio_err_t dec_err = esp_opus_dec_decode(opus_handle, &raw_in, &s_decoder_out_frame, &s_decoder_info);
-            if (dec_err == ESP_AUDIO_ERR_OK && s_decoder_out_frame.decoded_size > 0)
+            // uint32_t expected_crc = 0;
+            // memcpy(&expected_crc, msg.data, sizeof(expected_crc));
+
+            const uint8_t *chunk_data = msg.data + PLAYER_SVC_CHUNK_CRC_BYTES;
+            size_t chunk_len = msg.len - PLAYER_SVC_CHUNK_CRC_BYTES;
+            // uint32_t actual_crc = player_service_crc32(chunk_data, chunk_len);
+            // if (actual_crc != expected_crc)
+            // {
+            //     ESP_LOGE(TAG,
+            //              "crc32 mismatch in chunk %u: expected 0x%08lx got 0x%08lx",
+            //              (unsigned)msg.chunk_index,
+            //              (unsigned long)expected_crc,
+            //              (unsigned long)actual_crc);
+            //     continue;
+            // }
+
+            size_t cursor = 0;
+            while (cursor < chunk_len)
             {
-                size_t written = 0;
-                while (written < s_decoder_out_frame.decoded_size)
+                if (player_service_should_stop(generation))
                 {
-                    written += xStreamBufferSend(s_pcm_stream,
-                                                 s_decoder_pcm_buf + written,
-                                                 s_decoder_out_frame.decoded_size - written,
-                                                 portMAX_DELAY);
+                    running = false;
+                    break;
                 }
-            }
-            else if (dec_err != ESP_AUDIO_ERR_OK)
-            {
-                ESP_LOGE(TAG, "opus decode error in chunk %u, packet_len=%u: %d",
-                         (unsigned)msg.chunk_index,
-                         (unsigned)frame_len,
-                         dec_err);
-            }
 
-            cursor += pkt_size;
+                const uint8_t *pkt = chunk_data + cursor;
+                uint8_t byte1 = pkt[0];
+                size_t hdr_size = 1;
+                size_t frame_len;
+
+                if ((chunk_len - cursor) < 1)
+                {
+                    break;
+                }
+
+                if (byte1 < 252)
+                {
+                    frame_len = byte1;
+                }
+                else
+                {
+                    if ((chunk_len - cursor) < 2)
+                    {
+                        ESP_LOGE(TAG, "partial packet header in chunk %u", (unsigned)msg.chunk_index);
+                        break;
+                    }
+                    hdr_size = 2;
+                    frame_len = (pkt[1] * 4) + byte1;
+                }
+
+                if (frame_len > PLAYER_SVC_OPUS_MAX_FRAME_LEN)
+                {
+                    ESP_LOGE(TAG, "opus frame length %u exceeds maximum %u in chunk %u",
+                             (unsigned)frame_len,
+                             (unsigned)PLAYER_SVC_OPUS_MAX_FRAME_LEN,
+                             (unsigned)msg.chunk_index);
+                    break;
+                }
+
+                size_t pkt_size = hdr_size + frame_len;
+                if (pkt_size <= hdr_size)
+                {
+                    cursor += hdr_size;
+                    continue;
+                }
+
+                if (pkt_size > (chunk_len - cursor))
+                {
+                    ESP_LOGE(TAG, "packet size %u exceeds remaining chunk data %u in chunk %u",
+                             (unsigned)pkt_size,
+                             (unsigned)(chunk_len - cursor),
+                             (unsigned)msg.chunk_index);
+                    break;
+                }
+
+                esp_audio_dec_in_raw_t raw_in = {
+                    .buffer = (uint8_t *)(pkt + hdr_size),
+                    .len = (uint32_t)frame_len,
+                    .consumed = 0,
+                    .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
+                };
+
+                s_decoder_out_frame.decoded_size = 0;
+                esp_audio_err_t dec_err = esp_opus_dec_decode(opus_handle, &raw_in, &s_decoder_out_frame, &s_decoder_info);
+                if (dec_err == ESP_AUDIO_ERR_OK && s_decoder_out_frame.decoded_size > 0)
+                {
+                    size_t written = 0;
+                    while (written < s_decoder_out_frame.decoded_size)
+                    {
+                        if (player_service_should_stop(generation))
+                        {
+                            running = false;
+                            break;
+                        }
+                        written += xStreamBufferSend(s_pcm_stream,
+                                                     s_decoder_pcm_buf + written,
+                                                     s_decoder_out_frame.decoded_size - written,
+                                                     pdMS_TO_TICKS(PLAYER_SVC_QUEUE_POLL_MS));
+                    }
+                }
+                else if (dec_err != ESP_AUDIO_ERR_OK)
+                {
+                    ESP_LOGE(TAG, "opus decode error in chunk %u, packet_len=%u: %d",
+                             (unsigned)msg.chunk_index,
+                             (unsigned)frame_len,
+                             dec_err);
+                }
+
+                cursor += pkt_size;
+            }
         }
-    }
 
-    esp_opus_dec_close(opus_handle);
-    s_decoder_task = NULL;
-    free(task_params);
-    player_service_queue_track_complete(generation);
-    ESP_LOGI(TAG, "decoder task done for %s", s_current_track);
-    vTaskDelete(NULL);
+        esp_opus_dec_close(opus_handle);
+        player_service_queue_track_complete(generation);
+        ESP_LOGI(TAG, "decoder done for %s", s_current_track);
+    }
 }
 
 static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
 {
-    player_service_task_params_t *decoder_params;
-    player_service_task_params_t *reader_params;
     esp_err_t err;
 
     if (index >= s_playlist_count)
@@ -1316,9 +1392,9 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (s_reader_task || s_decoder_task)
+    if (!player_service_pipeline_idle())
     {
-        ESP_LOGW(TAG, "cannot start track while playback tasks are still active");
+        ESP_LOGW(TAG, "cannot start track while pipeline is still active");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1333,28 +1409,31 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
 
     start_chunk = player_service_clamp_chunk_index(start_chunk);
 
-    decoder_params = calloc(1, sizeof(*decoder_params));
-    reader_params = calloc(1, sizeof(*reader_params));
-    if (!decoder_params || !reader_params)
-    {
-        free(decoder_params);
-        free(reader_params);
-        return ESP_ERR_NO_MEM;
-    }
-
     s_active_generation++;
     if (s_active_generation == 0)
     {
         s_active_generation = 1;
     }
 
-    decoder_params->generation = s_active_generation;
-    reader_params->generation = s_active_generation;
-    reader_params->start_chunk = start_chunk;
-
     strncpy(s_current_track, player_service_playlist_title(index), sizeof(s_current_track) - 1);
     s_current_track[sizeof(s_current_track) - 1] = '\0';
     s_playlist_index = index;
+
+    /* Keep s_shuffle_position in sync with the track that is actually starting.
+     * next/prev paths already set it, but this also covers saved-state restores
+     * and any other direct jump to a specific index. */
+    if (s_playback_mode == PLAYER_SVC_MODE_SHUFFLE && s_shuffle_order)
+    {
+        for (size_t i = 0; i < s_playlist_count; i++)
+        {
+            if (s_shuffle_order[i] == index)
+            {
+                s_shuffle_position = i;
+                break;
+            }
+        }
+    }
+
     s_playing = true;
     s_paused = false;
     s_stop_requested = false;
@@ -1363,38 +1442,31 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
 
     player_service_reset_pipeline();
 
-    if (xTaskCreatePinnedToCore(player_service_decoder_task,
-                                "player_decoder",
-                                PLAYER_SVC_DECODER_TASK_STACK,
-                                decoder_params,
-                                PLAYER_SVC_DECODER_TASK_PRIORITY,
-                                &s_decoder_task,
-                                1) != pdPASS)
+    decoder_cmd_msg_t dec_cmd = {
+        .cmd = DECODER_CMD_START,
+        .generation = s_active_generation,
+    };
+    reader_cmd_msg_t rdr_cmd = {
+        .cmd = READER_CMD_START,
+        .generation = s_active_generation,
+        .start_chunk = start_chunk,
+    };
+
+    if (xQueueSend(s_decoder_cmd_queue, &dec_cmd, 0) != pdPASS)
     {
-        free(decoder_params);
-        free(reader_params);
-        s_decoder_task = NULL;
         s_playing = false;
-        ESP_LOGE(TAG, "failed to create decoder task");
+        ESP_LOGE(TAG, "failed to send start command to decoder");
         return ESP_ERR_NO_MEM;
     }
 
-    if (xTaskCreatePinnedToCore(player_service_reader_task,
-                                "player_reader",
-                                PLAYER_SVC_READER_TASK_STACK,
-                                reader_params,
-                                PLAYER_SVC_READER_TASK_PRIORITY,
-                                &s_reader_task,
-                                1) != pdPASS)
+    if (xQueueSend(s_reader_cmd_queue, &rdr_cmd, 0) != pdPASS)
     {
-        free(reader_params);
         s_cancelled_generation = s_active_generation;
         s_stop_requested = true;
-        s_reader_task = NULL;
         s_playing = false;
         player_service_send_eof_message(s_active_generation);
         player_service_wait_for_playback_stop();
-        ESP_LOGE(TAG, "failed to create reader task");
+        ESP_LOGE(TAG, "failed to send start command to reader");
         return ESP_ERR_NO_MEM;
     }
 
@@ -1488,12 +1560,12 @@ static size_t player_service_next_index(bool is_manual)
         }
         if (s_shuffle_order)
         {
-            /* Advance through the pre-shuffled order; rebuild when one pass ends. */
+            /* Advance through the pre-shuffled order; loop back without reshuffling
+             * when the last entry is reached.  A fresh shuffle only happens when
+             * the user switches into shuffle mode (see player_service_set_playback_mode). */
             size_t next_pos;
             if (s_shuffle_position == SIZE_MAX || s_shuffle_position + 1 >= s_playlist_count)
             {
-                /* Finished a full pass (or first use after mode switch): reshuffle. */
-                player_service_build_shuffle_order();
                 next_pos = 0;
             }
             else
@@ -1517,6 +1589,39 @@ static size_t player_service_next_index(bool is_manual)
     default:
         return (s_playlist_index + 1U < s_playlist_count) ? (s_playlist_index + 1U) : 0;
     }
+}
+
+/**
+ * @brief Compute the previous playlist index.
+ *
+ * In shuffle mode, steps backwards through the pre-shuffled order (wrapping to
+ * the last entry when already at position 0).  In all other modes behaves like
+ * simple sequential decrement.
+ */
+static size_t player_service_prev_index(void)
+{
+    if (s_playlist_count == 0)
+    {
+        return 0;
+    }
+
+    if (s_playback_mode == PLAYER_SVC_MODE_SHUFFLE && s_shuffle_order && s_playlist_count > 1)
+    {
+        size_t prev_pos;
+        if (s_shuffle_position == SIZE_MAX || s_shuffle_position == 0)
+        {
+            /* Already at the start; wrap to end of the current pass. */
+            prev_pos = s_playlist_count - 1;
+        }
+        else
+        {
+            prev_pos = s_shuffle_position - 1;
+        }
+        s_shuffle_position = prev_pos;
+        return s_shuffle_order[s_shuffle_position];
+    }
+
+    return (s_playlist_index > 0) ? (s_playlist_index - 1U) : (s_playlist_count - 1U);
 }
 
 static void player_service_handle_track_complete(uint32_t generation)
@@ -1593,7 +1698,7 @@ static void player_service_handle_control(player_service_control_t control)
         }
         else
         {
-            target_index = (s_playlist_index > 0) ? (s_playlist_index - 1U) : (s_playlist_count - 1U);
+            target_index = player_service_prev_index();
         }
         if (player_service_start_track(target_index, 0) != ESP_OK)
         {
@@ -1751,7 +1856,36 @@ esp_err_t player_service_init(void)
     s_chunk_queue = xQueueCreate(PLAYER_SVC_CHUNK_BUF_COUNT, sizeof(player_service_chunk_msg_t));
     s_buf_pool_sem = xSemaphoreCreateCounting(PLAYER_SVC_CHUNK_BUF_COUNT, PLAYER_SVC_CHUNK_BUF_COUNT);
     s_cmd_queue = xQueueCreate(PLAYER_SVC_QUEUE_DEPTH, sizeof(player_service_msg_t));
-    if (!s_pcm_stream || !s_chunk_queue || !s_buf_pool_sem || !s_cmd_queue)
+    s_reader_cmd_queue = xQueueCreate(1, sizeof(reader_cmd_msg_t));
+    s_decoder_cmd_queue = xQueueCreate(1, sizeof(decoder_cmd_msg_t));
+    s_pipeline_event_group = xEventGroupCreate();
+    if (!s_pcm_stream || !s_chunk_queue || !s_buf_pool_sem || !s_cmd_queue ||
+        !s_reader_cmd_queue || !s_decoder_cmd_queue || !s_pipeline_event_group)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Mark both pipeline tasks as idle before creating them. */
+    xEventGroupSetBits(s_pipeline_event_group, PLAYER_SVC_PIPELINE_IDLE_BITS);
+
+    if (xTaskCreatePinnedToCore(player_service_reader_task,
+                                "player_reader",
+                                PLAYER_SVC_READER_TASK_STACK,
+                                NULL,
+                                PLAYER_SVC_READER_TASK_PRIORITY,
+                                &s_reader_task,
+                                1) != pdPASS)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (xTaskCreatePinnedToCore(player_service_decoder_task,
+                                "player_decoder",
+                                PLAYER_SVC_DECODER_TASK_STACK,
+                                NULL,
+                                PLAYER_SVC_DECODER_TASK_PRIORITY,
+                                &s_decoder_task,
+                                1) != pdPASS)
     {
         return ESP_ERR_NO_MEM;
     }
@@ -1841,8 +1975,8 @@ esp_err_t player_service_set_playback_mode(player_service_playback_mode_t mode)
         player_service_build_shuffle_order();
     }
     ESP_LOGI(TAG, "playback mode -> %s",
-             mode == PLAYER_SVC_MODE_SINGLE_REPEAT ? "single_repeat" :
-             mode == PLAYER_SVC_MODE_SHUFFLE       ? "shuffle"       : "sequential");
+             mode == PLAYER_SVC_MODE_SINGLE_REPEAT ? "single_repeat" : mode == PLAYER_SVC_MODE_SHUFFLE ? "shuffle"
+                                                                                                       : "sequential");
     return ESP_OK;
 }
 

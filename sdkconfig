@@ -822,6 +822,13 @@ CONFIG_ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # end of ESP-Driver:GPIO Configurations
 
 #
+# ESP-Driver:I2S Configurations
+#
+# CONFIG_I2S_ISR_IRAM_SAFE is not set
+# CONFIG_I2S_ENABLE_DEBUG_LOG is not set
+# end of ESP-Driver:I2S Configurations
+
+#
 # ESP-Driver:SPI Configurations
 #
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y
