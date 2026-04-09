@@ -4,9 +4,11 @@ This document defines the Jukeboy binary formats currently used or reserved by t
 
 - `.jba`: Jukeboy Audio
 - `.jbm`: Jukeboy Metadata
-- `.jbs`: Jukeboy Playback Status
 
 All integer fields are little-endian unless stated otherwise.
+
+Playback resume state is not part of the cartridge file format. The firmware
+stores it in NVS under the `player_service` namespace.
 
 ## Common String Rules
 
@@ -23,7 +25,7 @@ If a string exactly fills the field, the recommended encoding rule is to truncat
 
 `.jba` stores Opus audio in a custom streaming format optimized for the Jukeboy player.
 
-### `.jbm` Layout
+### `.jba` Layout
 
 The file layout is:
 
@@ -156,7 +158,7 @@ typedef struct __attribute__((packed)) {
 
 `.jbm` stores album-level and track-level metadata for a Jukeboy album or collection.
 
-### `.jbs` Layout
+### `.jbm` Layout
 
 The file layout is:
 
@@ -241,56 +243,12 @@ typedef struct __attribute__((packed)) {
 } track_t;
 ```
 
-## `.jbs` - Jukeboy Playback Status
-
-`.jbs` stores the saved playback position for the current cartridge.
-
-The file is written as `playback.jbs` in the root of the cartridge filesystem.
-
-### High-Level Layout
-
-The file contains a single packed struct with no trailing data.
-
-### File Fields
-
-| Order | Size | Type | Name | Description |
-| --- | ---: | --- | --- | --- |
-| 1 | 4 | `uint32_t` | `version` | Playback status format version. Current value is `1`. |
-| 2 | 4 | `uint32_t` | `current_track_num` | Zero-based playlist index in metadata order. `0` means the first track in `.jbm`. |
-| 3 | 4 | `uint32_t` | `current_sec` | Resume position in seconds from the start of the selected track. |
-
-`.jbs` size is always 12 bytes.
-
-### Semantics
-
-- `current_track_num` refers to the metadata playback order, not the `.jba` file number
-- `current_sec` maps directly to the `.jba` lookup-table second index
-- on cartridge insert, if `playback.jbs` exists and is valid, playback should start from that saved track and second
-- implementations should overwrite the whole file and close it after each update so the saved state is durable on media
-
-### `.jbs` Constraints
-
-- `version` must currently be `1`
-- `current_track_num` must be less than the number of tracks in `.jbm`
-- `current_sec` should be clamped to the available lookup-table range when used for resume
-
-### Pseudostructure
-
-```c
-typedef struct __attribute__((packed)) {
-    uint32_t version;
-    uint32_t current_track_num;
-    uint32_t current_sec;
-} jbs_status_t;
-```
-
 ## Recommended File Pairing
 
 Recommended album bundle layout:
 
 - one `.jbm` metadata file for the album
 - up to 999 `.jba` files for audio assets
-- one optional `playback.jbs` file for persisted resume state
 
 Recommended mapping:
 

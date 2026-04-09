@@ -18,6 +18,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
+#include "nvs.h"
 
 #include "decoder/esp_audio_dec.h"
 #include "decoder/impl/esp_opus_dec.h"
@@ -26,6 +27,7 @@
 #include "cartridge_service.h"
 #include "jukeboy_formats.h"
 #include "player_service.h"
+#include "power_mgmt_service.h"
 
 #include "esp_random.h"
 
@@ -45,7 +47,6 @@
 #define PLAYER_SVC_PCM_FRAME_BYTES (48000 * 2 * 20 / 1000 * (int)sizeof(int16_t))
 #define PLAYER_SVC_FAST_SEEK_SECONDS 5U
 #define PLAYER_SVC_PREVIOUS_RESTART_SECONDS 7U
-#define PLAYER_SVC_STATUS_SAVE_INTERVAL_SECONDS 10U
 #define PLAYER_SVC_VOLUME_Q8_SHIFT 8
 #define PLAYER_SVC_VOLUME_Q8_ONE (1U << PLAYER_SVC_VOLUME_Q8_SHIFT)
 #define PLAYER_SVC_CHUNK_CRC_BYTES sizeof(uint32_t)
@@ -54,6 +55,9 @@
 #define PLAYER_SVC_STOP_POLL_MS 10
 #define PLAYER_SVC_STOP_TIMEOUT_LOOPS 200
 #define PLAYER_SVC_OPUS_MAX_FRAME_LEN 1275
+#define PLAYER_SVC_NVS_NAMESPACE "player_service"
+#define PLAYER_SVC_NVS_KEY_RESUME "resume"
+#define PLAYER_SVC_RESUME_STATE_VERSION 1U
 
 #define PLAYER_SVC_VOLUME_LEVEL_COUNT 11
 #define PLAYER_SVC_DEFAULT_VOLUME_LEVEL (PLAYER_SVC_VOLUME_LEVEL_COUNT - 1)
@@ -90,6 +94,7 @@ typedef enum
     PLAYER_SVC_CMD_CARTRIDGE_REMOVED,
     PLAYER_SVC_CMD_TRACK_COMPLETE,
     PLAYER_SVC_CMD_CONTROL,
+    PLAYER_SVC_CMD_PERSIST_FOR_SHUTDOWN,
 } player_service_cmd_t;
 
 typedef struct
@@ -97,6 +102,8 @@ typedef struct
     player_service_cmd_t cmd;
     player_service_control_t control;
     uint32_t generation;
+    SemaphoreHandle_t completion_semaphore;
+    esp_err_t *result_out;
 } player_service_msg_t;
 
 typedef struct
@@ -114,6 +121,15 @@ typedef struct
     size_t data_offset;
     size_t total_file_size;
 } player_service_track_info_t;
+
+typedef struct
+{
+    uint32_t version;
+    uint32_t cartridge_checksum;
+    uint32_t track_count;
+    uint32_t current_track_num;
+    uint32_t current_sec;
+} player_service_resume_state_t;
 
 typedef enum
 {
@@ -168,8 +184,6 @@ static volatile bool s_stop_requested;
 static uint32_t s_active_generation;
 static uint32_t s_cancelled_generation;
 static uint8_t s_volume_level = PLAYER_SVC_DEFAULT_VOLUME_LEVEL;
-static size_t s_last_saved_track_index = SIZE_MAX;
-static size_t s_last_saved_sec = SIZE_MAX;
 static player_service_playback_mode_t s_playback_mode = PLAYER_SVC_MODE_SEQUENTIAL;
 static player_service_playlist_entry_t *s_playlist = NULL;
 static size_t s_playlist_capacity = 0;
@@ -378,164 +392,183 @@ static bool player_service_should_restart_current_track(void)
     return player_service_current_file_offset() > s_track_info.previous_restart_offset;
 }
 
+static esp_err_t player_service_erase_saved_playback_status_locked(nvs_handle_t handle)
+{
+    esp_err_t err = nvs_erase_key(handle, PLAYER_SVC_NVS_KEY_RESUME);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    return nvs_commit(handle);
+}
+
 static esp_err_t player_service_write_playback_status(size_t track_index, size_t current_sec)
 {
-    char full_path[PLAYER_SVC_FULL_PATH_LEN];
-    char tmp_path[PLAYER_SVC_FULL_PATH_LEN];
-    FILE *status_file;
-    jukeboy_jbs_status_t status = {
-        .version = JUKEBOY_JBS_VERSION,
+    const jukeboy_jbm_header_t *metadata = cartridge_service_get_metadata_header();
+    nvs_handle_t handle;
+    player_service_resume_state_t status = {
+        .version = PLAYER_SVC_RESUME_STATE_VERSION,
+        .cartridge_checksum = metadata ? metadata->checksum : 0,
+        .track_count = metadata ? metadata->track_count : 0,
         .current_track_num = (uint32_t)track_index,
         .current_sec = (uint32_t)current_sec,
     };
+    esp_err_t err;
 
-    if (!cartridge_service_is_mounted())
+    if (!cartridge_service_is_mounted() || !metadata)
     {
         return ESP_ERR_INVALID_STATE;
     }
 
-    snprintf(full_path, sizeof(full_path), "%s/%s", cartridge_service_get_mount_point(), JUKEBOY_JBS_FILENAME);
-    snprintf(tmp_path, sizeof(tmp_path), "%s/playback.tmp", cartridge_service_get_mount_point());
-    status_file = fopen(tmp_path, "wb");
-    if (!status_file)
+    err = nvs_open(PLAYER_SVC_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "failed to open %s for playback status write", tmp_path);
-        return ESP_FAIL;
+        ESP_LOGE(TAG, "failed to open NVS namespace %s: %s",
+                 PLAYER_SVC_NVS_NAMESPACE,
+                 esp_err_to_name(err));
+        return err;
     }
 
-    if (fwrite(&status, 1, sizeof(status), status_file) != sizeof(status))
+    err = nvs_set_blob(handle, PLAYER_SVC_NVS_KEY_RESUME, &status, sizeof(status));
+    if (err == ESP_OK)
     {
-        ESP_LOGE(TAG, "failed to write playback status to %s", tmp_path);
-        fclose(status_file);
-        remove(tmp_path);
-        return ESP_FAIL;
+        err = nvs_commit(handle);
     }
+    nvs_close(handle);
 
-    if (fclose(status_file) != 0)
+    if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "failed to close playback status file %s", tmp_path);
-        remove(tmp_path);
-        return ESP_FAIL;
+        ESP_LOGE(TAG, "failed to write playback status to NVS: %s", esp_err_to_name(err));
+        return err;
     }
-
-    /* FAT rename is not always atomic; delete the destination first so the
-     * filesystem never sees two entries with the same name. */
-    remove(full_path);
-    if (rename(tmp_path, full_path) != 0)
-    {
-        ESP_LOGE(TAG, "failed to rename %s to %s", tmp_path, full_path);
-        remove(tmp_path);
-        return ESP_FAIL;
-    }
-
-    s_last_saved_track_index = track_index;
-    s_last_saved_sec = current_sec;
     return ESP_OK;
 }
 
-static void player_service_save_current_playback_status(void)
+static esp_err_t player_service_persist_current_playback_status(void)
 {
     if (!s_playing || s_playlist_count == 0)
     {
-        return;
+        return ESP_OK;
     }
 
-    if (player_service_write_playback_status(s_playlist_index, player_service_current_second()) != ESP_OK)
-    {
-        ESP_LOGW(TAG, "failed to persist playback status");
-    }
+    return player_service_write_playback_status(s_playlist_index, player_service_current_second());
 }
 
-static void player_service_maybe_save_playback_status(void)
+static esp_err_t player_service_shutdown_callback(void *user_ctx)
 {
-    size_t current_sec;
+    (void)user_ctx;
 
-    if (!s_playing || s_paused || s_playlist_count == 0)
+    if (!s_initialised || s_service_task == NULL || s_cmd_queue == NULL)
     {
-        return;
+        return ESP_OK;
     }
 
-    current_sec = player_service_current_second();
-    if (current_sec == 0 || (current_sec % PLAYER_SVC_STATUS_SAVE_INTERVAL_SECONDS) != 0)
+    StaticSemaphore_t completion_storage;
+    SemaphoreHandle_t completion_semaphore = xSemaphoreCreateBinaryStatic(&completion_storage);
+    player_service_msg_t msg = {
+        .cmd = PLAYER_SVC_CMD_PERSIST_FOR_SHUTDOWN,
+        .completion_semaphore = completion_semaphore,
+    };
+    esp_err_t result = ESP_FAIL;
+    msg.result_out = &result;
+
+    if (completion_semaphore == NULL)
     {
-        return;
+        return ESP_ERR_NO_MEM;
     }
 
-    if (s_last_saved_track_index == s_playlist_index && s_last_saved_sec == current_sec)
+    if (xQueueSend(s_cmd_queue, &msg, pdMS_TO_TICKS(PLAYER_SVC_CMD_TIMEOUT_MS)) != pdPASS)
     {
-        return;
+        vSemaphoreDelete(completion_semaphore);
+        return ESP_ERR_TIMEOUT;
     }
 
-    if (player_service_write_playback_status(s_playlist_index, current_sec) != ESP_OK)
+    if (xSemaphoreTake(completion_semaphore, pdMS_TO_TICKS(5000)) != pdTRUE)
     {
-        ESP_LOGW(TAG, "failed to persist playback status at %u s", (unsigned)current_sec);
+        vSemaphoreDelete(completion_semaphore);
+        return ESP_ERR_TIMEOUT;
     }
+
+    vSemaphoreDelete(completion_semaphore);
+    return result;
 }
 
 static bool player_service_load_saved_playback_status(size_t *track_index, size_t *start_chunk)
 {
-    char full_path[PLAYER_SVC_FULL_PATH_LEN];
-    FILE *status_file;
-    jukeboy_jbs_status_t status;
+    const jukeboy_jbm_header_t *metadata = cartridge_service_get_metadata_header();
+    nvs_handle_t handle;
+    player_service_resume_state_t status;
+    size_t status_size = sizeof(status);
+    esp_err_t err;
 
-    if (!track_index || !start_chunk || !cartridge_service_is_mounted())
+    if (!track_index || !start_chunk || !cartridge_service_is_mounted() || !metadata)
     {
         return false;
     }
 
-    snprintf(full_path, sizeof(full_path), "%s/%s", cartridge_service_get_mount_point(), JUKEBOY_JBS_FILENAME);
-
-    /* If a .tmp file exists from a previous interrupted write, it is the
-     * most-recent data.  Promote it to the final path before reading. */
+    err = nvs_open(PLAYER_SVC_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
     {
-        char tmp_path[PLAYER_SVC_FULL_PATH_LEN];
-        struct stat tmp_st;
-        snprintf(tmp_path, sizeof(tmp_path), "%s/playback.tmp", cartridge_service_get_mount_point());
-        if (stat(tmp_path, &tmp_st) == 0)
-        {
-            ESP_LOGI(TAG, "found uncommitted write %s; promoting to %s", tmp_path, full_path);
-            remove(full_path);
-            if (rename(tmp_path, full_path) != 0)
-            {
-                ESP_LOGW(TAG, "failed to promote %s; discarding", tmp_path);
-                remove(tmp_path);
-            }
-        }
-    }
-
-    struct stat st;
-    if (stat(full_path, &st) != 0 || st.st_size != sizeof(status))
-    {
-        ESP_LOGW(TAG, "ignoring missing or malformed playback status file %s", full_path);
+        ESP_LOGW(TAG, "failed to open NVS namespace %s: %s",
+                 PLAYER_SVC_NVS_NAMESPACE,
+                 esp_err_to_name(err));
         return false;
     }
 
-    status_file = fopen(full_path, "rb");
-    if (!status_file)
+    err = nvs_get_blob(handle, PLAYER_SVC_NVS_KEY_RESUME, &status, &status_size);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
     {
+        nvs_close(handle);
         return false;
     }
 
-    if (fread(&status, 1, sizeof(status), status_file) != sizeof(status))
+    if (err != ESP_OK || status_size != sizeof(status))
     {
-        fclose(status_file);
-        ESP_LOGW(TAG, "failed to read playback status from %s", full_path);
+        ESP_LOGW(TAG, "discarding malformed resume state from NVS");
+        (void)player_service_erase_saved_playback_status_locked(handle);
+        nvs_close(handle);
         return false;
     }
 
-    fclose(status_file);
-
-    if (status.version != JUKEBOY_JBS_VERSION)
+    if (status.version != PLAYER_SVC_RESUME_STATE_VERSION)
     {
-        ESP_LOGW(TAG, "ignoring playback status with unsupported version %lu", (unsigned long)status.version);
+        ESP_LOGW(TAG, "discarding resume state with unsupported version %lu",
+                 (unsigned long)status.version);
+        (void)player_service_erase_saved_playback_status_locked(handle);
+        nvs_close(handle);
         return false;
     }
 
-    if ((size_t)status.current_track_num >= s_playlist_count)
+    if (status.cartridge_checksum != metadata->checksum)
     {
-        ESP_LOGW(TAG, "ignoring playback status with invalid track index %lu", (unsigned long)status.current_track_num);
+        ESP_LOGI(TAG,
+                 "stored resume belongs to cartridge checksum 0x%08lx, current cartridge is 0x%08lx; clearing saved state",
+                 (unsigned long)status.cartridge_checksum,
+                 (unsigned long)metadata->checksum);
+        (void)player_service_erase_saved_playback_status_locked(handle);
+        nvs_close(handle);
         return false;
     }
+
+    if (status.track_count != metadata->track_count || (size_t)status.current_track_num >= s_playlist_count)
+    {
+        ESP_LOGW(TAG,
+                 "discarding resume state with invalid track index %lu for %lu-track cartridge",
+                 (unsigned long)status.current_track_num,
+                 (unsigned long)metadata->track_count);
+        (void)player_service_erase_saved_playback_status_locked(handle);
+        nvs_close(handle);
+        return false;
+    }
+
+    nvs_close(handle);
 
     *track_index = (size_t)status.current_track_num;
     *start_chunk = (size_t)status.current_sec;
@@ -792,18 +825,35 @@ static esp_err_t player_service_ensure_track_loaded(size_t index)
     return ESP_OK;
 }
 
-static void player_service_wait_for_playback_stop(void)
+static bool player_service_wait_for_idle_bits(EventBits_t bits, const char *timeout_message)
 {
-    EventBits_t bits = xEventGroupWaitBits(s_pipeline_event_group,
-                                           PLAYER_SVC_PIPELINE_IDLE_BITS,
-                                           pdFALSE, pdTRUE,
-                                           pdMS_TO_TICKS(PLAYER_SVC_STOP_POLL_MS * PLAYER_SVC_STOP_TIMEOUT_LOOPS));
-    if ((bits & PLAYER_SVC_PIPELINE_IDLE_BITS) != PLAYER_SVC_PIPELINE_IDLE_BITS)
+    EventBits_t current_bits = xEventGroupWaitBits(s_pipeline_event_group,
+                                                   bits,
+                                                   pdFALSE, pdTRUE,
+                                                   pdMS_TO_TICKS(PLAYER_SVC_STOP_POLL_MS * PLAYER_SVC_STOP_TIMEOUT_LOOPS));
+    if ((current_bits & bits) != bits)
     {
-        ESP_LOGW(TAG, "timed out waiting for pipeline tasks to become idle");
+        ESP_LOGW(TAG, "%s", timeout_message);
+        return false;
     }
 
+    return true;
+}
+
+static void player_service_wait_for_playback_stop(void)
+{
+    player_service_wait_for_idle_bits(PLAYER_SVC_PIPELINE_IDLE_BITS,
+                                      "timed out waiting for pipeline tasks to become idle");
+
     player_service_reset_pipeline();
+}
+
+static void player_service_queue_track_complete_when_reader_idle(uint32_t generation)
+{
+    xEventGroupSetBits(s_pipeline_event_group, PLAYER_SVC_DECODER_IDLE_BIT);
+    player_service_wait_for_idle_bits(PLAYER_SVC_READER_IDLE_BIT,
+                                      "timed out waiting for reader task to become idle before track complete");
+    player_service_queue_track_complete(generation);
 }
 
 static bool player_service_pipeline_idle(void)
@@ -1216,7 +1266,7 @@ static void player_service_decoder_task(void *param)
         if (aerr != ESP_AUDIO_ERR_OK || !opus_handle)
         {
             ESP_LOGE(TAG, "failed to open opus decoder: %d", aerr);
-            player_service_queue_track_complete(generation);
+            player_service_queue_track_complete_when_reader_idle(generation);
             continue;
         }
 
@@ -1378,7 +1428,7 @@ static void player_service_decoder_task(void *param)
         }
 
         esp_opus_dec_close(opus_handle);
-        player_service_queue_track_complete(generation);
+        player_service_queue_track_complete_when_reader_idle(generation);
         ESP_LOGI(TAG, "decoder done for %s", s_current_track);
     }
 }
@@ -1489,8 +1539,6 @@ static void player_service_handle_cartridge_inserted(void)
     s_paused = false;
     s_playing = false;
     s_current_track[0] = '\0';
-    s_last_saved_track_index = SIZE_MAX;
-    s_last_saved_sec = SIZE_MAX;
 
     cartridge_status = cartridge_service_get_status();
     if (cartridge_status == CARTRIDGE_STATUS_EMPTY || cartridge_status == CARTRIDGE_STATUS_INVALID)
@@ -1680,10 +1728,6 @@ static void player_service_handle_control(player_service_control_t control)
         {
             s_playing = false;
         }
-        else
-        {
-            player_service_save_current_playback_status();
-        }
         break;
     case PLAYER_SVC_CONTROL_PREVIOUS:
         if (s_playlist_count == 0)
@@ -1703,10 +1747,6 @@ static void player_service_handle_control(player_service_control_t control)
         if (player_service_start_track(target_index, 0) != ESP_OK)
         {
             s_playing = false;
-        }
-        else
-        {
-            player_service_save_current_playback_status();
         }
         break;
     case PLAYER_SVC_CONTROL_FAST_FORWARD:
@@ -1760,7 +1800,6 @@ static void player_service_handle_control(player_service_control_t control)
             player_service_stop_playback(true);
             s_paused = true;
         }
-        player_service_save_current_playback_status();
         break;
     default:
         break;
@@ -1775,8 +1814,6 @@ static void player_service_handle_cartridge_removed(void)
     s_paused = false;
     s_playing = false;
     s_current_track[0] = '\0';
-    s_last_saved_track_index = SIZE_MAX;
-    s_last_saved_sec = SIZE_MAX;
     ESP_LOGI(TAG, "cartridge removed, playback stopped");
 }
 
@@ -1789,7 +1826,6 @@ static void player_service_task(void *param)
     {
         if (xQueueReceive(s_cmd_queue, &msg, pdMS_TO_TICKS(PLAYER_SVC_CMD_TIMEOUT_MS)) != pdPASS)
         {
-            player_service_maybe_save_playback_status();
             continue;
         }
 
@@ -1807,11 +1843,26 @@ static void player_service_task(void *param)
         case PLAYER_SVC_CMD_CONTROL:
             player_service_handle_control(msg.control);
             break;
+        case PLAYER_SVC_CMD_PERSIST_FOR_SHUTDOWN:
+        {
+            esp_err_t err = player_service_persist_current_playback_status();
+            if (err != ESP_OK)
+            {
+                ESP_LOGW(TAG, "failed to persist playback status during shutdown: %s", esp_err_to_name(err));
+            }
+            if (msg.result_out != NULL)
+            {
+                *msg.result_out = err;
+            }
+            if (msg.completion_semaphore != NULL)
+            {
+                xSemaphoreGive(msg.completion_semaphore);
+            }
+            break;
+        }
         default:
             break;
         }
-
-        player_service_maybe_save_playback_status();
     }
 }
 
@@ -1912,6 +1963,9 @@ esp_err_t player_service_init(void)
                                                NULL));
 
     s_initialised = true;
+    ESP_ERROR_CHECK(power_mgmt_service_register_shutdown_callback(player_service_shutdown_callback,
+                                                                  NULL,
+                                                                  POWER_MGMT_SERVICE_SHUTDOWN_PRIORITY_PLAYER));
     player_service_post_event(PLAYER_SVC_EVENT_STARTED, NULL, 0);
     if (cartridge_service_is_inserted())
     {

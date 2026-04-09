@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 
+#include "power_mgmt_service.h"
 #include "wifi_service.h"
 
 /* ── Constants ──────────────────────────────────────────────────────── */
@@ -73,6 +74,9 @@ typedef struct
 
 static QueueHandle_t s_cmd_queue;
 static SemaphoreHandle_t s_scan_mutex;
+static TaskHandle_t s_task_handle;
+static esp_event_handler_instance_t s_wifi_event_handler_instance;
+static esp_event_handler_instance_t s_ip_event_handler_instance;
 EXT_RAM_BSS_ATTR static wifi_svc_scan_result_t s_scan_results;
 static esp_netif_t *s_sta_netif;
 static TimerHandle_t s_reconnect_timer;
@@ -81,6 +85,7 @@ static volatile bool s_autoreconnect = true;
 static bool s_sntp_initialised = false;
 static esp_netif_ip_info_t s_ip_info;
 static bool s_have_ip_info = false;
+static bool s_initialised;
 
 /* Keep the WiFi service stack internal: this task calls NVS/flash-backed APIs. */
 static StaticTask_t s_task_tcb;
@@ -134,6 +139,7 @@ static esp_err_t wifi_service_connect_saved_credentials(void)
     char ssid[33] = {0};
     char password[65] = {0};
     wifi_config_t cfg = {0};
+    cfg.sta.listen_interval = 3;
     esp_err_t err = nvs_load_creds(ssid, sizeof(ssid), password, sizeof(password));
 
     if (err != ESP_OK)
@@ -262,6 +268,12 @@ static void reconnect_timer_cb(TimerHandle_t timer)
     xQueueSend(s_cmd_queue, &msg, 0);
 }
 
+static esp_err_t wifi_service_shutdown_callback(void *user_ctx)
+{
+    (void)user_ctx;
+    return wifi_service_shutdown();
+}
+
 /* ── Service task ───────────────────────────────────────────────────── */
 
 static void wifi_service_task(void *arg)
@@ -282,6 +294,8 @@ static void wifi_service_task(void *arg)
                                msg.payload.connect.password);
 
                 wifi_config_t cfg = {0};
+                cfg.sta.listen_interval = 3;
+
                 strncpy((char *)cfg.sta.ssid,
                         msg.payload.connect.ssid,
                         sizeof(cfg.sta.ssid) - 1);
@@ -407,6 +421,9 @@ static void wifi_service_task(void *arg)
 
 esp_err_t wifi_service_init(void)
 {
+    if (s_initialised)
+        return ESP_OK;
+
     /* Network interface */
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
@@ -426,12 +443,14 @@ esp_err_t wifi_service_init(void)
 
     /* Register internal handlers */
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
+        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &s_wifi_event_handler_instance));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, ip_event_handler, NULL, NULL));
+        IP_EVENT, IP_EVENT_STA_GOT_IP, ip_event_handler, NULL, &s_ip_event_handler_instance));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));
 
     /* IPC primitives */
     s_cmd_queue = xQueueCreate(CMD_QUEUE_DEPTH, sizeof(wifi_svc_msg_t));
@@ -449,12 +468,17 @@ esp_err_t wifi_service_init(void)
         return ESP_ERR_NO_MEM;
 
     /* Service task — static allocation in PSRAM */
-    TaskHandle_t h = xTaskCreateStaticPinnedToCore(
+    s_task_handle = xTaskCreateStaticPinnedToCore(
         wifi_service_task, "wifi_svc",
         SVC_TASK_STACK_SIZE, NULL, SVC_TASK_PRIORITY,
         s_task_stack, &s_task_tcb, SVC_TASK_CORE);
-    if (!h)
+    if (!s_task_handle)
         return ESP_ERR_NO_MEM;
+
+    s_initialised = true;
+    ESP_ERROR_CHECK(power_mgmt_service_register_shutdown_callback(wifi_service_shutdown_callback,
+                                                                  NULL,
+                                                                  POWER_MGMT_SERVICE_SHUTDOWN_PRIORITY_WIFI));
 
     post_event(WIFI_SVC_EVENT_STARTED, NULL, 0);
     ESP_LOGI(TAG, "WiFi service started");
@@ -545,5 +569,91 @@ esp_err_t wifi_service_get_ip_info(esp_netif_ip_info_t *out)
     if (!s_have_ip_info)
         return ESP_ERR_INVALID_STATE;
     *out = s_ip_info;
+    return ESP_OK;
+}
+
+esp_err_t wifi_service_shutdown(void)
+{
+    if (!s_initialised)
+    {
+        return ESP_OK;
+    }
+
+    if (s_reconnect_timer)
+    {
+        xTimerStop(s_reconnect_timer, portMAX_DELAY);
+    }
+
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT && err != ESP_ERR_WIFI_NOT_STARTED)
+    {
+        return err;
+    }
+
+    err = esp_wifi_stop();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT && err != ESP_ERR_WIFI_NOT_STARTED)
+    {
+        return err;
+    }
+
+    err = esp_wifi_deinit();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT)
+    {
+        return err;
+    }
+
+    if (s_ip_event_handler_instance != NULL)
+    {
+        ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT,
+                                                              IP_EVENT_STA_GOT_IP,
+                                                              s_ip_event_handler_instance));
+        s_ip_event_handler_instance = NULL;
+    }
+
+    if (s_wifi_event_handler_instance != NULL)
+    {
+        ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT,
+                                                              ESP_EVENT_ANY_ID,
+                                                              s_wifi_event_handler_instance));
+        s_wifi_event_handler_instance = NULL;
+    }
+
+    if (s_sta_netif != NULL)
+    {
+        esp_netif_destroy_default_wifi(s_sta_netif);
+        s_sta_netif = NULL;
+    }
+
+    if (s_task_handle != NULL)
+    {
+        vTaskDelete(s_task_handle);
+        s_task_handle = NULL;
+    }
+
+    if (s_reconnect_timer != NULL)
+    {
+        xTimerDelete(s_reconnect_timer, portMAX_DELAY);
+        s_reconnect_timer = NULL;
+    }
+
+    if (s_scan_mutex != NULL)
+    {
+        vSemaphoreDelete(s_scan_mutex);
+        s_scan_mutex = NULL;
+    }
+
+    if (s_cmd_queue != NULL)
+    {
+        vQueueDelete(s_cmd_queue);
+        s_cmd_queue = NULL;
+    }
+
+    memset(&s_scan_results, 0, sizeof(s_scan_results));
+    memset(&s_ip_info, 0, sizeof(s_ip_info));
+    s_have_ip_info = false;
+    s_sntp_initialised = false;
+    s_state = WIFI_SVC_STATE_IDLE;
+    s_initialised = false;
+
     return ESP_OK;
 }

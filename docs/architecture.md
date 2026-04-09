@@ -12,7 +12,7 @@ communicating via queues and events.
 
 ## Directory Layout
 
-```
+```text
 bttest/
 ├── CMakeLists.txt              Root build file (ESP-IDF project)
 ├── partitions.csv              Flash partition table (dual-OTA + NVS + littlefs)
@@ -27,7 +27,7 @@ bttest/
 │   ├── i2s_service.c/.h        I2S output (currently a no-op stub)
 │   ├── audio_output_switch.c/.h PCM routing between BT and I2S outputs
 │   ├── console_service.c/.h    UART console: commands + telemetry task
-│   └── jukeboy_formats.h       On-disk format structs (.jba, .jbm, .jbs)
+│   └── jukeboy_formats.h       On-disk format structs (.jba, .jbm)
 ├── components/
 │   ├── bt/                     Bluetooth stack component overrides
 │   ├── esp_audio_codec/        Opus decoder component
@@ -50,7 +50,7 @@ All services follow the same pattern:
 3. **Public API** — thin wrappers that enqueue commands and return immediately.
 4. **Events** — services post `esp_event` notifications for inter-service signalling.
 
-```
+```text
 ┌─────────────┐  esp_event   ┌──────────────┐
 │  cartridge  │─────────────▶│   player     │
 │  service    │  INSERTED /  │   service    │
@@ -97,7 +97,7 @@ All services follow the same pattern:
 
 ### Pipeline
 
-```
+```text
  SD card
    │
    ├── [cart_reader task]  ───▶  128 KB PSRAM double-buffer
@@ -129,10 +129,12 @@ a previous track leaking into a new playback session.
 
 ### Playback Status Persistence
 
-The player writes a `playback.jbs` file to the cartridge every
+The player writes a resume blob to NVS every
 `PLAYER_SVC_STATUS_SAVE_INTERVAL_SECONDS` (10 s), recording the current track
-index and second. Writes are crash-safe: data is written to a `playback.tmp` file first,
-then atomically renamed to the final path.
+index and second under the `player_service` namespace. The saved state also
+includes the current cartridge metadata checksum; on cartridge insert, any
+resume state from a different cartridge is erased and playback starts from
+track 0, second 0.
 
 ### Playback Modes
 
@@ -276,11 +278,14 @@ See [jukeboy_formats.md](jukeboy_formats.md) for full specification.
 |---------------|---------|---------------------------------------------|
 | `album.jbm`  | JBM v1  | Album metadata: name, artist, track list    |
 | `NNN.jba`     | JBA v1  | Audio file: header + lookup table + Opus chunks |
-| `playback.jbs`| JBS v1  | Playback resume state (track + second)      |
+
+Playback resume state is not stored on the cartridge. It lives in NVS under
+the `player_service` namespace and is keyed to the current cartridge metadata
+checksum.
 
 ### JBA File Structure
 
-```
+```text
 ┌─────────────────────────┐
 │  jukeboy_jba_header_t   │  version, header_len_in_blocks, lookup_table_len
 ├─────────────────────────┤

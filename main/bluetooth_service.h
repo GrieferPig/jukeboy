@@ -67,6 +67,9 @@ extern "C"
      */
     esp_err_t bluetooth_service_register_48k_sbc_endpoint(void);
 
+    /** Disconnect and deinitialize the Classic Bluetooth host/controller stack owned by this app. */
+    esp_err_t bluetooth_service_shutdown(void);
+
 #ifdef __cplusplus
 }
 #endif

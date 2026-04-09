@@ -88,6 +88,9 @@ extern "C"
     /** Copy current IP info (only valid when state == CONNECTED). */
     esp_err_t wifi_service_get_ip_info(esp_netif_ip_info_t *out);
 
+    /** Stop Wi-Fi, tear down its task/timer/netif state, and deinitialize the network driver stack. */
+    esp_err_t wifi_service_shutdown(void);
+
 #ifdef __cplusplus
 }
 #endif

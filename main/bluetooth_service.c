@@ -11,6 +11,8 @@
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
 #include "esp_attr.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
 #include "esp_bt_defs.h"
 #include "esp_event.h"
 #include "esp_gap_bt_api.h"
@@ -19,6 +21,7 @@
 
 #include "bluetooth_service.h"
 #include "player_service.h"
+#include "power_mgmt_service.h"
 
 #define BT_SVC_TASK_STACK_SIZE 2048
 #define BT_SVC_TASK_PRIORITY 5
@@ -152,6 +155,30 @@ static void bt_svc_post_event(bluetooth_service_event_id_t event_id, const void 
 static bool bt_svc_queue_send(const bluetooth_service_msg_t *msg)
 {
     return s_cmd_queue && xQueueSend(s_cmd_queue, msg, 0) == pdPASS;
+}
+
+static esp_err_t bt_svc_validate_a2dp_state(bool require_connected, const char *action)
+{
+    if (!s_cmd_queue)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (require_connected)
+    {
+        if (!s_a2dp_connected)
+        {
+            ESP_LOGW(TAG, "%s rejected: no A2DP device connected", action);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    else if (s_a2dp_connected)
+    {
+        ESP_LOGW(TAG, "%s rejected: A2DP device already connected", action);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
 }
 
 static void bt_svc_invoke_connection_callback(bluetooth_service_connection_event_t event,
@@ -595,6 +622,49 @@ static void bt_svc_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
     }
 }
 
+static esp_err_t bt_svc_ignore_invalid_state(esp_err_t err)
+{
+    return (err == ESP_ERR_INVALID_STATE) ? ESP_OK : err;
+}
+
+static esp_err_t bt_svc_wait_for_disconnect_state(bool *flag, bool target_value, TickType_t timeout_ticks)
+{
+    TickType_t start_ticks = xTaskGetTickCount();
+
+    while (*flag != target_value)
+    {
+        if ((xTaskGetTickCount() - start_ticks) >= timeout_ticks)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t bt_svc_wait_for_spp_close(TickType_t timeout_ticks)
+{
+    TickType_t start_ticks = xTaskGetTickCount();
+
+    while (s_spp_handle != 0)
+    {
+        if ((xTaskGetTickCount() - start_ticks) >= timeout_ticks)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t bluetooth_service_shutdown_callback(void *user_ctx)
+{
+    (void)user_ctx;
+    return bluetooth_service_shutdown();
+}
+
 static void bt_svc_task(void *arg)
 {
     bluetooth_service_msg_t msg;
@@ -609,6 +679,11 @@ static void bt_svc_task(void *arg)
         switch (msg.cmd)
         {
         case BT_SVC_CMD_PAIR_BEST:
+            if (s_a2dp_connected)
+            {
+                ESP_LOGW(TAG, "ignoring pair request: A2DP device already connected");
+                break;
+            }
             bt_svc_reset_discovery_results();
             s_pair_request_pending = true;
             if (s_discovery_running)
@@ -622,6 +697,11 @@ static void bt_svc_task(void *arg)
             break;
         case BT_SVC_CMD_CONNECT_LAST_BONDED:
         {
+            if (s_a2dp_connected)
+            {
+                ESP_LOGW(TAG, "ignoring connect request: A2DP device already connected");
+                break;
+            }
             esp_err_t err = bt_svc_connect_last_bonded_device();
             if (err != ESP_OK)
             {
@@ -630,10 +710,12 @@ static void bt_svc_task(void *arg)
             break;
         }
         case BT_SVC_CMD_DISCONNECT_A2DP:
-            if (s_a2dp_connected)
+            if (!s_a2dp_connected)
             {
-                esp_a2d_source_disconnect(s_connected_bda);
+                ESP_LOGW(TAG, "ignoring disconnect request: no A2DP device connected");
+                break;
             }
+            esp_a2d_source_disconnect(s_connected_bda);
             break;
         case BT_SVC_CMD_START_AUDIO:
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
@@ -880,6 +962,9 @@ esp_err_t bluetooth_service_init(void)
     ESP_ERROR_CHECK(esp_spp_enhanced_init(&spp_cfg));
 
     s_initialised = true;
+    ESP_ERROR_CHECK(power_mgmt_service_register_shutdown_callback(bluetooth_service_shutdown_callback,
+                                                                  NULL,
+                                                                  POWER_MGMT_SERVICE_SHUTDOWN_PRIORITY_BLUETOOTH));
     bt_svc_post_event(BLUETOOTH_SVC_EVENT_STARTED, NULL, 0);
     ESP_LOGI(TAG, "Bluetooth service started");
 
@@ -895,9 +980,10 @@ esp_err_t bluetooth_service_init(void)
 esp_err_t bluetooth_service_pair_best_a2dp_sink(void)
 {
     bluetooth_service_msg_t msg = {.cmd = BT_SVC_CMD_PAIR_BEST};
-    if (!s_cmd_queue)
+    esp_err_t err = bt_svc_validate_a2dp_state(false, "pair request");
+    if (err != ESP_OK)
     {
-        return ESP_ERR_INVALID_STATE;
+        return err;
     }
     return xQueueSend(s_cmd_queue, &msg, pdMS_TO_TICKS(1000)) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
 }
@@ -905,9 +991,10 @@ esp_err_t bluetooth_service_pair_best_a2dp_sink(void)
 esp_err_t bluetooth_service_connect_last_bonded_a2dp_device(void)
 {
     bluetooth_service_msg_t msg = {.cmd = BT_SVC_CMD_CONNECT_LAST_BONDED};
-    if (!s_cmd_queue)
+    esp_err_t err = bt_svc_validate_a2dp_state(false, "connect request");
+    if (err != ESP_OK)
     {
-        return ESP_ERR_INVALID_STATE;
+        return err;
     }
     return xQueueSend(s_cmd_queue, &msg, pdMS_TO_TICKS(1000)) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
 }
@@ -915,9 +1002,10 @@ esp_err_t bluetooth_service_connect_last_bonded_a2dp_device(void)
 esp_err_t bluetooth_service_disconnect_a2dp(void)
 {
     bluetooth_service_msg_t msg = {.cmd = BT_SVC_CMD_DISCONNECT_A2DP};
-    if (!s_cmd_queue)
+    esp_err_t err = bt_svc_validate_a2dp_state(true, "disconnect request");
+    if (err != ESP_OK)
     {
-        return ESP_ERR_INVALID_STATE;
+        return err;
     }
     return xQueueSend(s_cmd_queue, &msg, pdMS_TO_TICKS(1000)) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
 }
@@ -1008,6 +1096,154 @@ esp_err_t bluetooth_service_get_bonded_devices(size_t *count, esp_bd_addr_t *dev
     esp_err_t err = esp_bt_gap_get_bond_device_list(&device_count, devices);
     *count = device_count > 0 ? (size_t)device_count : 0;
     return err;
+}
+
+esp_err_t bluetooth_service_shutdown(void)
+{
+    if (!s_initialised)
+    {
+        return ESP_OK;
+    }
+
+    if (s_discovery_running)
+    {
+        esp_err_t err = bt_svc_ignore_invalid_state(esp_bt_gap_cancel_discovery());
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    if (s_a2dp_connected)
+    {
+        esp_err_t err = bt_svc_ignore_invalid_state(esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND));
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        err = bt_svc_ignore_invalid_state(esp_a2d_source_disconnect(s_connected_bda));
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        err = bt_svc_wait_for_disconnect_state(&s_a2dp_connected, false, pdMS_TO_TICKS(2000));
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    if (s_spp_handle != 0)
+    {
+        esp_err_t err = bt_svc_ignore_invalid_state(esp_spp_disconnect(s_spp_handle));
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        err = bt_svc_wait_for_spp_close(pdMS_TO_TICKS(2000));
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    esp_err_t err = bt_svc_ignore_invalid_state(esp_spp_stop_srv());
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    err = bt_svc_ignore_invalid_state(esp_spp_deinit());
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = bt_svc_ignore_invalid_state(esp_avrc_ct_deinit());
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = bt_svc_ignore_invalid_state(esp_avrc_tg_deinit());
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = bt_svc_ignore_invalid_state(esp_a2d_source_deinit());
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED)
+    {
+        err = esp_bluedroid_disable();
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_UNINITIALIZED)
+    {
+        err = esp_bluedroid_deinit();
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED)
+    {
+        err = esp_bt_controller_disable();
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED)
+    {
+        err = esp_bt_controller_deinit();
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    if (s_task_handle != NULL)
+    {
+        vTaskDelete(s_task_handle);
+        s_task_handle = NULL;
+    }
+
+    if (s_cmd_queue != NULL)
+    {
+        vQueueDelete(s_cmd_queue);
+        s_cmd_queue = NULL;
+    }
+
+    s_initialised = false;
+    s_pair_request_pending = false;
+    s_discovery_running = false;
+    s_a2dp_connected = false;
+    memset(s_connected_bda, 0, sizeof(s_connected_bda));
+    s_avrc_tl = 0;
+    s_avrc_rn_vol_registered = false;
+    s_avrc_ct_vol_registered = false;
+    s_spp_handle = 0;
+    memset(s_spp_remote_bda, 0, sizeof(s_spp_remote_bda));
+    memset(s_discovered, 0, sizeof(s_discovered));
+    s_discovered_count = 0;
+
+    return ESP_OK;
 }
 
 esp_err_t bluetooth_service_register_48k_sbc_endpoint(void)

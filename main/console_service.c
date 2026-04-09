@@ -13,12 +13,14 @@
 #include "esp_wifi.h"
 #include "argtable3/argtable3.h"
 
+#include "esp_flash_dispatcher.h"
 #include "bluetooth_service.h"
 #include "wifi_service.h"
 #include "console_service.h"
 #include "cartridge_service.h"
 #include "audio_output_switch.h"
 #include "player_service.h"
+#include "power_mgmt_service.h"
 
 static const char *TAG = "console_svc";
 
@@ -33,7 +35,7 @@ typedef struct
     char name[configMAX_TASK_NAME_LEN];
 } telemetry_task_snapshot_t;
 
-static volatile bool s_memory_telemetry_enabled = true;
+static volatile bool s_memory_telemetry_enabled = false;
 static UBaseType_t s_prev_snapshot_count;
 static configRUN_TIME_COUNTER_TYPE s_prev_total_runtime;
 static uint8_t s_snapshot_idx;
@@ -910,12 +912,21 @@ static int cmd_wifi(int argc, char **argv)
 
 static int cmd_reboot(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
+
     // Unmount SD card if mounted to ensure clean shutdown
     cartridge_service_unmount();
     printf("Rebooting...\n");
-    vTaskDelay(pdMS_TO_TICKS(100)); /* let UART flush */
-    esp_restart();
-    return 0; /* unreachable */
+
+    esp_err_t err = power_mgmt_service_reboot();
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    return 0;
 }
 
 static void register_reboot(void)
@@ -1019,6 +1030,94 @@ static void register_telemetry(void)
         .argtable = &s_telemetry_args,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
+/* ── flash ──────────────────────────────────────────────────────────── */
+
+static void print_u64_decimal(uint64_t value)
+{
+    char buffer[32];
+    size_t index = sizeof(buffer) - 1;
+
+    buffer[index] = '\0';
+    do
+    {
+        buffer[--index] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while (value > 0U);
+
+    printf("%s", &buffer[index]);
+}
+
+static int flash_status_handler(int argc, char **argv)
+{
+    esp_flash_dispatcher_status_t status;
+    esp_err_t err = esp_flash_dispatcher_get_status(&status);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Pending writes: %u\n", (unsigned)status.pending_write_count);
+    printf("Pending bytes:  %u\n", (unsigned)status.pending_write_bytes);
+    printf("Arena free:     %u\n", (unsigned)status.arena_free_bytes);
+    printf("Last flush:     ");
+    print_u64_decimal(status.last_flush_time_us);
+    printf(" us\n");
+    return 0;
+}
+
+static int flash_flush_handler(int argc, char **argv)
+{
+    uint64_t write_time_us = 0;
+    esp_err_t err = esp_flash_dispatcher_flush_writes(&write_time_us);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    esp_flash_dispatcher_status_t status;
+    err = esp_flash_dispatcher_get_status(&status);
+    if (err != ESP_OK)
+    {
+        printf("Flushed queued writes in ");
+        print_u64_decimal(write_time_us);
+        printf(" us\n");
+        return 0;
+    }
+
+    printf("Flushed queued writes in ");
+    print_u64_decimal(write_time_us);
+    printf(" us\n");
+    printf("Remaining queued writes: %u (%u bytes)\n",
+           (unsigned)status.pending_write_count,
+           (unsigned)status.pending_write_bytes);
+    return 0;
+}
+
+static int cmd_flash(int argc, char **argv)
+{
+    static const char *usage =
+        "Usage: flash <subcommand>\n"
+        "  status    Show queued write count, bytes, arena free space, and last flush time\n"
+        "  flush     Write all queued writes to flash and print elapsed time\n";
+
+    if (argc < 2)
+    {
+        printf("%s", usage);
+        return 1;
+    }
+
+    const char *sub = argv[1];
+    if (strcmp(sub, "status") == 0)
+        return flash_status_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "flush") == 0)
+        return flash_flush_handler(argc - 1, argv + 1);
+
+    printf("Unknown subcommand '%s'.\n%s", sub, usage);
+    return 1;
 }
 
 /* ════════════════════════════════════════════════════════════════════ *
@@ -1388,6 +1487,14 @@ esp_err_t console_service_init(void)
         .argtable = &s_media_args,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&media_cmd));
+
+    const esp_console_cmd_t flash_cmd = {
+        .command = "flash",
+        .help = "Flash dispatcher: flash <status|flush>",
+        .hint = NULL,
+        .func = cmd_flash,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&flash_cmd));
 
     /* System commands */
     register_reboot();

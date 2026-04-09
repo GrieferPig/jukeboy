@@ -10,10 +10,8 @@ extern "C"
 #define JUKEBOY_JBA_VERSION 0x1U
 #define JUKEBOY_JBA_HEADER_BLOCK_SIZE 512U
 #define JUKEBOY_JBM_VERSION 1U
-#define JUKEBOY_JBS_VERSION 1U
 #define JUKEBOY_MAX_TRACK_FILES 999U
 #define JUKEBOY_JBM_FILENAME "album.jbm"
-#define JUKEBOY_JBS_FILENAME "playback.jbs"
 
 #define JUKEBOY_JBM_ALBUM_NAME_BYTES 128U
 #define JUKEBOY_JBM_ALBUM_DESCRIPTION_BYTES 1024U
@@ -53,17 +51,9 @@ extern "C"
         uint32_t file_num;
     } jukeboy_jbm_track_t;
 
-    typedef struct __attribute__((packed))
-    {
-        uint32_t version;
-        uint32_t current_track_num;
-        uint32_t current_sec;
-    } jukeboy_jbs_status_t;
-
     _Static_assert(sizeof(jukeboy_jba_header_t) == 9, "Unexpected .jba header size");
     _Static_assert(sizeof(jukeboy_jbm_header_t) == 1652, "Unexpected .jbm header size");
     _Static_assert(sizeof(jukeboy_jbm_track_t) == 392, "Unexpected .jbm track size");
-    _Static_assert(sizeof(jukeboy_jbs_status_t) == 12, "Unexpected .jbs status size");
 
 #ifdef __cplusplus
 }

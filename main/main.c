@@ -7,6 +7,7 @@
 #include "nvs_flash.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
+#include "esp_flash_dispatcher.h"
 #include "esp_gap_bt_api.h"
 
 #include "audio_output_switch.h"
@@ -15,10 +16,15 @@
 #include "console_service.h"
 #include "i2s_service.h"
 #include "player_service.h"
+#include "power_mgmt_service.h"
 #include "wifi_service.h"
 
 void app_main(void)
 {
+    const esp_flash_dispatcher_config_t flash_dispatcher_cfg = ESP_FLASH_DISPATCHER_DEFAULT_CONFIG;
+
+    ESP_ERROR_CHECK(power_mgmt_service_init());
+    ESP_ERROR_CHECK(esp_flash_dispatcher_init(&flash_dispatcher_cfg));
     ESP_ERROR_CHECK(nvs_flash_init());
 
     cartridge_service_config_t cart_cfg = CARTRIDGE_SERVICE_CONFIG_DEFAULT();
