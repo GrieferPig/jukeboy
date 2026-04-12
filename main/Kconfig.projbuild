@@ -1,0 +1,11 @@
+menu "FTP Service"
+
+config FTP_SVC_USER
+    string "FTP server username"
+    default "root"
+
+config FTP_SVC_PASSWORD
+    string "FTP server password"
+    default "root"
+
+endmenu

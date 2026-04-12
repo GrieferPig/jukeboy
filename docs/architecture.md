@@ -30,8 +30,7 @@ bttest/
 │   └── jukeboy_formats.h       On-disk format structs (.jba, .jbm)
 ├── components/
 │   ├── bt/                     Bluetooth stack component overrides
-│   ├── esp_audio_codec/        Opus decoder component
-│   └── mpy/                    MicroPython component (unused at runtime)
+│   └── esp_audio_codec/        Opus decoder component
 ├── docs/
 │   ├── architecture.md         This file
 │   └── jukeboy_formats.md      Detailed file-format specification

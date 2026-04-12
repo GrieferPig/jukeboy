@@ -1,0 +1,49 @@
+menu "WASM Extended Native"
+    config WASMACHINE_WASM_EXT_NATIVE
+        bool "Enable Export WASM Extended Native"
+        default y
+    
+    config WASMACHINE_WASM_EXT_NATIVE_LIBC
+        bool "Export WASM extended libc native APIs"
+        default y
+        depends on WASMACHINE_WASM_EXT_NATIVE
+    
+    config WASMACHINE_WASM_EXT_NATIVE_LIBMATH
+        bool "Export WASM extended libm native APIs"
+        default y
+        depends on WASMACHINE_WASM_EXT_NATIVE
+
+    config WASMACHINE_WASM_EXT_NATIVE_HTTP_CLIENT
+        bool "Export WASM extended HTTP client native APIs"
+        default n
+        depends on WASMACHINE_WASM_EXT_NATIVE
+
+    config WASMACHINE_WASM_EXT_NATIVE_LVGL
+        bool "Export WASM extended LVGL native APIs"
+        default n
+        depends on WASMACHINE_WASM_EXT_NATIVE
+
+    config WASMACHINE_WASM_EXT_NATIVE_LVGL_USE_WASM_HEAP
+        bool "Enable to allocate LVGL memory from WASM APP heap"
+        default n
+        depends on WASMACHINE_WASM_EXT_NATIVE && WASMACHINE_WASM_EXT_NATIVE_LVGL
+        help
+            When enabled, LVGL memory allocations are redirected to the WASM APP's heap
+            instead of the system heap. This ensures memory isolation between different
+            WASM applications and allows proper cleanup when an app is unloaded.
+
+            Requires configNUM_THREAD_LOCAL_STORAGE_POINTERS >= 3 in FreeRTOS config.
+
+    config WASMACHINE_WASM_EXT_NATIVE_MQTT
+        bool "Export WASM extended MQTT native APIs"
+        default n
+        depends on WASMACHINE_WASM_EXT_NATIVE && WASMACHINE_APP_MGR
+
+    config WASMACHINE_WASM_EXT_NATIVE_WIFI_PROVISIONING
+        bool "Export WASM extended WiFi provisioning native APIs"
+        default n
+        depends on WASMACHINE_WASM_EXT_NATIVE
+
+    orsource "../wasmachine_ext_wasm_native_rainmaker/Kconfig.wasmachine"
+    orsource "../espressif__wasmachine_ext_wasm_native_rainmaker/Kconfig.wasmachine"
+endmenu

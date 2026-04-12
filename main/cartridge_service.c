@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 
 #include "cartridge_service.h"
+#include "runtime_env.h"
 
 static const char *TAG = "cartridge_svc";
 
@@ -360,10 +361,15 @@ esp_err_t cartridge_service_mount(void)
     }
 
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
-        .format_if_mount_failed = false,
+        .format_if_mount_failed = app_is_running_in_qemu(),
         .max_files = 5,
         .allocation_unit_size = 16 * 1024,
     };
+
+    if (mount_cfg.format_if_mount_failed)
+    {
+        ESP_LOGW(TAG, "QEMU runtime detected: formatting SD card if FAT mount fails");
+    }
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags = SDMMC_HOST_FLAG_1BIT;

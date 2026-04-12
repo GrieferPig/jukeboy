@@ -1,6 +1,9 @@
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,12 +18,14 @@
 
 #include "esp_flash_dispatcher.h"
 #include "bluetooth_service.h"
+#include "ftp_service.h"
 #include "wifi_service.h"
 #include "console_service.h"
 #include "cartridge_service.h"
 #include "audio_output_switch.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
+#include "script_service.h"
 
 static const char *TAG = "console_svc";
 
@@ -1121,6 +1126,112 @@ static int cmd_flash(int argc, char **argv)
 }
 
 /* ════════════════════════════════════════════════════════════════════ *
+ *  FTP server commands                                               *
+ * ════════════════════════════════════════════════════════════════════ */
+
+static int ftp_enable_handler(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (ftp_service_is_enabled())
+    {
+        printf("FTP server is already enabled.\n");
+        return 0;
+    }
+
+    esp_err_t err = ftp_service_enable();
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    esp_netif_ip_info_t ip;
+    if (wifi_service_get_ip_info(&ip) == ESP_OK)
+    {
+        printf("FTP server enabled at ftp://" IPSTR ":%u/\n", IP2STR(&ip.ip), FTP_SERVICE_COMMAND_PORT);
+    }
+    else
+    {
+        printf("FTP server enabled.\n");
+    }
+
+    return 0;
+}
+
+static int ftp_disable_handler(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (!ftp_service_is_enabled())
+    {
+        printf("FTP server is already disabled.\n");
+        return 0;
+    }
+
+    esp_err_t err = ftp_service_disable();
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("FTP server disabled.\n");
+    return 0;
+}
+
+static int ftp_status_handler(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    const bool enabled = ftp_service_is_enabled();
+    const int state = ftp_service_get_state();
+    esp_netif_ip_info_t ip;
+    const esp_err_t ip_err = wifi_service_get_ip_info(&ip);
+
+    printf("Enabled:      %s\n", enabled ? "yes" : "no");
+    printf("State:        %s\n", ftp_service_state_name(state));
+    printf("Root:         %s\n", FTP_SERVICE_ROOT_PATH);
+    printf("Command port: %u\n", FTP_SERVICE_COMMAND_PORT);
+    printf("Passive port: %u\n", FTP_SERVICE_PASSIVE_PORT);
+    printf("WiFi:         %s\n", ip_err == ESP_OK ? "connected" : "not connected");
+    if (ip_err == ESP_OK)
+    {
+        printf("Address:      " IPSTR "\n", IP2STR(&ip.ip));
+    }
+
+    return 0;
+}
+
+static int cmd_ftp(int argc, char **argv)
+{
+    static const char *usage =
+        "Usage: ftp <subcommand>\n"
+        "  enable    Start the FTP server on the current WiFi connection\n"
+        "  disable   Stop the FTP server\n"
+        "  status    Show FTP server status, root path, and network address\n";
+
+    if (argc < 2)
+    {
+        return ftp_status_handler(argc, argv);
+    }
+
+    const char *sub = argv[1];
+    if (strcmp(sub, "enable") == 0)
+        return ftp_enable_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "disable") == 0)
+        return ftp_disable_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "status") == 0)
+        return ftp_status_handler(argc - 1, argv + 1);
+
+    printf("Unknown subcommand '%s'.\n%s", sub, usage);
+    return 1;
+}
+
+/* ════════════════════════════════════════════════════════════════════ *
  *  SD card commands                                                   *
  * ════════════════════════════════════════════════════════════════════ */
 
@@ -1358,6 +1469,207 @@ static int cmd_sd(int argc, char **argv)
 }
 
 /* ════════════════════════════════════════════════════════════════════ *
+ *  Script commands                                                    *
+ * ════════════════════════════════════════════════════════════════════ */
+
+static const char *script_lookup_root_path(const char *label)
+{
+    size_t root_count = script_service_get_root_count();
+
+    for (size_t index = 0; index < root_count; index++)
+    {
+        const char *root_label = script_service_get_root_label(index);
+        if (root_label && strcmp(label, root_label) == 0)
+        {
+            return script_service_get_root_path(index);
+        }
+    }
+
+    return NULL;
+}
+
+static void script_print_roots(void)
+{
+    size_t root_count = script_service_get_root_count();
+
+    for (size_t index = 0; index < root_count; index++)
+    {
+        printf("%s -> %s\n",
+               script_service_get_root_label(index),
+               script_service_get_root_path(index));
+    }
+}
+
+static int script_list_directory(const char *path)
+{
+    DIR *dir = opendir(path);
+    struct dirent *entry;
+
+    if (!dir)
+    {
+        printf("Cannot open %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+
+    printf("%s\n", path);
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+        {
+            continue;
+        }
+
+        char entry_path[SCRIPT_SERVICE_MAX_PATH_LEN];
+        struct stat entry_stat = {0};
+        int printed = snprintf(entry_path, sizeof(entry_path), "%s/%s", path, entry->d_name);
+
+        if (printed < 0 || (size_t)printed >= sizeof(entry_path) || stat(entry_path, &entry_stat) != 0)
+        {
+            printf("  %s\n", entry->d_name);
+            continue;
+        }
+
+        if (S_ISDIR(entry_stat.st_mode))
+        {
+            printf("  [dir]  %s/\n", entry->d_name);
+        }
+        else
+        {
+            printf("  [file] %s\n", entry->d_name);
+        }
+    }
+
+    closedir(dir);
+    return 0;
+}
+
+static void script_print_status(void)
+{
+    printf("Script service: %s\n", script_service_status_name(script_service_get_status()));
+    printf("Host module:    %s\n", SCRIPT_SERVICE_HOST_MODULE_NAME);
+    printf("Search roots:\n");
+    script_print_roots();
+}
+
+static int cmd_script(int argc, char **argv)
+{
+    static const char *usage =
+        "Usage: script <subcommand> [args]\n"
+        "  status                 Show runtime status and search roots\n"
+        "  roots                  Print script search roots\n"
+        "  ls [root|path]         List a script root or explicit directory\n"
+        "  resolve <path>         Show how a script path resolves\n"
+        "  run <path> [args...]   Execute a .wasm script\n";
+
+    if (argc < 2 || strcmp(argv[1], "status") == 0)
+    {
+        script_print_status();
+        return 0;
+    }
+
+    if (strcmp(argv[1], "roots") == 0)
+    {
+        script_print_roots();
+        return 0;
+    }
+
+    if (strcmp(argv[1], "ls") == 0)
+    {
+        if (argc < 3)
+        {
+            size_t root_count = script_service_get_root_count();
+            int result = 0;
+
+            for (size_t index = 0; index < root_count; index++)
+            {
+                const char *root_path = script_service_get_root_path(index);
+                if (index > 0)
+                {
+                    printf("\n");
+                }
+                result |= script_list_directory(root_path);
+            }
+
+            return result;
+        }
+
+        const char *path = script_lookup_root_path(argv[2]);
+        if (!path)
+        {
+            path = argv[2];
+        }
+        return script_list_directory(path);
+    }
+
+    if (strcmp(argv[1], "resolve") == 0)
+    {
+        char resolved_path[SCRIPT_SERVICE_MAX_PATH_LEN];
+        esp_err_t err;
+
+        if (argc < 3)
+        {
+            printf("Usage: script resolve <path>\n");
+            return 1;
+        }
+
+        err = script_service_resolve_path(argv[2], resolved_path, sizeof(resolved_path));
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        printf("%s\n", resolved_path);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "run") == 0)
+    {
+        script_service_run_result_t result = {0};
+        const char *const *script_argv = NULL;
+        int script_argc = 0;
+        esp_err_t err;
+
+        if (argc < 3)
+        {
+            printf("Usage: script run <path> [args...]\n");
+            return 1;
+        }
+
+        if (argc > 3)
+        {
+            script_argc = argc - 3;
+            script_argv = (const char *const *)&argv[3];
+        }
+
+        err = script_service_run(argv[2], script_argc, script_argv, &result);
+        if (err != ESP_OK)
+        {
+            if (result.resolved_path[0] != '\0')
+            {
+                printf("Resolved:  %s\n", result.resolved_path);
+            }
+            printf("Error: %s\n",
+                   result.message[0] != '\0' ? result.message : esp_err_to_name(err));
+            return 1;
+        }
+
+        printf("Resolved:  %s\n", result.resolved_path);
+        printf("Size:      %u bytes\n", (unsigned)result.script_size_bytes);
+        printf("Exit code: %ld\n", (long)result.exit_code);
+        if (result.message[0] != '\0')
+        {
+            printf("Result:    %s\n", result.message);
+        }
+
+        return result.exit_code == 0 ? 0 : 1;
+    }
+
+    printf("Unknown subcommand '%s'.\n%s", argv[1], usage);
+    return 1;
+}
+
+/* ════════════════════════════════════════════════════════════════════ *
  *  Audio output commands                                              *
  * ════════════════════════════════════════════════════════════════════ */
 
@@ -1495,6 +1807,22 @@ esp_err_t console_service_init(void)
         .func = cmd_flash,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&flash_cmd));
+
+    const esp_console_cmd_t ftp_cmd = {
+        .command = "ftp",
+        .help = "FTP server: ftp <enable|disable|status>",
+        .hint = NULL,
+        .func = cmd_ftp,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&ftp_cmd));
+
+    const esp_console_cmd_t script_cmd = {
+        .command = "script",
+        .help = "WASM scripts: script <status|roots|ls|resolve|run> [args]",
+        .hint = NULL,
+        .func = cmd_script,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&script_cmd));
 
     /* System commands */
     register_reboot();

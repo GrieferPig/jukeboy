@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "esp_check.h"
 #include "esp_flash.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp32/himem.h"
@@ -106,6 +107,7 @@ typedef struct
     bool dispatcher_initialized;
     esp_himem_handle_t write_buffer_handle;
     esp_himem_rangehandle_t write_buffer_range;
+    uint8_t *write_buffer_ptr;
     size_t write_buffer_capacity;
     size_t pending_write_count;
     size_t pending_write_bytes;
@@ -117,6 +119,27 @@ typedef struct
 } flash_dispatcher_context_t;
 
 static flash_dispatcher_context_t s_flash_dispatcher_ctx;
+
+static void flash_dispatcher_release_pending_buffer(void)
+{
+    if (s_flash_dispatcher_ctx.write_buffer_range != NULL)
+    {
+        esp_himem_free_map_range(s_flash_dispatcher_ctx.write_buffer_range);
+        s_flash_dispatcher_ctx.write_buffer_range = NULL;
+    }
+
+    if (s_flash_dispatcher_ctx.write_buffer_handle != NULL)
+    {
+        esp_himem_free(s_flash_dispatcher_ctx.write_buffer_handle);
+        s_flash_dispatcher_ctx.write_buffer_handle = NULL;
+    }
+
+    if (s_flash_dispatcher_ctx.write_buffer_ptr != NULL)
+    {
+        heap_caps_free(s_flash_dispatcher_ctx.write_buffer_ptr);
+        s_flash_dispatcher_ctx.write_buffer_ptr = NULL;
+    }
+}
 
 static inline flash_arena_block_header_t *flash_dispatcher_arena_block_at(uint8_t *arena_ptr,
                                                                           uint32_t block_offset)
@@ -164,25 +187,43 @@ static inline size_t flash_dispatcher_pending_allocation_size(uint32_t data_size
 static esp_err_t flash_dispatcher_map_pending_buffer_locked(int flags, uint8_t **out_ptr)
 {
     ESP_RETURN_ON_FALSE(out_ptr != NULL, ESP_ERR_INVALID_ARG, TAG, "pending buffer output is null");
-    ESP_RETURN_ON_FALSE(s_flash_dispatcher_ctx.write_buffer_handle != NULL,
+    ESP_RETURN_ON_FALSE(s_flash_dispatcher_ctx.write_buffer_handle != NULL ||
+                            s_flash_dispatcher_ctx.write_buffer_ptr != NULL,
                         ESP_ERR_INVALID_STATE,
                         TAG,
-                        "pending write buffer handle is not allocated");
-    ESP_RETURN_ON_FALSE(s_flash_dispatcher_ctx.write_buffer_range != NULL,
-                        ESP_ERR_INVALID_STATE,
-                        TAG,
-                        "pending write buffer range is not allocated");
+                        "pending write buffer is not allocated");
 
-    esp_err_t err = esp_himem_map(s_flash_dispatcher_ctx.write_buffer_handle,
-                                  s_flash_dispatcher_ctx.write_buffer_range,
-                                  0,
-                                  0,
-                                  FLASH_DISPATCHER_PENDING_BUFFER_SIZE,
-                                  flags,
-                                  (void **)out_ptr);
+    if (s_flash_dispatcher_ctx.write_buffer_ptr != NULL)
+    {
+        *out_ptr = s_flash_dispatcher_ctx.write_buffer_ptr;
+        return ESP_OK;
+    }
+
+    ESP_RETURN_ON_FALSE(s_flash_dispatcher_ctx.write_buffer_range == NULL,
+                        ESP_ERR_INVALID_STATE,
+                        TAG,
+                        "pending write buffer range is already allocated");
+
+    esp_err_t err = esp_himem_alloc_map_range(FLASH_DISPATCHER_PENDING_BUFFER_SIZE,
+                                              &s_flash_dispatcher_ctx.write_buffer_range);
+    if (err != ESP_OK)
+    {
+        ESP_EARLY_LOGE(TAG, "alloc pending write buffer range failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = esp_himem_map(s_flash_dispatcher_ctx.write_buffer_handle,
+                        s_flash_dispatcher_ctx.write_buffer_range,
+                        0,
+                        0,
+                        FLASH_DISPATCHER_PENDING_BUFFER_SIZE,
+                        flags,
+                        (void **)out_ptr);
     if (err != ESP_OK)
     {
         ESP_EARLY_LOGE(TAG, "map pending write buffer failed: %s", esp_err_to_name(err));
+        esp_himem_free_map_range(s_flash_dispatcher_ctx.write_buffer_range);
+        s_flash_dispatcher_ctx.write_buffer_range = NULL;
     }
     return err;
 }
@@ -194,13 +235,37 @@ static esp_err_t flash_dispatcher_unmap_pending_buffer_locked(uint8_t *buffer_pt
         return ESP_OK;
     }
 
+    if (s_flash_dispatcher_ctx.write_buffer_ptr != NULL)
+    {
+        ESP_RETURN_ON_FALSE(buffer_ptr == s_flash_dispatcher_ctx.write_buffer_ptr,
+                            ESP_ERR_INVALID_ARG,
+                            TAG,
+                            "pending write buffer pointer mismatch");
+        return ESP_OK;
+    }
+
+    ESP_RETURN_ON_FALSE(s_flash_dispatcher_ctx.write_buffer_range != NULL,
+                        ESP_ERR_INVALID_STATE,
+                        TAG,
+                        "pending write buffer range is not allocated");
+
     esp_err_t err = esp_himem_unmap(s_flash_dispatcher_ctx.write_buffer_range,
                                     buffer_ptr,
                                     FLASH_DISPATCHER_PENDING_BUFFER_SIZE);
     if (err != ESP_OK)
     {
         ESP_EARLY_LOGE(TAG, "unmap pending write buffer failed: %s", esp_err_to_name(err));
+        return err;
     }
+
+    err = esp_himem_free_map_range(s_flash_dispatcher_ctx.write_buffer_range);
+    if (err != ESP_OK)
+    {
+        ESP_EARLY_LOGE(TAG, "free pending write buffer range failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    s_flash_dispatcher_ctx.write_buffer_range = NULL;
     return err;
 }
 
@@ -222,6 +287,20 @@ static void flash_dispatcher_arena_init_locked(uint8_t *arena_ptr)
     s_flash_dispatcher_ctx.arena_first_free_block_offset = 0;
     s_flash_dispatcher_ctx.pending_write_count = 0;
     s_flash_dispatcher_ctx.pending_write_bytes = 0;
+}
+
+static esp_err_t flash_dispatcher_init_direct_pending_buffer(void)
+{
+    s_flash_dispatcher_ctx.write_buffer_ptr = heap_caps_calloc(1,
+                                                               FLASH_DISPATCHER_PENDING_BUFFER_SIZE,
+                                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_flash_dispatcher_ctx.write_buffer_ptr == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    flash_dispatcher_arena_init_locked(s_flash_dispatcher_ctx.write_buffer_ptr);
+    return ESP_OK;
 }
 
 static void flash_dispatcher_arena_remove_free_block_locked(uint8_t *arena_ptr,
@@ -833,29 +912,38 @@ esp_err_t esp_flash_dispatcher_init(const esp_flash_dispatcher_config_t *cfg)
 
     err = esp_himem_alloc(FLASH_DISPATCHER_PENDING_BUFFER_SIZE,
                           &s_flash_dispatcher_ctx.write_buffer_handle);
-    if (err != ESP_OK)
+    if (err == ESP_OK)
     {
-        goto himem_fail;
+        uint8_t *arena_ptr = NULL;
+        err = flash_dispatcher_map_pending_buffer_locked(0, &arena_ptr);
+        if (err == ESP_OK)
+        {
+            flash_dispatcher_arena_init_locked(arena_ptr);
+            err = flash_dispatcher_unmap_pending_buffer_locked(arena_ptr);
+        }
+
+        if (err != ESP_OK)
+        {
+            flash_dispatcher_release_pending_buffer();
+            ESP_LOGW(TAG,
+                     "himem pending buffer unavailable (%s), falling back to direct PSRAM buffer",
+                     esp_err_to_name(err));
+        }
+    }
+    else
+    {
+        ESP_LOGW(TAG,
+                 "himem allocation unavailable (%s), falling back to direct PSRAM buffer",
+                 esp_err_to_name(err));
     }
 
-    err = esp_himem_alloc_map_range(FLASH_DISPATCHER_PENDING_BUFFER_SIZE,
-                                    &s_flash_dispatcher_ctx.write_buffer_range);
     if (err != ESP_OK)
     {
-        goto himem_fail;
-    }
-
-    uint8_t *arena_ptr = NULL;
-    err = flash_dispatcher_map_pending_buffer_locked(0, &arena_ptr);
-    if (err != ESP_OK)
-    {
-        goto himem_fail;
-    }
-    flash_dispatcher_arena_init_locked(arena_ptr);
-    err = flash_dispatcher_unmap_pending_buffer_locked(arena_ptr);
-    if (err != ESP_OK)
-    {
-        goto himem_fail;
+        err = flash_dispatcher_init_direct_pending_buffer();
+        if (err != ESP_OK)
+        {
+            goto himem_fail;
+        }
     }
 
     BaseType_t rc = xTaskCreatePinnedToCoreWithCaps(flash_dispatcher_task,
@@ -893,16 +981,7 @@ himem_fail:
         vTaskDelete(s_flash_dispatcher_ctx.task);
         s_flash_dispatcher_ctx.task = NULL;
     }
-    if (s_flash_dispatcher_ctx.write_buffer_range != NULL)
-    {
-        esp_himem_free_map_range(s_flash_dispatcher_ctx.write_buffer_range);
-        s_flash_dispatcher_ctx.write_buffer_range = NULL;
-    }
-    if (s_flash_dispatcher_ctx.write_buffer_handle != NULL)
-    {
-        esp_himem_free(s_flash_dispatcher_ctx.write_buffer_handle);
-        s_flash_dispatcher_ctx.write_buffer_handle = NULL;
-    }
+    flash_dispatcher_release_pending_buffer();
     if (s_flash_dispatcher_ctx.pending_lock != NULL)
     {
         vSemaphoreDeleteWithCaps(s_flash_dispatcher_ctx.pending_lock);
