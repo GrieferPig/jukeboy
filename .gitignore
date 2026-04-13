@@ -76,3 +76,5 @@ Desktop.ini
 *.sln.docstates # Visual Studio
 
 tools/out
+
+qemu*/**

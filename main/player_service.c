@@ -28,10 +28,12 @@
 #include "jukeboy_formats.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
+#include "runtime_env.h"
 
 #include "esp_random.h"
 
 #define PLAYER_SVC_PCM_STREAM_BUF_SIZE (16 * 1024)
+#define PLAYER_SVC_QEMU_PCM_STREAM_BUF_SIZE (64 * 1024)
 #define PLAYER_SVC_CHUNK_BUF_COUNT 2
 #define PLAYER_SVC_CHUNK_MAX_BYTES (24 * 1024)
 #define PLAYER_SVC_READER_TASK_STACK 4096
@@ -58,6 +60,8 @@
 #define PLAYER_SVC_NVS_NAMESPACE "player_service"
 #define PLAYER_SVC_NVS_KEY_RESUME "resume"
 #define PLAYER_SVC_RESUME_STATE_VERSION 1U
+#define PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS 10
+#define PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS 2
 
 #define PLAYER_SVC_VOLUME_LEVEL_COUNT 11
 #define PLAYER_SVC_DEFAULT_VOLUME_LEVEL (PLAYER_SVC_VOLUME_LEVEL_COUNT - 1)
@@ -217,6 +221,19 @@ static bool player_service_queue_track_complete(uint32_t generation)
         .generation = generation,
     };
     return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
+}
+
+static StreamBufferHandle_t player_service_create_pcm_stream(void)
+{
+    if (!app_is_running_in_qemu())
+    {
+        return xStreamBufferCreate(PLAYER_SVC_PCM_STREAM_BUF_SIZE, 1);
+    }
+
+    ESP_LOGI(TAG,
+             "using %u-byte QEMU PCM stream buffer",
+             (unsigned)PLAYER_SVC_QEMU_PCM_STREAM_BUF_SIZE);
+    return xStreamBufferCreate(PLAYER_SVC_QEMU_PCM_STREAM_BUF_SIZE, 1);
 }
 
 static const char *player_service_playlist_filename(size_t index)
@@ -1903,7 +1920,7 @@ esp_err_t player_service_init(void)
         return err;
     }
 
-    s_pcm_stream = xStreamBufferCreate(PLAYER_SVC_PCM_STREAM_BUF_SIZE, 1);
+    s_pcm_stream = player_service_create_pcm_stream();
     s_chunk_queue = xQueueCreate(PLAYER_SVC_CHUNK_BUF_COUNT, sizeof(player_service_chunk_msg_t));
     s_buf_pool_sem = xSemaphoreCreateCounting(PLAYER_SVC_CHUNK_BUF_COUNT, PLAYER_SVC_CHUNK_BUF_COUNT);
     s_cmd_queue = xQueueCreate(PLAYER_SVC_QUEUE_DEPTH, sizeof(player_service_msg_t));
@@ -2043,6 +2060,8 @@ int32_t player_service_pcm_provider(uint8_t *data, int32_t len, void *user_ctx)
 {
     (void)user_ctx;
 
+    int32_t filled;
+
     if (!data || len <= 0)
     {
         return 0;
@@ -2066,6 +2085,52 @@ int32_t player_service_pcm_provider(uint8_t *data, int32_t len, void *user_ctx)
         memset(data + received, 0, (size_t)len - received);
     }
 
-    player_service_apply_volume(data, (size_t)len);
+    filled = (int32_t)received;
+    player_service_apply_volume(data, (size_t)filled);
+    return filled;
+}
+
+int32_t player_service_qemu_pcm_provider(uint8_t *data, int32_t len, void *user_ctx)
+{
+    (void)user_ctx;
+
+    size_t received = 0;
+    size_t target;
+
+    if (!data || len <= 0)
+    {
+        return 0;
+    }
+
+    target = (size_t)len;
+
+    if (!s_pcm_stream || s_paused)
+    {
+        memset(data, 0, target);
+        return len;
+    }
+
+    while (received < target)
+    {
+        TickType_t wait_ticks = pdMS_TO_TICKS(received == 0 ? PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS
+                                                            : PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS);
+        size_t chunk = xStreamBufferReceive(s_pcm_stream,
+                                            data + received,
+                                            target - received,
+                                            wait_ticks);
+        if (chunk == 0)
+        {
+            break;
+        }
+
+        received += chunk;
+    }
+
+    if (received < target)
+    {
+        memset(data + received, 0, target - received);
+    }
+
+    player_service_apply_volume(data, received);
     return len;
 }

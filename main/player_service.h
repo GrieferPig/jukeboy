@@ -51,6 +51,7 @@ extern "C"
     uint8_t player_service_get_volume_percent(void);
     void player_service_set_volume_absolute(uint8_t avrc_vol);
     int32_t player_service_pcm_provider(uint8_t *data, int32_t len, void *user_ctx);
+    int32_t player_service_qemu_pcm_provider(uint8_t *data, int32_t len, void *user_ctx);
 
     /**
      * @brief Set the playback sequence mode.
