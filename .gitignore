@@ -78,3 +78,4 @@ Desktop.ini
 tools/out
 
 qemu*/**
+/qemu-official-9.0.0/
