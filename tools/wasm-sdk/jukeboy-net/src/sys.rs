@@ -1,27 +1,18 @@
-use std::ffi::CString;
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::os::raw::c_char;
-use std::time::Duration;
+extern crate alloc;
+
+use alloc::ffi::CString;
+use alloc::string::ToString;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::ffi::c_char;
+use core::net::{IpAddr, SocketAddr};
+use core::ptr;
+use core::time::Duration;
 
 use crate::addr::{AddressFamily, SocketType, WasiAddr, WasiAddrInfo, WasiAddrInfoHints, ANY_ADDRESS_POOL_FD};
 use crate::error::{check, Error, Result};
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Ciovec {
-    pub buf: *const u8,
-    pub buf_len: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Iovec {
-    pub buf: *mut u8,
-    pub buf_len: usize,
-}
-
-#[link(wasm_import_module = "wasi_snapshot_preview1")]
+#[link(wasm_import_module = "env")]
 unsafe extern "C" {
     #[link_name = "sock_open"]
     fn raw_sock_open(pool_fd: i32, family: i32, socket_type: i32, fd_out: *mut u32) -> u16;
@@ -60,8 +51,8 @@ unsafe extern "C" {
     #[link_name = "sock_recv"]
     fn raw_sock_recv(
         fd: i32,
-        iovs: *mut Iovec,
-        iovs_len: u32,
+        buffer: *mut u8,
+        buffer_len: u32,
         flags: i32,
         data_len_out: *mut u32,
         ro_flags_out: *mut u16,
@@ -70,8 +61,8 @@ unsafe extern "C" {
     #[link_name = "sock_send"]
     fn raw_sock_send(
         fd: i32,
-        iovs: *const Ciovec,
-        iovs_len: u32,
+        buffer: *const u8,
+        buffer_len: u32,
         flags: i32,
         data_len_out: *mut u32,
     ) -> u16;
@@ -79,8 +70,8 @@ unsafe extern "C" {
     #[link_name = "sock_recv_from"]
     fn raw_sock_recv_from(
         fd: i32,
-        iovs: *mut Iovec,
-        iovs_len: u32,
+        buffer: *mut u8,
+        buffer_len: u32,
         flags: i32,
         addr_out: *mut WasiAddr,
         data_len_out: *mut u32,
@@ -89,8 +80,8 @@ unsafe extern "C" {
     #[link_name = "sock_send_to"]
     fn raw_sock_send_to(
         fd: i32,
-        iovs: *const Ciovec,
-        iovs_len: u32,
+        buffer: *const u8,
+        buffer_len: u32,
         flags: i32,
         addr: *const WasiAddr,
         data_len_out: *mut u32,
@@ -216,7 +207,7 @@ pub fn sock_addr_resolve(host: &str, service: Option<&str>, hints: Option<WasiAd
     let host = CString::new(host).map_err(|_| Error::new(28))?;
     let service = CString::new(service.unwrap_or("")).map_err(|_| Error::new(28))?;
     let hints_value = hints.unwrap_or_default();
-    let hints_ptr = if hints.is_some() { &hints_value as *const _ } else { std::ptr::null() };
+    let hints_ptr = if hints.is_some() { &hints_value as *const _ } else { ptr::null() };
     let mut info = vec![WasiAddrInfo::default(); 8];
     let mut count = 0_u32;
 
@@ -259,29 +250,29 @@ pub fn resolve_socket_addrs(host: &str, port: u16, socket_type: SocketType) -> R
 }
 
 pub fn sock_send(fd: u32, buffer: &[u8], flags: u16) -> Result<usize> {
-    let iovec = Ciovec {
-        buf: buffer.as_ptr(),
-        buf_len: buffer.len(),
-    };
     let mut sent = 0_u32;
 
-    check(unsafe { raw_sock_send(fd as i32, &iovec, 1, i32::from(flags), &mut sent) })?;
+    check(unsafe {
+        raw_sock_send(
+            fd as i32,
+            buffer.as_ptr(),
+            buffer.len().min(u32::MAX as usize) as u32,
+            i32::from(flags),
+            &mut sent,
+        )
+    })?;
     Ok(sent as usize)
 }
 
 pub fn sock_recv(fd: u32, buffer: &mut [u8], flags: u16) -> Result<(usize, u16)> {
-    let mut iovec = Iovec {
-        buf: buffer.as_mut_ptr(),
-        buf_len: buffer.len(),
-    };
     let mut received = 0_u32;
     let mut ro_flags = 0_u16;
 
     check(unsafe {
         raw_sock_recv(
             fd as i32,
-            &mut iovec,
-            1,
+            buffer.as_mut_ptr(),
+            buffer.len().min(u32::MAX as usize) as u32,
             i32::from(flags),
             &mut received,
             &mut ro_flags,
@@ -292,18 +283,14 @@ pub fn sock_recv(fd: u32, buffer: &mut [u8], flags: u16) -> Result<(usize, u16)>
 }
 
 pub fn sock_send_to(fd: u32, buffer: &[u8], flags: u16, addr: SocketAddr) -> Result<usize> {
-    let iovec = Ciovec {
-        buf: buffer.as_ptr(),
-        buf_len: buffer.len(),
-    };
     let addr = WasiAddr::from(addr);
     let mut sent = 0_u32;
 
     check(unsafe {
         raw_sock_send_to(
             fd as i32,
-            &iovec,
-            1,
+            buffer.as_ptr(),
+            buffer.len().min(u32::MAX as usize) as u32,
             i32::from(flags),
             &addr,
             &mut sent,
@@ -314,18 +301,14 @@ pub fn sock_send_to(fd: u32, buffer: &[u8], flags: u16, addr: SocketAddr) -> Res
 }
 
 pub fn sock_recv_from(fd: u32, buffer: &mut [u8], flags: u16) -> Result<(usize, SocketAddr)> {
-    let mut iovec = Iovec {
-        buf: buffer.as_mut_ptr(),
-        buf_len: buffer.len(),
-    };
     let mut addr = WasiAddr::default();
     let mut received = 0_u32;
 
     check(unsafe {
         raw_sock_recv_from(
             fd as i32,
-            &mut iovec,
-            1,
+            buffer.as_mut_ptr(),
+            buffer.len().min(u32::MAX as usize) as u32,
             i32::from(flags),
             &mut addr,
             &mut received,
@@ -409,8 +392,4 @@ pub fn sock_get_tcp_no_delay(fd: u32) -> Result<bool> {
     let mut enabled = 0_i32;
     check(unsafe { raw_sock_get_tcp_no_delay(fd as i32, &mut enabled) })?;
     Ok(raw_to_bool(enabled))
-}
-
-pub fn invalid_input(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
 }

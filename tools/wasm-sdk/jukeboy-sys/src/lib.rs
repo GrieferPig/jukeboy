@@ -1,4 +1,6 @@
-use std::os::raw::c_char;
+#![no_std]
+
+use core::ffi::c_char;
 
 #[link(wasm_import_module = "jukeboy")]
 unsafe extern "C" {

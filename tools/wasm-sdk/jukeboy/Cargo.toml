@@ -5,7 +5,9 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+dlmalloc = { workspace = true }
 jukeboy-sys = { path = "../jukeboy-sys" }
+ufmt = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

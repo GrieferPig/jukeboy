@@ -1,8 +1,8 @@
-use std::io::{self, Read, Write};
-use std::net::SocketAddr;
-use std::time::Duration;
+use core::net::SocketAddr;
+use core::time::Duration;
 
-use crate::addr::SocketType;
+use crate::addr::{AddressFamily, SocketType};
+use crate::error::{Error, Result};
 use crate::sys;
 
 #[derive(Debug)]
@@ -11,14 +11,13 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    pub fn bind(addr: SocketAddr) -> io::Result<Self> {
+    pub fn bind(addr: SocketAddr) -> Result<Self> {
         let fd = sys::sock_open(sys::address_family_for(addr), SocketType::Stream)?;
 
         if let Err(error) = sys::sock_set_reuse_addr(fd, true) {
-            let io_error: io::Error = error.into();
-            if io_error.kind() != io::ErrorKind::Unsupported {
+            if error.code() != 58 && error.code() != 50 && error.code() != 66 {
                 let _ = sys::sock_close(fd);
-                return Err(io_error);
+                return Err(error);
             }
         }
 
@@ -35,14 +34,18 @@ impl TcpListener {
         Ok(Self { fd })
     }
 
-    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+    pub fn accept(&self) -> Result<(TcpStream, SocketAddr)> {
         let fd = sys::sock_accept(self.fd, 0)?;
         let peer = sys::sock_addr_remote(fd)?;
         Ok((TcpStream { fd }, peer))
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(sys::sock_addr_local(self.fd)?)
+    }
+
+    pub fn set_reuse_addr(&self, enabled: bool) -> Result<()> {
+        sys::sock_set_reuse_addr(self.fd, enabled)
     }
 }
 
@@ -58,7 +61,7 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    pub fn connect(addr: SocketAddr) -> io::Result<Self> {
+    pub fn connect(addr: SocketAddr) -> Result<Self> {
         let fd = sys::sock_open(sys::address_family_for(addr), SocketType::Stream)?;
 
         if let Err(error) = sys::sock_connect(fd, addr) {
@@ -69,7 +72,7 @@ impl TcpStream {
         Ok(Self { fd })
     }
 
-    pub fn connect_host(host: &str, port: u16) -> io::Result<Self> {
+    pub fn connect_host(host: &str, port: u16) -> Result<Self> {
         let addresses = sys::resolve_socket_addrs(host, port, SocketType::Stream)?;
         let mut last_error = None;
 
@@ -80,27 +83,27 @@ impl TcpStream {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| sys::invalid_input("no socket addresses resolved")))
+        Err(last_error.unwrap_or_else(|| Error::new(44)))
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(sys::sock_addr_local(self.fd)?)
     }
 
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
         Ok(sys::sock_addr_remote(self.fd)?)
     }
 
-    pub fn set_nodelay(&self, enabled: bool) -> io::Result<()> {
+    pub fn set_nodelay(&self, enabled: bool) -> Result<()> {
         sys::sock_set_tcp_no_delay(self.fd, enabled)?;
         Ok(())
     }
 
-    pub fn nodelay(&self) -> io::Result<bool> {
+    pub fn nodelay(&self) -> Result<bool> {
         Ok(sys::sock_get_tcp_no_delay(self.fd)?)
     }
 
-    pub fn set_keepalive(&self, keepalive: Option<Duration>) -> io::Result<()> {
+    pub fn set_keepalive(&self, keepalive: Option<Duration>) -> Result<()> {
         if let Some(timeout) = keepalive {
             sys::sock_set_keep_alive(self.fd, true)?;
             sys::sock_set_tcp_keep_idle(self.fd, timeout)?;
@@ -112,47 +115,79 @@ impl TcpStream {
         Ok(())
     }
 
-    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         sys::sock_set_read_timeout(self.fd, timeout)?;
         Ok(())
     }
 
-    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         sys::sock_set_write_timeout(self.fd, timeout)?;
         Ok(())
     }
 
-    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+    pub fn set_recv_buffer_size(&self, size: usize) -> Result<()> {
         sys::sock_set_recv_buf_size(self.fd, size)?;
         Ok(())
     }
 
-    pub fn recv_buffer_size(&self) -> io::Result<usize> {
+    pub fn recv_buffer_size(&self) -> Result<usize> {
         Ok(sys::sock_get_recv_buf_size(self.fd)?)
     }
 
-    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+    pub fn set_send_buffer_size(&self, size: usize) -> Result<()> {
         sys::sock_set_send_buf_size(self.fd, size)?;
         Ok(())
     }
 
-    pub fn send_buffer_size(&self) -> io::Result<usize> {
+    pub fn send_buffer_size(&self) -> Result<usize> {
         Ok(sys::sock_get_send_buf_size(self.fd)?)
     }
-}
 
-impl Read for TcpStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         Ok(sys::sock_recv(self.fd, buf, 0)?.0)
     }
-}
 
-impl Write for TcpStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        sys::sock_send(self.fd, buf, 0).map_err(Into::into)
+    pub fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        sys::sock_send(self.fd, buf, 0)
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    pub fn write_all(&mut self, mut buf: &[u8]) -> Result<()> {
+        while !buf.is_empty() {
+            let written = self.write(buf)?;
+            if written == 0 {
+                return Err(Error::new(64));
+            }
+            buf = &buf[written..];
+        }
+
+        Ok(())
+    }
+
+    pub fn connect_unspecified(port: u16) -> Result<Self> {
+        Self::connect(SocketAddr::from(([0, 0, 0, 0], port)))
+    }
+
+    pub fn connect_loopback(port: u16) -> Result<Self> {
+        Self::connect(SocketAddr::from(([127, 0, 0, 1], port)))
+    }
+
+    pub fn connect_family(host: &str, port: u16, family: AddressFamily) -> Result<Self> {
+        let addresses = sys::resolve_socket_addrs(host, port, SocketType::Stream)?;
+
+        for addr in addresses {
+            if sys::address_family_for(addr) != family {
+                continue;
+            }
+
+            if let Ok(stream) = Self::connect(addr) {
+                return Ok(stream);
+            }
+        }
+
+        Err(Error::new(44))
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }

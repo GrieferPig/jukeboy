@@ -18,6 +18,11 @@ extern "C"
 
     typedef enum
     {
+        SCRIPT_SERVICE_RUN_MODE_LIBC_BUILTIN = 0,
+    } script_service_run_mode_t;
+
+    typedef enum
+    {
         SCRIPT_SERVICE_STATUS_UNINITIALIZED = 0,
         SCRIPT_SERVICE_STATUS_READY,
         SCRIPT_SERVICE_STATUS_BUSY,
@@ -29,6 +34,7 @@ extern "C"
         char resolved_path[SCRIPT_SERVICE_MAX_PATH_LEN];
         char message[SCRIPT_SERVICE_MAX_MESSAGE_LEN];
         char output[SCRIPT_SERVICE_MAX_OUTPUT_LEN];
+        script_service_run_mode_t mode;
         uint32_t script_size_bytes;
         int32_t exit_code;
     } script_service_run_result_t;
@@ -37,6 +43,7 @@ extern "C"
     bool script_service_is_ready(void);
     script_service_status_t script_service_get_status(void);
     const char *script_service_status_name(script_service_status_t status);
+    const char *script_service_run_mode_name(script_service_run_mode_t mode);
 
     size_t script_service_get_root_count(void);
     const char *script_service_get_root_label(size_t index);

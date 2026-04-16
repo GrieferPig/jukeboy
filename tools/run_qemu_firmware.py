@@ -9,7 +9,6 @@ from typing import Sequence
 
 DEFAULT_QEMU_DIR = "qemu-official-9.0.0"
 DEFAULT_BUILD_DIR = "build"
-STORAGE_BUILD_TARGETS = ("littlefs_littlefs_bin",)
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,43 +87,6 @@ def format_command(command: Sequence[str]) -> str:
 def ensure_exists(path: Path, description: str) -> None:
     if not path.exists():
         raise SystemExit(f"Missing {description}: {path}")
-
-
-def read_cmake_cache_value(build_dir: Path, variable: str) -> str | None:
-    cache_path = build_dir / "CMakeCache.txt"
-    if not cache_path.exists():
-        return None
-
-    prefix = f"{variable}:"
-    for line in cache_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.startswith(prefix):
-            continue
-        _, _, value = line.partition("=")
-        return value.strip() or None
-
-    return None
-
-
-def build_storage_images(build_dir: Path, dry_run: bool) -> None:
-    cmake_executable = read_cmake_cache_value(build_dir, "CMAKE_COMMAND") or "cmake"
-    command = [
-        cmake_executable,
-        "--build",
-        str(build_dir),
-        "--target",
-        *STORAGE_BUILD_TARGETS,
-    ]
-    print(f"+ {format_command(command)}")
-
-    if dry_run:
-        return
-
-    try:
-        subprocess.run(command, cwd=build_dir.parent, check=True)
-    except FileNotFoundError as exc:
-        raise SystemExit(
-            f"Unable to run the configured CMake executable: {cmake_executable}"
-        ) from exc
 
 
 def merge_flash(build_dir: Path, dry_run: bool) -> None:
@@ -241,8 +203,6 @@ def main() -> int:
     root = repo_root()
     build_dir = resolve_path(root, args.build_dir)
     ensure_exists(build_dir, "firmware build directory")
-
-    build_storage_images(build_dir, args.dry_run)
 
     if not args.skip_flash_merge:
         merge_flash(build_dir, args.dry_run)

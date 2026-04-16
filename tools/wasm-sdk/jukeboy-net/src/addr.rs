@@ -1,128 +1,88 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#![allow(clippy::module_name_repetitions)]
+
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 pub const ANY_ADDRESS_POOL_FD: i32 = -1;
 
-#[repr(i32)]
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketType {
-    Any = -1,
-    Dgram = 0,
-    Stream = 1,
+    Any = 0,
+    Datagram = 1,
+    Stream = 2,
 }
 
-#[repr(i32)]
+impl Default for SocketType {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressFamily {
-    Inet4 = 0,
-    Inet6 = 1,
-    Unspec = 2,
+    Unspec = 0,
+    Inet4 = 1,
+    Inet6 = 2,
 }
 
-#[repr(i32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AddrType {
-    Ipv4 = 0,
-    Ipv6 = 1,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct WasiAddrIp4 {
-    pub n0: u8,
-    pub n1: u8,
-    pub n2: u8,
-    pub n3: u8,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct WasiAddrIp4Port {
-    pub addr: WasiAddrIp4,
-    pub port: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct WasiAddrIp6 {
-    pub n0: u16,
-    pub n1: u16,
-    pub n2: u16,
-    pub n3: u16,
-    pub h0: u16,
-    pub h1: u16,
-    pub h2: u16,
-    pub h3: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct WasiAddrIp6Port {
-    pub addr: WasiAddrIp6,
-    pub port: u16,
+impl Default for AddressFamily {
+    fn default() -> Self {
+        Self::Unspec
+    }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub union WasiAddrPayload {
-    pub ip4: WasiAddrIp4Port,
-    pub ip6: WasiAddrIp6Port,
+pub union WasiAddrIp {
+    pub v4: [u8; 4],
+    pub v6: [u16; 8],
 }
 
-impl Default for WasiAddrPayload {
+impl Default for WasiAddrIp {
     fn default() -> Self {
-        Self {
-            ip4: WasiAddrIp4Port::default(),
-        }
+        Self { v4: [0; 4] }
     }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct WasiAddr {
-    pub kind: AddrType,
-    pub addr: WasiAddrPayload,
+    pub kind: AddressFamily,
+    pub reserved0: u8,
+    pub port: u16,
+    pub ip: WasiAddrIp,
 }
 
 impl Default for WasiAddr {
     fn default() -> Self {
-        Self::from(SocketAddr::from(([0, 0, 0, 0], 0)))
+        Self {
+            kind: AddressFamily::Inet4,
+            reserved0: 0,
+            port: 0,
+            ip: WasiAddrIp::default(),
+        }
     }
 }
 
 impl WasiAddr {
-    pub fn family(&self) -> AddressFamily {
-        match self.kind {
-            AddrType::Ipv4 => AddressFamily::Inet4,
-            AddrType::Ipv6 => AddressFamily::Inet6,
-        }
-    }
-
     pub fn to_socket_addr(&self) -> Option<SocketAddr> {
         unsafe {
             match self.kind {
-                AddrType::Ipv4 => {
-                    let ip4 = self.addr.ip4;
-                    Some(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(ip4.addr.n0, ip4.addr.n1, ip4.addr.n2, ip4.addr.n3)),
-                        ip4.port,
-                    ))
+                AddressFamily::Inet4 => {
+                    let ip = self.ip.v4;
+                    Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), self.port))
                 }
-                AddrType::Ipv6 => {
-                    let ip6 = self.addr.ip6;
+                AddressFamily::Inet6 => {
+                    let ip = self.ip.v6;
                     Some(SocketAddr::new(
                         IpAddr::V6(Ipv6Addr::new(
-                            ip6.addr.n0,
-                            ip6.addr.n1,
-                            ip6.addr.n2,
-                            ip6.addr.n3,
-                            ip6.addr.h0,
-                            ip6.addr.h1,
-                            ip6.addr.h2,
-                            ip6.addr.h3,
+                            ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7],
                         )),
-                        ip6.port,
+                        self.port,
                     ))
                 }
+                AddressFamily::Unspec => None,
             }
         }
     }
@@ -132,38 +92,18 @@ impl From<SocketAddr> for WasiAddr {
     fn from(value: SocketAddr) -> Self {
         match value {
             SocketAddr::V4(addr) => Self {
-                kind: AddrType::Ipv4,
-                addr: WasiAddrPayload {
-                    ip4: WasiAddrIp4Port {
-                        addr: WasiAddrIp4 {
-                            n0: addr.ip().octets()[0],
-                            n1: addr.ip().octets()[1],
-                            n2: addr.ip().octets()[2],
-                            n3: addr.ip().octets()[3],
-                        },
-                        port: addr.port(),
-                    },
-                },
+                kind: AddressFamily::Inet4,
+                reserved0: 0,
+                port: addr.port(),
+                ip: WasiAddrIp { v4: addr.ip().octets() },
             },
             SocketAddr::V6(addr) => {
                 let segments = addr.ip().segments();
                 Self {
-                    kind: AddrType::Ipv6,
-                    addr: WasiAddrPayload {
-                        ip6: WasiAddrIp6Port {
-                            addr: WasiAddrIp6 {
-                                n0: segments[0],
-                                n1: segments[1],
-                                n2: segments[2],
-                                n3: segments[3],
-                                h0: segments[4],
-                                h1: segments[5],
-                                h2: segments[6],
-                                h3: segments[7],
-                            },
-                            port: addr.port(),
-                        },
-                    },
+                    kind: AddressFamily::Inet6,
+                    reserved0: 0,
+                    port: addr.port(),
+                    ip: WasiAddrIp { v6: segments },
                 }
             }
         }
@@ -173,39 +113,39 @@ impl From<SocketAddr> for WasiAddr {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct WasiAddrInfo {
-    pub addr: WasiAddr,
+    pub address: WasiAddr,
     pub socket_type: SocketType,
+    pub is_internal: bool,
 }
 
 impl Default for WasiAddrInfo {
     fn default() -> Self {
         Self {
-            addr: WasiAddr::default(),
+            address: WasiAddr::default(),
             socket_type: SocketType::Any,
+            is_internal: false,
         }
     }
 }
 
 impl WasiAddrInfo {
     pub fn to_socket_addr(&self) -> Option<SocketAddr> {
-        self.addr.to_socket_addr()
+        self.address.to_socket_addr()
     }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct WasiAddrInfoHints {
-    pub socket_type: SocketType,
     pub family: AddressFamily,
-    pub hints_enabled: u8,
+    pub socket_type: SocketType,
 }
 
 impl WasiAddrInfoHints {
     pub const fn new(socket_type: SocketType, family: AddressFamily) -> Self {
         Self {
-            socket_type,
             family,
-            hints_enabled: 1,
+            socket_type,
         }
     }
 }
@@ -213,9 +153,75 @@ impl WasiAddrInfoHints {
 impl Default for WasiAddrInfoHints {
     fn default() -> Self {
         Self {
-            socket_type: SocketType::Any,
             family: AddressFamily::Unspec,
-            hints_enabled: 0,
+            socket_type: SocketType::Any,
+        }
+    }
+}
+
+pub struct DisplaySocketAddr<'a>(pub &'a SocketAddr);
+
+fn write_hex_u16<W>(formatter: &mut ufmt::Formatter<'_, W>, value: u16) -> core::result::Result<(), W::Error>
+where
+    W: ufmt::uWrite + ?Sized,
+{
+    let digits = [
+        ((value >> 12) & 0x0f) as u8,
+        ((value >> 8) & 0x0f) as u8,
+        ((value >> 4) & 0x0f) as u8,
+        (value & 0x0f) as u8,
+    ];
+    let mut emitted = false;
+
+    for (index, digit) in digits.into_iter().enumerate() {
+        if digit != 0 || emitted || index == digits.len() - 1 {
+            emitted = true;
+            formatter.write_str(match digit {
+                0 => "0",
+                1 => "1",
+                2 => "2",
+                3 => "3",
+                4 => "4",
+                5 => "5",
+                6 => "6",
+                7 => "7",
+                8 => "8",
+                9 => "9",
+                10 => "a",
+                11 => "b",
+                12 => "c",
+                13 => "d",
+                14 => "e",
+                _ => "f",
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+impl ufmt::uDisplay for DisplaySocketAddr<'_> {
+    fn fmt<W>(&self, formatter: &mut ufmt::Formatter<'_, W>) -> core::result::Result<(), W::Error>
+    where
+        W: ufmt::uWrite + ?Sized,
+    {
+        match self.0 {
+            SocketAddr::V4(addr) => {
+                let octets = addr.ip().octets();
+                ufmt::uwrite!(formatter, "{}.{}.{}.{}:{}", octets[0], octets[1], octets[2], octets[3], addr.port())
+            }
+            SocketAddr::V6(addr) => {
+                let segments = addr.ip().segments();
+                formatter.write_str("[")?;
+                for (index, segment) in segments.into_iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(":")?;
+                    }
+                    write_hex_u16(formatter, segment)?;
+                }
+                formatter.write_str("]:")?;
+                ufmt::uwrite!(formatter, "{}", addr.port())
+            }
         }
     }
 }

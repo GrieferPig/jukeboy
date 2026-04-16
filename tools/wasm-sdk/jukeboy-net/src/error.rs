@@ -1,6 +1,3 @@
-use std::fmt;
-use std::io;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Error {
     code: u16,
@@ -15,55 +12,40 @@ impl Error {
         self.code
     }
 
-    pub fn kind(self) -> io::ErrorKind {
+    pub const fn message(self) -> &'static str {
         match self.code {
-            2 | 63 | 76 => io::ErrorKind::PermissionDenied,
-            3 => io::ErrorKind::AddrInUse,
-            4 | 17 => io::ErrorKind::AddrNotAvailable,
-            6 => io::ErrorKind::WouldBlock,
-            7 | 26 => io::ErrorKind::WouldBlock,
-            8 => io::ErrorKind::BrokenPipe,
-            13 => io::ErrorKind::ConnectionAborted,
-            14 => io::ErrorKind::ConnectionRefused,
-            15 => io::ErrorKind::ConnectionReset,
-            20 => io::ErrorKind::AlreadyExists,
-            23 | 38 | 40 => io::ErrorKind::NotConnected,
-            27 => io::ErrorKind::Interrupted,
-            28 => io::ErrorKind::InvalidInput,
-            29 => io::ErrorKind::Other,
-            33 | 41 => io::ErrorKind::Other,
-            35 => io::ErrorKind::InvalidData,
-            37 => io::ErrorKind::InvalidInput,
-            42 | 48 => io::ErrorKind::OutOfMemory,
-            44 => io::ErrorKind::NotFound,
-            50 | 58 | 66 => io::ErrorKind::Unsupported,
-            51 => io::ErrorKind::StorageFull,
-            53 | 57 => io::ErrorKind::NotConnected,
-            61 => io::ErrorKind::InvalidData,
-            64 => io::ErrorKind::BrokenPipe,
-            68 => io::ErrorKind::InvalidInput,
-            69 => io::ErrorKind::ReadOnlyFilesystem,
-            73 => io::ErrorKind::TimedOut,
-            _ => io::ErrorKind::Other,
+            2 | 63 => "permission denied",
+            3 => "address in use",
+            4 | 17 => "address not available",
+            6 | 7 | 26 => "operation would block",
+            8 | 64 => "broken pipe",
+            13 => "connection aborted",
+            14 => "connection refused",
+            15 => "connection reset",
+            20 => "already exists",
+            23 | 38 | 40 | 53 | 57 => "not connected",
+            27 => "interrupted",
+            28 | 68 => "invalid input",
+            35 => "message too large",
+            42 | 48 => "out of memory",
+            44 => "not found",
+            50 | 58 | 66 => "unsupported",
+            73 => "timed out",
+            _ => "socket error",
         }
     }
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WASI socket error {}", self.code)
+impl ufmt::uDisplay for Error {
+    fn fmt<W>(&self, formatter: &mut ufmt::Formatter<'_, W>) -> core::result::Result<(), W::Error>
+    where
+        W: ufmt::uWrite + ?Sized,
+    {
+        ufmt::uwrite!(formatter, "{} ({})", self.message(), self.code)
     }
 }
 
-impl std::error::Error for Error {}
-
-impl From<Error> for io::Error {
-    fn from(value: Error) -> Self {
-        io::Error::new(value.kind(), value)
-    }
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = core::result::Result<T, Error>;
 
 pub fn check(code: u16) -> Result<()> {
     if code == 0 {

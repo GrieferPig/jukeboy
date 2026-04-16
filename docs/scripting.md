@@ -1,6 +1,6 @@
 # WASM Scripting
 
-The firmware embeds Espressif's WASMachine core and exposes a native host module named `jukeboy` to WASM scripts.
+The firmware embeds Espressif's WASMachine core and exposes a native host module named `jukeboy` plus builtin socket natives in the `env` module.
 
 ## Console commands
 
@@ -8,7 +8,7 @@ The firmware embeds Espressif's WASMachine core and exposes a native host module
 - `script roots` prints the root labels and backing directories.
 - `script ls [root|path]` lists all configured roots when no argument is given, or one root/path when an argument is provided.
 - `script resolve <path>` prints the fully resolved script path.
-- `script run <path> [args...]` runs a module and forwards the remaining arguments to `_start`.
+- `script run <path> [args...]` runs a builtin module and forwards the remaining arguments to `main(argc, argv)`.
 
 ## Script roots and resolution
 
@@ -23,7 +23,7 @@ Resolver behavior:
 - Absolute paths are tried first.
 - Labeled paths such as `lfs/hello`, `tmp/demo`, and `sd/net-echo.wasm` resolve against the matching root.
 - Bare names are resolved by searching the configured roots.
-- If the provided path has no extension, the resolver also tries `.wasm` and, when AOT support is enabled, `.aot`.
+- If the provided path has no extension, the resolver also tries `.wasm`, `.cwasm`, and, when AOT support is enabled, `.aot`.
 - On hardware, bare names are searched in this order: `/lfs/scripts`, `/tmp/scripts`, `/sdcard/scripts`.
 - Under QEMU, bare names are searched in this order: `/sdcard/scripts`, `/tmp/scripts`, `/lfs/scripts`.
 
@@ -34,15 +34,17 @@ Examples:
 - `script run hello`
 - `script run lfs/hello`
 - `script run /sdcard/scripts/demo.wasm first second`
+- `script run hello.cwasm`
 
 ## Run results
 
-`script run` captures WASI stdout/stderr and prints:
+`script run` prints:
 
 - `Resolved`
+- `Mode`
 - `Size`
 - `Exit code`
-- `Output` when the script wrote to stdout or stderr
+- `Output` when the script wrote through the `jukeboy.log()` host hook
 - `Result` or `Error`
 
 Captured output is currently limited to 2048 bytes. A non-zero script exit code makes the console command fail even when the runtime completed normally.
@@ -97,28 +99,18 @@ __attribute__((import_name("get_uptime_ms")))
 long long get_uptime_ms(void);
 ```
 
-## WASI runtime behavior
+## Builtin runtime behavior
 
-Each run gets these environment variables:
+Scripts now run only in libc-builtin mode. `.wasm` and `.cwasm` both resolve to builtin modules, and the runtime accepts either `main(argc, argv)` or `__main_argc_argv`.
 
-- `JUKEBOY=1`
-- `JUKEBOY_QEMU=0` or `JUKEBOY_QEMU=1`
-
-The runtime enables WASI socket access for any address and wildcard DNS lookups.
-
-Filesystem preopens are narrower than the earlier implementation:
-
-- On hardware, the runtime preopens `/lfs/scripts` only when the resolved module lives under that LittleFS root.
-- Scripts launched from `/tmp/scripts` or `/sdcard/scripts` still run, but they do not receive a default WASI filesystem preopen.
-- Under QEMU, the runtime currently passes no preopened directories, so scripts can run from the staged SD image but do not get default WASI filesystem access.
-
-Build scripts with a WASI-capable toolchain if they need stdio or sockets.
+The firmware exposes the `jukeboy` host module for device control and an `env` socket shim that implements the existing `sock_*` API on top of ESP-IDF BSD sockets. That gives builtin scripts DNS lookup plus TCP and UDP access without WASI.
 
 ## QEMU validation flow
 
-The current smoketest expects these staged scripts in the SD image:
+The current smoketest expects these staged scripts in LittleFS:
 
 - `hello.wasm`
+- `google-get.wasm`
 - `player-control.wasm`
 - `net-echo.wasm`
 

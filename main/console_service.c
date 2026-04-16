@@ -1544,6 +1544,8 @@ static void script_print_status(void)
 {
     printf("Script service: %s\n", script_service_status_name(script_service_get_status()));
     printf("Host module:    %s\n", SCRIPT_SERVICE_HOST_MODULE_NAME);
+    printf("Run mode:       .wasm/.cwasm => %s\n",
+           script_service_run_mode_name(SCRIPT_SERVICE_RUN_MODE_LIBC_BUILTIN));
     printf("Search roots:\n");
     script_print_roots();
 }
@@ -1573,7 +1575,7 @@ static int cmd_script(int argc, char **argv)
         "  roots                  Print script search roots\n"
         "  ls [root|path]         List a script root or explicit directory\n"
         "  resolve <path>         Show how a script path resolves\n"
-        "  run <path> [args...]   Execute a .wasm script\n";
+        "  run <path> [args...]   Execute a builtin .wasm or .cwasm script\n";
 
     if (argc < 2 || strcmp(argv[1], "status") == 0)
     {
@@ -1669,6 +1671,7 @@ static int cmd_script(int argc, char **argv)
             if (result->resolved_path[0] != '\0')
             {
                 printf("Resolved:  %s\n", result->resolved_path);
+                printf("Mode:      %s\n", script_service_run_mode_name(result->mode));
             }
             script_print_output(result->output);
             printf("Error: %s\n",
@@ -1678,6 +1681,7 @@ static int cmd_script(int argc, char **argv)
         }
 
         printf("Resolved:  %s\n", result->resolved_path);
+        printf("Mode:      %s\n", script_service_run_mode_name(result->mode));
         printf("Size:      %u bytes\n", (unsigned)result->script_size_bytes);
         printf("Exit code: %ld\n", (long)result->exit_code);
         script_print_output(result->output);

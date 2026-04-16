@@ -31,21 +31,32 @@ IMAGE_SIZE_ALIGNMENT_BYTES = 64 * 1024 * 1024
 MIN_POPULATED_FREE_SPACE_BYTES = 128 * 1024 * 1024
 VOLUME_LABEL = "JUKEBOYSD"
 
+DEFAULT_SD_SOURCE_DIR = "tools/out"
+DEFAULT_SD_IMAGE_SIZE_BYTES = 1024 * 1024 * 1024
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create a QEMU SD image with an MBR and a FAT partition"
     )
     parser.add_argument(
-        "--image-path", required=True, help="Path to the raw SD image file"
+        "--image-path",
+        required=False,
+        help="Path to the raw SD image file",
+        default="build/sd_image.bin",
     )
     parser.add_argument(
-        "--size-bytes", required=True, type=int, help="Total image size in bytes"
+        "--size-bytes",
+        required=False,
+        type=int,
+        help="Total image size in bytes",
+        default=DEFAULT_SD_IMAGE_SIZE_BYTES,
     )
     parser.add_argument(
         "--source-dir",
-        required=True,
+        required=False,
         help="Directory whose contents should be placed at the root of the FAT partition",
+        default=DEFAULT_SD_SOURCE_DIR,
     )
     parser.add_argument(
         "--partition-start-lba",

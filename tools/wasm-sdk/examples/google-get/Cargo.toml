@@ -7,3 +7,4 @@ publish = false
 [dependencies]
 jukeboy = { path = "../../jukeboy" }
 jukeboy-net = { path = "../../jukeboy-net" }
+ufmt = { workspace = true }
