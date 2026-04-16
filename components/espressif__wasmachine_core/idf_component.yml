@@ -10,8 +10,6 @@ dependencies:
     version: ==0.*
   wasmachine_ext_wasm_vfs:
     version: ==0.*
-  wasmachine_shell:
-    version: ==0.*
 description: Espressif WASMachine core component
 issues: https://github.com/espressif/esp-wasmachine/issues
 repository: git://github.com/espressif/esp-wasmachine.git

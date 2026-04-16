@@ -9,7 +9,7 @@ from typing import Sequence
 
 DEFAULT_QEMU_DIR = "qemu-official-9.0.0"
 DEFAULT_BUILD_DIR = "build"
-STORAGE_BUILD_TARGETS = ("littlefs_littlefs_bin", "qemu_sd_image")
+STORAGE_BUILD_TARGETS = ("littlefs_littlefs_bin",)
 
 
 def parse_args() -> argparse.Namespace:

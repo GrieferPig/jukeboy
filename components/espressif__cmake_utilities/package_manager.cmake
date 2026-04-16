@@ -39,7 +39,14 @@ macro(cu_pkg_define_version pkg_path)
     string(TOUPPER ${pkg_name} pkg_name)
     string(REPLACE "-" "_" pkg_name ${pkg_name})
     message(STATUS "${pkg_name}: ${ver_major}.${ver_minor}.${ver_patch}")
-    list(LENGTH pkg_name_list len)
-    target_compile_options(${COMPONENT_LIB} PUBLIC
-        -D${pkg_name}_VER_MAJOR=${ver_major} -D${pkg_name}_VER_MINOR=${ver_minor} -D${pkg_name}_VER_PATCH=${ver_patch})
+
+    get_target_property(target_type ${COMPONENT_LIB} TYPE)
+    if(target_type STREQUAL "INTERFACE_LIBRARY")
+        set(target_scope INTERFACE)
+    else()
+        set(target_scope PUBLIC)
+    endif()
+
+    target_compile_definitions(${COMPONENT_LIB} ${target_scope}
+        ${pkg_name}_VER_MAJOR=${ver_major} ${pkg_name}_VER_MINOR=${ver_minor} ${pkg_name}_VER_PATCH=${ver_patch})
 endmacro()

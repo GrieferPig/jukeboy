@@ -9,7 +9,7 @@
 #include "esp_idf_version.h"
 
 #include "wm_ext_wasm_vfs.h"
-#include "ext_vfs.h"
+// #include "ext_vfs.h"
 
 #ifdef CONFIG_WASMACHINE_EXT_VFS_UART
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 3, 0)

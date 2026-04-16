@@ -1,8 +1,6 @@
 dependencies:
   cmake_utilities:
     version: ==0.*
-  extended_vfs:
-    version: ==0.*
   idf:
     version: '>=5.1'
 description: Extended WASM VFS component for Espressif WASMachine

@@ -28,11 +28,7 @@ if(CONFIG_WASMACHINE_WASM_EXT_NATIVE)
     endif()
 endif()
 
-set(requires "wasm-micro-runtime" "wasmachine_data_sequence")
-
-if(CONFIG_WASMACHINE_EXT_VFS)
-    list(APPEND requires "wasmachine_ext_wasm_vfs")
-endif()
+set(requires "wasm-micro-runtime" "wasmachine_data_sequence" "espressif__wasmachine_ext_wasm_vfs")
 
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS ${include_dir}
