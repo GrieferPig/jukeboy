@@ -241,19 +241,6 @@ static int script_socket_family_to_native(uint8_t family)
     }
 }
 
-static uint8_t script_socket_family_from_native(int family)
-{
-    switch (family)
-    {
-    case AF_INET:
-        return SCRIPT_SOCKET_ADDR_FAMILY_INET4;
-    case AF_INET6:
-        return SCRIPT_SOCKET_ADDR_FAMILY_INET6;
-    default:
-        return SCRIPT_SOCKET_ADDR_FAMILY_UNSPEC;
-    }
-}
-
 static int script_socket_type_to_native(uint8_t socket_type)
 {
     switch (socket_type)
@@ -710,8 +697,8 @@ static uint32_t sock_addr_resolve_wrapper(wasm_exec_env_t exec_env,
 
     err = script_socket_get_guest_buffer(module_inst,
                                          addr_info_offset,
-                                         addr_info_len * (uint32_t)sizeof(*addr_info),
-                                         addr_info_len == 0,
+                                         sizeof(*addr_info) * addr_info_len,
+                                         false,
                                          (void **)&addr_info);
     if (err != WASI_ESUCCESS)
     {

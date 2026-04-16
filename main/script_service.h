@@ -45,9 +45,10 @@ extern "C"
     const char *script_service_status_name(script_service_status_t status);
     const char *script_service_run_mode_name(script_service_run_mode_t mode);
 
-    size_t script_service_get_root_count(void);
-    const char *script_service_get_root_label(size_t index);
-    const char *script_service_get_root_path(size_t index);
+    const char *script_service_get_root_path(void);
+    esp_err_t script_service_get_script_directory(const char *name,
+                                                  char *out_path,
+                                                  size_t out_path_size);
 
     esp_err_t script_service_resolve_path(const char *path, char *out_path, size_t out_path_size);
     esp_err_t script_service_run(const char *path,

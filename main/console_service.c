@@ -1472,32 +1472,9 @@ static int cmd_sd(int argc, char **argv)
  *  Script commands                                                    *
  * ════════════════════════════════════════════════════════════════════ */
 
-static const char *script_lookup_root_path(const char *label)
+static void script_print_root(void)
 {
-    size_t root_count = script_service_get_root_count();
-
-    for (size_t index = 0; index < root_count; index++)
-    {
-        const char *root_label = script_service_get_root_label(index);
-        if (root_label && strcmp(label, root_label) == 0)
-        {
-            return script_service_get_root_path(index);
-        }
-    }
-
-    return NULL;
-}
-
-static void script_print_roots(void)
-{
-    size_t root_count = script_service_get_root_count();
-
-    for (size_t index = 0; index < root_count; index++)
-    {
-        printf("%s -> %s\n",
-               script_service_get_root_label(index),
-               script_service_get_root_path(index));
-    }
+    printf("%s\n", script_service_get_root_path());
 }
 
 static int script_list_directory(const char *path)
@@ -1546,8 +1523,9 @@ static void script_print_status(void)
     printf("Host module:    %s\n", SCRIPT_SERVICE_HOST_MODULE_NAME);
     printf("Run mode:       .wasm/.cwasm => %s\n",
            script_service_run_mode_name(SCRIPT_SERVICE_RUN_MODE_LIBC_BUILTIN));
-    printf("Search roots:\n");
-    script_print_roots();
+    printf("Scripts root:   %s\n", script_service_get_root_path());
+    printf("Lookup:         <name> -> %s/<name>/<name>.wasm|.cwasm\n",
+           script_service_get_root_path());
 }
 
 static void script_print_output(const char *output)
@@ -1571,11 +1549,9 @@ static int cmd_script(int argc, char **argv)
 {
     static const char *usage =
         "Usage: script <subcommand> [args]\n"
-        "  status                 Show runtime status and search roots\n"
-        "  roots                  Print script search roots\n"
-        "  ls [root|path]         List a script root or explicit directory\n"
-        "  resolve <path>         Show how a script path resolves\n"
-        "  run <path> [args...]   Execute a builtin .wasm or .cwasm script\n";
+        "  status                 Show runtime status and fixed scripts root\n"
+        "  ls [name]              List /lfs/scripts or one script directory\n"
+        "  run <name> [args...]   Execute a builtin .wasm or .cwasm script\n";
 
     if (argc < 2 || strcmp(argv[1], "status") == 0)
     {
@@ -1583,60 +1559,22 @@ static int cmd_script(int argc, char **argv)
         return 0;
     }
 
-    if (strcmp(argv[1], "roots") == 0)
-    {
-        script_print_roots();
-        return 0;
-    }
-
     if (strcmp(argv[1], "ls") == 0)
     {
         if (argc < 3)
         {
-            size_t root_count = script_service_get_root_count();
-            int result = 0;
-
-            for (size_t index = 0; index < root_count; index++)
-            {
-                const char *root_path = script_service_get_root_path(index);
-                if (index > 0)
-                {
-                    printf("\n");
-                }
-                result |= script_list_directory(root_path);
-            }
-
-            return result;
+            return script_list_directory(script_service_get_root_path());
         }
 
-        const char *path = script_lookup_root_path(argv[2]);
-        if (!path)
-        {
-            path = argv[2];
-        }
-        return script_list_directory(path);
-    }
-
-    if (strcmp(argv[1], "resolve") == 0)
-    {
-        char resolved_path[SCRIPT_SERVICE_MAX_PATH_LEN];
-        esp_err_t err;
-
-        if (argc < 3)
-        {
-            printf("Usage: script resolve <path>\n");
-            return 1;
-        }
-
-        err = script_service_resolve_path(argv[2], resolved_path, sizeof(resolved_path));
+        char path[SCRIPT_SERVICE_MAX_PATH_LEN];
+        esp_err_t err = script_service_get_script_directory(argv[2], path, sizeof(path));
         if (err != ESP_OK)
         {
-            printf("Error: %s\n", esp_err_to_name(err));
+            printf("Error: script name must be a bare filename under %s\n",
+                   script_service_get_root_path());
             return 1;
         }
-
-        printf("%s\n", resolved_path);
-        return 0;
+        return script_list_directory(path);
     }
 
     if (strcmp(argv[1], "run") == 0)
@@ -1648,7 +1586,7 @@ static int cmd_script(int argc, char **argv)
 
         if (argc < 3)
         {
-            printf("Usage: script run <path> [args...]\n");
+            printf("Usage: script run <name> [args...]\n");
             return 1;
         }
 

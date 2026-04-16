@@ -33,15 +33,8 @@
 #define SCRIPT_SERVICE_WASM_STACK_SIZE (32 * 1024)
 #define SCRIPT_SERVICE_WASM_HEAP_SIZE (32 * 1024)
 
-#define SCRIPT_SD_ROOT_PATH "/sdcard/scripts"
+#define SCRIPT_LFS_ROOT_PATH APP_LITTLEFS_MOUNT_PATH "/scripts"
 #define SCRIPT_CWASM_EXTENSION ".cwasm"
-
-typedef struct
-{
-    const char *label;
-    const char *path;
-    bool ensure_on_init;
-} script_root_t;
 
 typedef struct
 {
@@ -58,10 +51,6 @@ typedef struct
 } script_run_context_t;
 
 static const char *TAG = "script_svc";
-
-static const script_root_t s_script_roots[] = {
-    {"lfs", APP_LITTLEFS_MOUNT_PATH "/scripts", true},
-};
 
 static script_service_status_t s_status = SCRIPT_SERVICE_STATUS_UNINITIALIZED;
 static StaticSemaphore_t s_runtime_mutex_storage;
@@ -124,21 +113,6 @@ static void script_append_output(script_service_run_result_t *result, const char
     script_append_result_output(result, text, strlen(text));
 }
 
-static bool script_has_suffix(const char *path, const char *suffix)
-{
-    size_t path_len;
-    size_t suffix_len;
-
-    if (!path || !suffix)
-    {
-        return false;
-    }
-
-    path_len = strlen(path);
-    suffix_len = strlen(suffix);
-    return path_len >= suffix_len && strcmp(path + path_len - suffix_len, suffix) == 0;
-}
-
 static bool script_is_regular_file(const char *path)
 {
     struct stat st = {0};
@@ -152,6 +126,148 @@ static bool script_has_extension(const char *path)
     const char *dot = strrchr(path, '.');
 
     return dot && (!slash || dot > slash);
+}
+
+static bool script_is_name_char(char ch)
+{
+    return (ch >= 'a' && ch <= 'z') ||
+           (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9') ||
+           ch == '_' ||
+           ch == '-';
+}
+
+static bool script_is_supported_extension(const char *extension)
+{
+    if (!extension)
+    {
+        return false;
+    }
+
+    if (strcmp(extension, ".wasm") == 0 || strcmp(extension, SCRIPT_CWASM_EXTENSION) == 0)
+    {
+        return true;
+    }
+
+#if defined(CONFIG_WAMR_ENABLE_AOT) && CONFIG_WAMR_ENABLE_AOT != 0
+    if (strcmp(extension, ".aot") == 0)
+    {
+        return true;
+    }
+#endif
+
+    return false;
+}
+
+static esp_err_t script_parse_name(const char *input,
+                                   char *script_name,
+                                   size_t script_name_size,
+                                   const char **extension_out)
+{
+    const char *extension = NULL;
+    size_t name_len;
+
+    if (!input || input[0] == '\0' || !script_name || script_name_size == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (input[0] == '/' || strchr(input, '/') || strchr(input, '\\'))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(input, ".") == 0 || strcmp(input, "..") == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    extension = strrchr(input, '.');
+    name_len = extension ? (size_t)(extension - input) : strlen(input);
+    if (name_len == 0 || name_len + 1 > script_name_size)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (size_t index = 0; index < name_len; index++)
+    {
+        if (!script_is_name_char(input[index]))
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    if (extension && !script_is_supported_extension(extension))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memcpy(script_name, input, name_len);
+    script_name[name_len] = '\0';
+
+    if (extension_out)
+    {
+        *extension_out = extension;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t script_build_script_directory(const char *name,
+                                               char *out_path,
+                                               size_t out_path_size)
+{
+    char script_name[SCRIPT_SERVICE_MAX_PATH_LEN];
+    int written;
+    esp_err_t err = script_parse_name(name, script_name, sizeof(script_name), NULL);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    written = snprintf(out_path, out_path_size, "%s/%s", SCRIPT_LFS_ROOT_PATH, script_name);
+    if (written <= 0 || (size_t)written >= out_path_size)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t script_build_resolve_base_path(const char *name,
+                                                char *out_path,
+                                                size_t out_path_size,
+                                                bool *has_extension_out)
+{
+    char script_name[SCRIPT_SERVICE_MAX_PATH_LEN];
+    const char *extension = NULL;
+    int written;
+    esp_err_t err = script_parse_name(name, script_name, sizeof(script_name), &extension);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    written = snprintf(out_path,
+                       out_path_size,
+                       "%s/%s/%s%s",
+                       SCRIPT_LFS_ROOT_PATH,
+                       script_name,
+                       script_name,
+                       extension ? extension : "");
+    if (written <= 0 || (size_t)written >= out_path_size)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (has_extension_out)
+    {
+        *has_extension_out = extension != NULL;
+    }
+
+    return ESP_OK;
 }
 
 static bool script_copy_candidate(const char *candidate, char *out_path, size_t out_path_size)
@@ -214,95 +330,10 @@ static bool script_try_path_variants(const char *base_path, char *out_path, size
     return false;
 }
 
-static bool script_try_root(const char *root_path, const char *relative_path, char *out_path, size_t out_path_size)
-{
-    char candidate[SCRIPT_SERVICE_MAX_PATH_LEN];
-    const char *dot = NULL;
-    size_t directory_len = 0;
-    int written;
-
-    // Check if relative_path is just the script name (without extension or slash)
-    if (!strchr(relative_path, '/'))
-    {
-        dot = strrchr(relative_path, '.');
-        directory_len = dot ? (size_t)(dot - relative_path) : strlen(relative_path);
-
-        if (directory_len > 0)
-        {
-            written = snprintf(candidate,
-                               sizeof(candidate),
-                               "%s/%.*s/%s",
-                               root_path,
-                               (int)directory_len,
-                               relative_path,
-                               relative_path);
-            if (written > 0 && (size_t)written < sizeof(candidate) &&
-                script_copy_candidate(candidate, out_path, out_path_size))
-            {
-                return true;
-            }
-
-            if (!script_has_extension(relative_path))
-            {
-                written = snprintf(candidate,
-                                   sizeof(candidate),
-                                   "%s/%.*s/%s",
-                                   root_path,
-                                   (int)directory_len,
-                                   relative_path,
-                                   relative_path);
-                if (written > 0 && (size_t)written < sizeof(candidate) &&
-                    script_try_path_variants(candidate, out_path, out_path_size))
-                {
-                    return true;
-                }
-            }
-        }
-    }
-
-    written = snprintf(candidate, sizeof(candidate), "%s/%s", root_path, relative_path);
-    if (written <= 0 || (size_t)written >= sizeof(candidate))
-    {
-        return false;
-    }
-
-    return script_try_path_variants(candidate, out_path, out_path_size);
-}
-
 static script_service_run_mode_t script_detect_run_mode(const char *resolved_path)
 {
     (void)resolved_path;
     return SCRIPT_SERVICE_RUN_MODE_LIBC_BUILTIN;
-}
-
-static bool script_try_labeled_root(const char *path, char *out_path, size_t out_path_size)
-{
-    const char *separator = strchr(path, '/');
-
-    if (!separator)
-    {
-        return false;
-    }
-
-    size_t label_len = (size_t)(separator - path);
-    const char *relative_path = separator + 1;
-    size_t root_count = script_service_get_root_count();
-
-    if (*relative_path == '\0')
-    {
-        return false;
-    }
-
-    for (size_t index = 0; index < root_count; index++)
-    {
-        const char *label = script_service_get_root_label(index);
-        if (strlen(label) == label_len && strncmp(path, label, label_len) == 0)
-        {
-            return script_try_root(script_service_get_root_path(index), relative_path, out_path, out_path_size);
-        }
-    }
-
-    return false;
 }
 
 static void script_ensure_directory(const char *path)
@@ -981,18 +1012,7 @@ esp_err_t script_service_init(void)
         s_natives_registered = true;
     }
 
-    for (size_t index = 0; index < sizeof(s_script_roots) / sizeof(s_script_roots[0]); index++)
-    {
-        if (s_script_roots[index].ensure_on_init)
-        {
-            script_ensure_directory(s_script_roots[index].path);
-        }
-    }
-
-    if (cartridge_service_is_mounted())
-    {
-        script_ensure_directory(SCRIPT_SD_ROOT_PATH);
-    }
+    script_ensure_directory(SCRIPT_LFS_ROOT_PATH);
 
     if (!s_worker_thread_started)
     {
@@ -1061,47 +1081,41 @@ const char *script_service_run_mode_name(script_service_run_mode_t mode)
     }
 }
 
-size_t script_service_get_root_count(void)
+const char *script_service_get_root_path(void)
 {
-    return sizeof(s_script_roots) / sizeof(s_script_roots[0]);
+    return SCRIPT_LFS_ROOT_PATH;
 }
 
-const char *script_service_get_root_label(size_t index)
+esp_err_t script_service_get_script_directory(const char *name,
+                                              char *out_path,
+                                              size_t out_path_size)
 {
-    return index < script_service_get_root_count() ? s_script_roots[index].label : NULL;
-}
-
-const char *script_service_get_root_path(size_t index)
-{
-    return index < script_service_get_root_count() ? s_script_roots[index].path : NULL;
+    return script_build_script_directory(name, out_path, out_path_size);
 }
 
 esp_err_t script_service_resolve_path(const char *path, char *out_path, size_t out_path_size)
 {
+    char candidate[SCRIPT_SERVICE_MAX_PATH_LEN];
+    bool has_extension = false;
+    esp_err_t err;
+
     if (!path || path[0] == '\0' || !out_path || out_path_size == 0)
     {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (script_try_path_variants(path, out_path, out_path_size))
+    err = script_build_resolve_base_path(path, candidate, sizeof(candidate), &has_extension);
+    if (err != ESP_OK)
     {
-        return ESP_OK;
+        return err;
     }
 
-    if (script_try_labeled_root(path, out_path, out_path_size))
+    if (has_extension)
     {
-        return ESP_OK;
+        return script_copy_candidate(candidate, out_path, out_path_size) ? ESP_OK : ESP_ERR_NOT_FOUND;
     }
 
-    for (size_t index = 0; index < script_service_get_root_count(); index++)
-    {
-        if (script_try_root(script_service_get_root_path(index), path, out_path, out_path_size))
-        {
-            return ESP_OK;
-        }
-    }
-
-    return ESP_ERR_NOT_FOUND;
+    return script_try_path_variants(candidate, out_path, out_path_size) ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 esp_err_t script_service_run(const char *path,
@@ -1136,7 +1150,7 @@ esp_err_t script_service_run(const char *path,
 
     if (!path || path[0] == '\0')
     {
-        script_set_result_message(result, "script path is required");
+        script_set_result_message(result, "script name is required");
         free(owned_result);
         return ESP_ERR_INVALID_ARG;
     }
@@ -1168,7 +1182,16 @@ esp_err_t script_service_run(const char *path,
                                       sizeof(context->result.resolved_path));
     if (err != ESP_OK)
     {
-        script_set_result_message(result, "could not resolve %s", path);
+        if (err == ESP_ERR_INVALID_ARG)
+        {
+            script_set_result_message(result,
+                                      "script name must be a bare filename under %s",
+                                      script_service_get_root_path());
+        }
+        else
+        {
+            script_set_result_message(result, "could not resolve %s", path);
+        }
         free(context);
         free(owned_result);
         return err;

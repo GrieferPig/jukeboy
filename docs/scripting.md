@@ -4,36 +4,25 @@ The firmware embeds Espressif's WASMachine core and exposes a native host module
 
 ## Console commands
 
-- `script status` prints the service state, host module name, and configured roots.
-- `script roots` prints the root labels and backing directories.
-- `script ls [root|path]` lists all configured roots when no argument is given, or one root/path when an argument is provided.
-- `script resolve <path>` prints the fully resolved script path.
-- `script run <path> [args...]` runs a builtin module and forwards the remaining arguments to `main(argc, argv)`.
+- `script status` prints the service state, host module name, and fixed scripts root.
+- `script ls [name]` lists `/lfs/scripts` when no argument is given, or one script directory when a filename is provided.
+- `script run <name> [args...]` runs a builtin module and forwards the remaining arguments to `main(argc, argv)`.
 
 ## Script roots and resolution
 
-Configured roots:
-
-- `lfs` -> `/lfs/scripts`
-- `tmp` -> `/tmp/scripts`
-- `sd` -> `/sdcard/scripts`
-
 Resolver behavior:
 
-- Absolute paths are tried first.
-- Labeled paths such as `lfs/hello`, `tmp/demo`, and `sd/net-echo.wasm` resolve against the matching root.
-- Bare names are resolved by searching the configured roots.
-- If the provided path has no extension, the resolver also tries `.wasm`, `.cwasm`, and, when AOT support is enabled, `.aot`.
-- On hardware, bare names are searched in this order: `/lfs/scripts`, `/tmp/scripts`, `/sdcard/scripts`.
-- Under QEMU, bare names are searched in this order: `/sdcard/scripts`, `/tmp/scripts`, `/lfs/scripts`.
+- The only lookup root is `/lfs/scripts`.
+- Script inputs must be bare filenames. Absolute paths, directory separators, and traversal forms such as `..` are rejected.
+- Accepted filename characters are ASCII letters, digits, `_`, and `-`, with an optional `.wasm`, `.cwasm`, or `.aot` suffix.
+- `script run hello` resolves by probing `/lfs/scripts/hello/hello.wasm`, then `/lfs/scripts/hello/hello.cwasm`, and, when AOT support is enabled, `/lfs/scripts/hello/hello.aot`.
+- `script run hello.wasm` resolves only `/lfs/scripts/hello/hello.wasm`.
 
 Examples:
 
 - `script ls`
-- `script resolve hello`
+- `script ls hello`
 - `script run hello`
-- `script run lfs/hello`
-- `script run /sdcard/scripts/demo.wasm first second`
 - `script run hello.cwasm`
 
 ## Run results

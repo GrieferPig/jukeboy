@@ -1,40 +1,10 @@
 dependencies:
-  espressif/cmake_utilities:
-    dependencies: []
-    source:
-      path: C:\Users\GrieferPig\bttest\components\espressif__cmake_utilities
-      type: local
-    version: 0.5.3
-  espressif/network_provisioning:
-    dependencies: []
-    source:
-      path: C:\Users\GrieferPig\bttest\components\espressif__network_provisioning
-      type: local
-    version: 1.2.2
   espressif/wasm-micro-runtime:
     dependencies: []
     source:
       path: C:\Users\GrieferPig\bttest\components\espressif__wasm-micro-runtime
       type: local
     version: 2.4.0~1
-  espressif/wasmachine_data_sequence:
-    dependencies: []
-    source:
-      path: C:\Users\GrieferPig\bttest\components\espressif__wasmachine_data_sequence
-      type: local
-    version: 0.1.0~3
-  espressif/wasmachine_ext_wasm_native:
-    dependencies: []
-    source:
-      path: C:\Users\GrieferPig\bttest\components\espressif__wasmachine_ext_wasm_native
-      type: local
-    version: 0.5.0
-  espressif/wasmachine_ext_wasm_vfs:
-    dependencies: []
-    source:
-      path: C:\Users\GrieferPig\bttest\components\espressif__wasmachine_ext_wasm_vfs
-      type: local
-    version: 0.1.1~1
   idf:
     source:
       type: idf
@@ -50,14 +20,9 @@ dependencies:
       type: service
     version: 1.20.4
 direct_dependencies:
-- espressif/cmake_utilities
-- espressif/network_provisioning
 - espressif/wasm-micro-runtime
-- espressif/wasmachine_data_sequence
-- espressif/wasmachine_ext_wasm_native
-- espressif/wasmachine_ext_wasm_vfs
 - idf
 - joltwallet/littlefs
-manifest_hash: 0eaf8918ed16faf6ea52836057de6fd12a6ce88ad1a1779456e50e5c119bc759
+manifest_hash: 054233240ae4f6bec000853f0abffe2ed04d7a6601aea62789161283c5d14a4c
 target: esp32
 version: 2.0.0

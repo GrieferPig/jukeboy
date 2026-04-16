@@ -12,14 +12,6 @@
 
 #include "wasm_export.h"
 
-#ifdef CONFIG_WASMACHINE_WASM_EXT_NATIVE
-#include "wm_ext_wasm_native.h"
-#endif
-
-#ifdef CONFIG_WASMACHINE_EXT_VFS
-#include "wm_ext_wasm_vfs.h"
-#endif
-
 #include "wm_wamr.h"
 
 #define MALLOC_ALIGN_SIZE       8
@@ -78,12 +70,4 @@ void wm_wamr_init(void)
     init_args.mem_alloc_option.allocator.free_func    = wamr_free;
 
     assert(wasm_runtime_full_init(&init_args));
-
-#ifdef CONFIG_WASMACHINE_WASM_EXT_NATIVE
-    wm_ext_wasm_native_export();
-#endif
-
-#ifdef CONFIG_WASMACHINE_EXT_VFS
-    wm_ext_wasm_vfs_init();
-#endif
 }

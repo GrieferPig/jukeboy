@@ -1,10 +1,6 @@
 menu "WASMachine Configuration"
     orsource "../wasmachine_core/Kconfig.wasmachine"
     orsource "../espressif__wasmachine_core/Kconfig.wasmachine"
-    orsource "../wasmachine_ext_wasm_native/Kconfig.wasmachine"
-    orsource "../espressif__wasmachine_ext_wasm_native/Kconfig.wasmachine"
-    orsource "../wasmachine_ext_wasm_vfs/Kconfig.wasmachine"
-    orsource "../espressif__wasmachine_ext_wasm_vfs/Kconfig.wasmachine"
     orsource "../wasmachine_shell/Kconfig.wasmachine"
     orsource "../espressif__wasmachine_shell/Kconfig.wasmachine"
 endmenu

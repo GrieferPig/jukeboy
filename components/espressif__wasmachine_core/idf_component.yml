@@ -1,15 +1,7 @@
 dependencies:
-  cmake_utilities:
-    version: ==0.*
   idf: '>=5.1'
   wasm-micro-runtime:
     version: ==2.*
-  wasmachine_data_sequence:
-    version: ==0.*
-  wasmachine_ext_wasm_native:
-    version: ==0.*
-  wasmachine_ext_wasm_vfs:
-    version: ==0.*
 description: Espressif WASMachine core component
 issues: https://github.com/espressif/esp-wasmachine/issues
 repository: git://github.com/espressif/esp-wasmachine.git
