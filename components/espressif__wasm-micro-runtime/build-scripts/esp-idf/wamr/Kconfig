@@ -47,6 +47,11 @@ menu "WASM Micro Runtime"
         bool "Lib pthread"
         default y
 
+    config WAMR_ENABLE_LIB_PTHREAD_SEMAPHORE
+        bool "Lib pthread semaphore"
+        default n
+        depends on WAMR_ENABLE_LIB_PTHREAD
+
     config WAMR_ENABLE_LIBC_BUILTIN
         bool "Libc builtin"
         default y
@@ -54,6 +59,27 @@ menu "WASM Micro Runtime"
     config WAMR_ENABLE_LIBC_WASI
         bool "Libc WASI"
         default y
+
+    config WAMR_ENABLE_LIB_WASI_THREADS
+        bool "Lib wasi-threads"
+        default n
+        depends on WAMR_ENABLE_LIBC_WASI
+
+    config WAMR_ENABLE_BULK_MEMORY
+        bool "Bulk memory"
+        default y
+
+    config WAMR_ENABLE_TAIL_CALL
+        bool "Tail call"
+        default n
+
+    config WAMR_ENABLE_EXTENDED_CONST_EXPR
+        bool "Extended const expressions"
+        default n
+
+    config WAMR_ENABLE_EXCE_HANDLING
+        bool "Exception handling"
+        default n
 
     config WAMR_ENABLE_MEMORY_PROFILING
         bool "Memory profiling"
@@ -69,11 +95,40 @@ menu "WASM Micro Runtime"
 
     config WAMR_ENABLE_REF_TYPES
         bool "Reference types"
-        default n
+        default y
 
     config WAMR_ENABLE_SHARED_MEMORY
         bool "Shared memory"
         default n
+
+    config WAMR_ENABLE_SHARED_HEAP
+        bool "Shared heap"
+        default n
+
+    config WAMR_ENABLE_THREAD_MGR
+        bool "Thread manager"
+        default n
+
+    config WAMR_ENABLE_CUSTOM_NAME_SECTION
+        bool "Custom name section"
+        default n
+
+    config WAMR_ENABLE_DUMP_CALL_STACK
+        bool "Dump call stack"
+        default n
+
+    config WAMR_ENABLE_LOAD_CUSTOM_SECTION
+        bool "Load custom sections"
+        default n
+
+    config WAMR_ENABLE_DEBUG_INTERP
+        bool "Debug interpreter"
+        default n
+        depends on WAMR_ENABLE_INTERP
+
+    config WAMR_ENABLE_SHRUNK_MEMORY
+        bool "Shrunk memory"
+        default y
 
     menuconfig WAMR_ENABLE_APP_FRAMEWORK
         bool "App framework"

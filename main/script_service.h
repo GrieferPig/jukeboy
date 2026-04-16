@@ -14,6 +14,7 @@ extern "C"
 #define SCRIPT_SERVICE_HOST_MODULE_NAME "jukeboy"
 #define SCRIPT_SERVICE_MAX_PATH_LEN 256
 #define SCRIPT_SERVICE_MAX_MESSAGE_LEN 160
+#define SCRIPT_SERVICE_MAX_OUTPUT_LEN 2048
 
     typedef enum
     {
@@ -27,6 +28,7 @@ extern "C"
     {
         char resolved_path[SCRIPT_SERVICE_MAX_PATH_LEN];
         char message[SCRIPT_SERVICE_MAX_MESSAGE_LEN];
+        char output[SCRIPT_SERVICE_MAX_OUTPUT_LEN];
         uint32_t script_size_bytes;
         int32_t exit_code;
     } script_service_run_result_t;

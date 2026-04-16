@@ -1,0 +1,9 @@
+[package]
+name = "google-get"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+jukeboy = { path = "../../jukeboy" }
+jukeboy-net = { path = "../../jukeboy-net" }

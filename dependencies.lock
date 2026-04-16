@@ -1,9 +1,13 @@
 dependencies:
   espressif/cmake_utilities:
-    dependencies: []
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
     source:
-      path: C:\Users\GrieferPig\bttest\components\espressif__cmake_utilities
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
     version: 0.5.3
   espressif/extended_vfs:
     dependencies: []
@@ -42,10 +46,14 @@ dependencies:
       type: local
     version: 0.1.1~1
   espressif/wasmachine_shell:
-    dependencies: []
+    component_hash: 099cded980fc98877ed46cc9f4bdb7a9dea9c6c509f7906018625ebc0be1b92b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.1'
     source:
-      path: C:\Users\GrieferPig\bttest\components\espressif__wasmachine_shell
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
     version: 0.1.1~1
   idf:
     source:
@@ -72,6 +80,6 @@ direct_dependencies:
 - espressif/wasmachine_shell
 - idf
 - joltwallet/littlefs
-manifest_hash: 24aeb6799c052cdb6bfd8f50d1fe8f7ea8ad8477f9f5a7b42dd92ff0a439c915
+manifest_hash: 7c479aa95bb98a6bb244310ce0b2d72019a5a2a63098eb3466c083b601d21b08
 target: esp32
 version: 2.0.0

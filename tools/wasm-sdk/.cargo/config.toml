@@ -1,0 +1,5 @@
+[build]
+target = "wasm32-wasip1"
+
+[alias]
+build-examples = "build --release -p hello -p google-get -p player-control -p net-echo"

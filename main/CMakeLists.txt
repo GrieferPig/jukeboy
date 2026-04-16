@@ -5,11 +5,11 @@ idf_component_register(SRCS "main.c"
                        "bluetooth_service.c"
                        "cartridge_service.c"
                        "console_service.c"
-                       "esp_flash_dispatcher.c"
                        "ftp_service.c"
                        "i2s_service.c"
                        "player_service.c"
                        "power_mgmt_service.c"
+                       "qemu_openeth_service.c"
                        "qemu_pcm_service.c"
                        "ramdisk_service.c"
                        "runtime_env.c"
@@ -22,7 +22,6 @@ idf_component_register(SRCS "main.c"
 
 set(FLASHFS_SOURCE_DIR "${CMAKE_SOURCE_DIR}/flashfs")
 set(FLASHFS_STAGE_DIR "${CMAKE_BINARY_DIR}/flashfs_image")
-set(QEMU_SD_IMAGE "${CMAKE_BINARY_DIR}/sd_image.bin")
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
@@ -32,26 +31,8 @@ add_custom_target(stage_flashfs ALL
                   COMMAND ${CMAKE_COMMAND} -E copy_directory "${FLASHFS_SOURCE_DIR}" "${FLASHFS_STAGE_DIR}"
                   VERBATIM)
 
-add_custom_command(OUTPUT "${QEMU_SD_IMAGE}"
-          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ensure_sd_image.py"
-              --image-path "${QEMU_SD_IMAGE}"
-              --size-bytes "1073741824"
-              --source-dir "${CMAKE_SOURCE_DIR}/tools/out"
-          COMMENT "Generating QEMU SD image from tools/out"
-                  VERBATIM)
-
-add_custom_target(qemu_sd_image ALL
-                  DEPENDS "${QEMU_SD_IMAGE}")
-
 littlefs_create_partition_image(littlefs "${FLASHFS_STAGE_DIR}" FLASH_IN_PROJECT DEPENDS stage_flashfs)
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
                            CONFIG_FTP_USER=\"${CONFIG_FTP_SVC_USER}\"
                            CONFIG_FTP_PASSWORD=\"${CONFIG_FTP_SVC_PASSWORD}\")
-
-target_link_libraries(${COMPONENT_LIB} INTERFACE
-                      "-Wl,--wrap=esp_flash_read"
-                      "-Wl,--wrap=esp_flash_write"
-                      "-Wl,--wrap=esp_flash_write_encrypted"
-                      "-Wl,--wrap=esp_flash_erase_region"
-                      "-Wl,--wrap=esp_flash_erase_chip")

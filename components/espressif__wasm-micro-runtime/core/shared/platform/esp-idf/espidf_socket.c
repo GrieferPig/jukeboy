@@ -154,7 +154,11 @@ os_socket_bind(bh_socket_t socket, const char *host, int *port)
     }
 
     ret = setsockopt(socket, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
-    if (ret < 0) {
+    if (ret < 0 && errno != ENOPROTOOPT && errno != EOPNOTSUPP
+#ifdef ENOSYS
+        && errno != ENOSYS
+#endif
+    ) {
         goto fail;
     }
 

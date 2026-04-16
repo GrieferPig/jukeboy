@@ -79,3 +79,5 @@ tools/out
 
 qemu*/**
 /qemu-official-9.0.0/
+
+flashfs/scripts/**/*

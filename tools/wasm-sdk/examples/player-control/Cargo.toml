@@ -1,0 +1,8 @@
+[package]
+name = "player-control"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+jukeboy = { path = "../../jukeboy" }

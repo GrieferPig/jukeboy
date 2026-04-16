@@ -20,6 +20,7 @@
 #define QEMU_PCM_SVC_REG_BUFFER_SIZE 0x10u
 #define QEMU_PCM_SVC_REG_CURRENT_BUFFER 0x20u
 #define QEMU_PCM_SVC_REG_QUEUED_MASK 0x24u
+#define QEMU_PCM_SVC_REG_UNDERRUN_COUNT 0x28u
 #define QEMU_PCM_SVC_REG_BUFFER0_LENGTH 0x2cu
 #define QEMU_PCM_SVC_REG_BUFFER1_LENGTH 0x30u
 #define QEMU_PCM_SVC_REG_BUFFER0_SUBMIT 0x34u
@@ -34,7 +35,7 @@
 #define QEMU_PCM_SVC_TASK_STACK_SIZE 3072
 #define QEMU_PCM_SVC_TASK_PRIORITY 6
 #define QEMU_PCM_SVC_QUEUE_DEPTH 4
-#define QEMU_PCM_SVC_POLL_MS 5
+#define QEMU_PCM_SVC_POLL_MS 10
 
 static const char *TAG = "qemu_pcm_svc";
 
@@ -69,9 +70,16 @@ static inline void qemu_pcm_service_reg_write(uint32_t offset, uint32_t value)
     *(volatile uint32_t *)(QEMU_PCM_SVC_REG_BASE + offset) = value;
 }
 
-static bool qemu_pcm_service_buffer_is_free(unsigned index, uint32_t current_buffer, uint32_t queued_mask)
+static TickType_t qemu_pcm_service_poll_ticks(void)
 {
-    return current_buffer != index && (queued_mask & BIT(index)) == 0;
+    TickType_t poll_ticks = pdMS_TO_TICKS(QEMU_PCM_SVC_POLL_MS);
+
+    if (poll_ticks == 0)
+    {
+        poll_ticks = 1;
+    }
+
+    return poll_ticks;
 }
 
 static bool qemu_pcm_service_fill_buffer(unsigned index)
@@ -120,12 +128,17 @@ static bool qemu_pcm_service_fill_buffer(unsigned index)
 
 static void qemu_pcm_service_fill_free_buffers(void)
 {
-    uint32_t current_buffer = qemu_pcm_service_reg_read(QEMU_PCM_SVC_REG_CURRENT_BUFFER);
+    /* Read only QUEUED_MASK.  Reading CURRENT_BUFFER in a separate non-atomic
+     * MMIO access creates a TOCTOU race: if the miniaudio thread clears a
+     * buffer between the two reads we see a stale current_buffer value and
+     * skip a genuinely-free buffer for an entire poll cycle.  QUEUED_MASK is
+     * the canonical free-buffer indicator — a buffer's bit is cleared only
+     * when it is fully consumed. */
     uint32_t queued_mask = qemu_pcm_service_reg_read(QEMU_PCM_SVC_REG_QUEUED_MASK);
 
     for (unsigned index = 0; index < 2; ++index)
     {
-        if (!qemu_pcm_service_buffer_is_free(index, current_buffer, queued_mask))
+        if (queued_mask & BIT(index))
         {
             continue;
         }
@@ -136,10 +149,16 @@ static void qemu_pcm_service_fill_free_buffers(void)
         }
 
         queued_mask |= BIT(index);
-        if (current_buffer == UINT32_MAX)
-        {
-            current_buffer = index;
-        }
+    }
+
+    static uint32_t s_last_underrun_count = 0;
+    uint32_t underrun_count = qemu_pcm_service_reg_read(QEMU_PCM_SVC_REG_UNDERRUN_COUNT);
+    if (underrun_count != s_last_underrun_count)
+    {
+        ESP_LOGW(TAG, "PCM underrun count: %u (+%u)",
+                 (unsigned)underrun_count,
+                 (unsigned)(underrun_count - s_last_underrun_count));
+        s_last_underrun_count = underrun_count;
     }
 }
 
@@ -178,6 +197,7 @@ static void qemu_pcm_service_process_cmd(const qemu_pcm_service_msg_t *msg)
 static void qemu_pcm_service_task(void *param)
 {
     (void)param;
+    const TickType_t poll_ticks = qemu_pcm_service_poll_ticks();
     qemu_pcm_service_msg_t msg;
 
     for (;;)
@@ -202,7 +222,7 @@ static void qemu_pcm_service_task(void *param)
         }
 
         qemu_pcm_service_fill_free_buffers();
-        vTaskDelay(pdMS_TO_TICKS(QEMU_PCM_SVC_POLL_MS));
+        vTaskDelay(poll_ticks);
     }
 }
 

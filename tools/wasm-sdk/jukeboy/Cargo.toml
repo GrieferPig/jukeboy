@@ -1,0 +1,11 @@
+[package]
+name = "jukeboy"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+jukeboy-sys = { path = "../jukeboy-sys" }
+
+[lib]
+path = "src/lib.rs"

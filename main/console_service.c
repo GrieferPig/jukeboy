@@ -16,7 +16,7 @@
 #include "esp_wifi.h"
 #include "argtable3/argtable3.h"
 
-#include "esp_flash_dispatcher.h"
+// #include "esp_flash_dispatcher.h"
 #include "bluetooth_service.h"
 #include "ftp_service.h"
 #include "wifi_service.h"
@@ -1039,91 +1039,91 @@ static void register_telemetry(void)
 
 /* ── flash ──────────────────────────────────────────────────────────── */
 
-static void print_u64_decimal(uint64_t value)
-{
-    char buffer[32];
-    size_t index = sizeof(buffer) - 1;
+// static void print_u64_decimal(uint64_t value)
+// {
+//     char buffer[32];
+//     size_t index = sizeof(buffer) - 1;
 
-    buffer[index] = '\0';
-    do
-    {
-        buffer[--index] = (char)('0' + (value % 10U));
-        value /= 10U;
-    } while (value > 0U);
+//     buffer[index] = '\0';
+//     do
+//     {
+//         buffer[--index] = (char)('0' + (value % 10U));
+//         value /= 10U;
+//     } while (value > 0U);
 
-    printf("%s", &buffer[index]);
-}
+//     printf("%s", &buffer[index]);
+// }
 
-static int flash_status_handler(int argc, char **argv)
-{
-    esp_flash_dispatcher_status_t status;
-    esp_err_t err = esp_flash_dispatcher_get_status(&status);
-    if (err != ESP_OK)
-    {
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
+// static int flash_status_handler(int argc, char **argv)
+// {
+//     esp_flash_dispatcher_status_t status;
+//     esp_err_t err = esp_flash_dispatcher_get_status(&status);
+//     if (err != ESP_OK)
+//     {
+//         printf("Error: %s\n", esp_err_to_name(err));
+//         return 1;
+//     }
 
-    printf("Pending writes: %u\n", (unsigned)status.pending_write_count);
-    printf("Pending bytes:  %u\n", (unsigned)status.pending_write_bytes);
-    printf("Arena free:     %u\n", (unsigned)status.arena_free_bytes);
-    printf("Last flush:     ");
-    print_u64_decimal(status.last_flush_time_us);
-    printf(" us\n");
-    return 0;
-}
+//     printf("Pending writes: %u\n", (unsigned)status.pending_write_count);
+//     printf("Pending bytes:  %u\n", (unsigned)status.pending_write_bytes);
+//     printf("Arena free:     %u\n", (unsigned)status.arena_free_bytes);
+//     printf("Last flush:     ");
+//     print_u64_decimal(status.last_flush_time_us);
+//     printf(" us\n");
+//     return 0;
+// }
 
-static int flash_flush_handler(int argc, char **argv)
-{
-    uint64_t write_time_us = 0;
-    esp_err_t err = esp_flash_dispatcher_flush_writes(&write_time_us);
-    if (err != ESP_OK)
-    {
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
+// static int flash_flush_handler(int argc, char **argv)
+// {
+//     uint64_t write_time_us = 0;
+//     esp_err_t err = esp_flash_dispatcher_flush_writes(&write_time_us);
+//     if (err != ESP_OK)
+//     {
+//         printf("Error: %s\n", esp_err_to_name(err));
+//         return 1;
+//     }
 
-    esp_flash_dispatcher_status_t status;
-    err = esp_flash_dispatcher_get_status(&status);
-    if (err != ESP_OK)
-    {
-        printf("Flushed queued writes in ");
-        print_u64_decimal(write_time_us);
-        printf(" us\n");
-        return 0;
-    }
+//     esp_flash_dispatcher_status_t status;
+//     err = esp_flash_dispatcher_get_status(&status);
+//     if (err != ESP_OK)
+//     {
+//         printf("Flushed queued writes in ");
+//         print_u64_decimal(write_time_us);
+//         printf(" us\n");
+//         return 0;
+//     }
 
-    printf("Flushed queued writes in ");
-    print_u64_decimal(write_time_us);
-    printf(" us\n");
-    printf("Remaining queued writes: %u (%u bytes)\n",
-           (unsigned)status.pending_write_count,
-           (unsigned)status.pending_write_bytes);
-    return 0;
-}
+//     printf("Flushed queued writes in ");
+//     print_u64_decimal(write_time_us);
+//     printf(" us\n");
+//     printf("Remaining queued writes: %u (%u bytes)\n",
+//            (unsigned)status.pending_write_count,
+//            (unsigned)status.pending_write_bytes);
+//     return 0;
+// }
 
-static int cmd_flash(int argc, char **argv)
-{
-    static const char *usage =
-        "Usage: flash <subcommand>\n"
-        "  status    Show queued write count, bytes, arena free space, and last flush time\n"
-        "  flush     Write all queued writes to flash and print elapsed time\n";
+// static int cmd_flash(int argc, char **argv)
+// {
+//     static const char *usage =
+//         "Usage: flash <subcommand>\n"
+//         "  status    Show queued write count, bytes, arena free space, and last flush time\n"
+//         "  flush     Write all queued writes to flash and print elapsed time\n";
 
-    if (argc < 2)
-    {
-        printf("%s", usage);
-        return 1;
-    }
+//     if (argc < 2)
+//     {
+//         printf("%s", usage);
+//         return 1;
+//     }
 
-    const char *sub = argv[1];
-    if (strcmp(sub, "status") == 0)
-        return flash_status_handler(argc - 1, argv + 1);
-    if (strcmp(sub, "flush") == 0)
-        return flash_flush_handler(argc - 1, argv + 1);
+//     const char *sub = argv[1];
+//     if (strcmp(sub, "status") == 0)
+//         return flash_status_handler(argc - 1, argv + 1);
+//     if (strcmp(sub, "flush") == 0)
+//         return flash_flush_handler(argc - 1, argv + 1);
 
-    printf("Unknown subcommand '%s'.\n%s", sub, usage);
-    return 1;
-}
+//     printf("Unknown subcommand '%s'.\n%s", sub, usage);
+//     return 1;
+// }
 
 /* ════════════════════════════════════════════════════════════════════ *
  *  FTP server commands                                               *
@@ -1519,24 +1519,21 @@ static int script_list_directory(const char *path)
             continue;
         }
 
-        char entry_path[SCRIPT_SERVICE_MAX_PATH_LEN];
-        struct stat entry_stat = {0};
-        int printed = snprintf(entry_path, sizeof(entry_path), "%s/%s", path, entry->d_name);
-
-        if (printed < 0 || (size_t)printed >= sizeof(entry_path) || stat(entry_path, &entry_stat) != 0)
+#if defined(DT_DIR) && defined(DT_REG) && defined(DT_UNKNOWN)
+        if (entry->d_type == DT_DIR)
         {
-            printf("  %s\n", entry->d_name);
+            printf("  [dir]  %s/\n", entry->d_name);
             continue;
         }
 
-        if (S_ISDIR(entry_stat.st_mode))
-        {
-            printf("  [dir]  %s/\n", entry->d_name);
-        }
-        else
+        if (entry->d_type == DT_REG)
         {
             printf("  [file] %s\n", entry->d_name);
+            continue;
         }
+#endif
+
+        printf("  %s\n", entry->d_name);
     }
 
     closedir(dir);
@@ -1549,6 +1546,23 @@ static void script_print_status(void)
     printf("Host module:    %s\n", SCRIPT_SERVICE_HOST_MODULE_NAME);
     printf("Search roots:\n");
     script_print_roots();
+}
+
+static void script_print_output(const char *output)
+{
+    size_t output_len;
+
+    if (!output || output[0] == '\0')
+    {
+        return;
+    }
+
+    output_len = strlen(output);
+    printf("Output:\n%s", output);
+    if (output_len == 0 || output[output_len - 1] != '\n')
+    {
+        printf("\n");
+    }
 }
 
 static int cmd_script(int argc, char **argv)
@@ -1625,7 +1639,7 @@ static int cmd_script(int argc, char **argv)
 
     if (strcmp(argv[1], "run") == 0)
     {
-        script_service_run_result_t result = {0};
+        script_service_run_result_t *result = NULL;
         const char *const *script_argv = NULL;
         int script_argc = 0;
         esp_err_t err;
@@ -1642,27 +1656,39 @@ static int cmd_script(int argc, char **argv)
             script_argv = (const char *const *)&argv[3];
         }
 
-        err = script_service_run(argv[2], script_argc, script_argv, &result);
-        if (err != ESP_OK)
+        result = calloc(1, sizeof(*result));
+        if (!result)
         {
-            if (result.resolved_path[0] != '\0')
-            {
-                printf("Resolved:  %s\n", result.resolved_path);
-            }
-            printf("Error: %s\n",
-                   result.message[0] != '\0' ? result.message : esp_err_to_name(err));
+            printf("Error: out of memory\n");
             return 1;
         }
 
-        printf("Resolved:  %s\n", result.resolved_path);
-        printf("Size:      %u bytes\n", (unsigned)result.script_size_bytes);
-        printf("Exit code: %ld\n", (long)result.exit_code);
-        if (result.message[0] != '\0')
+        err = script_service_run(argv[2], script_argc, script_argv, result);
+        if (err != ESP_OK)
         {
-            printf("Result:    %s\n", result.message);
+            if (result->resolved_path[0] != '\0')
+            {
+                printf("Resolved:  %s\n", result->resolved_path);
+            }
+            script_print_output(result->output);
+            printf("Error: %s\n",
+                   result->message[0] != '\0' ? result->message : esp_err_to_name(err));
+            free(result);
+            return 1;
         }
 
-        return result.exit_code == 0 ? 0 : 1;
+        printf("Resolved:  %s\n", result->resolved_path);
+        printf("Size:      %u bytes\n", (unsigned)result->script_size_bytes);
+        printf("Exit code: %ld\n", (long)result->exit_code);
+        script_print_output(result->output);
+        if (result->message[0] != '\0')
+        {
+            printf("Result:    %s\n", result->message);
+        }
+
+        err = result->exit_code == 0 ? 0 : 1;
+        free(result);
+        return err;
     }
 
     printf("Unknown subcommand '%s'.\n%s", argv[1], usage);
@@ -1800,13 +1826,13 @@ esp_err_t console_service_init(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&media_cmd));
 
-    const esp_console_cmd_t flash_cmd = {
-        .command = "flash",
-        .help = "Flash dispatcher: flash <status|flush>",
-        .hint = NULL,
-        .func = cmd_flash,
-    };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&flash_cmd));
+    // const esp_console_cmd_t flash_cmd = {
+    //     .command = "flash",
+    //     .help = "Flash dispatcher: flash <status|flush>",
+    //     .hint = NULL,
+    //     .func = cmd_flash,
+    // };
+    // ESP_ERROR_CHECK(esp_console_cmd_register(&flash_cmd));
 
     const esp_console_cmd_t ftp_cmd = {
         .command = "ftp",

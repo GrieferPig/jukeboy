@@ -7,7 +7,7 @@
 #include "nvs_flash.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
-#include "esp_flash_dispatcher.h"
+// #include "esp_flash_dispatcher.h"
 #include "esp_gap_bt_api.h"
 #include "esp_littlefs.h"
 #include "esp_eth.h"
@@ -23,9 +23,11 @@
 #include "i2s_service.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
+#include "qemu_openeth_service.h"
 #include "qemu_pcm_service.h"
 #include "ramdisk_service.h"
 #include "runtime_env.h"
+#include "script_service.h"
 #include "storage_paths.h"
 #include "wifi_service.h"
 
@@ -34,7 +36,7 @@ static const bool QEMU_PCM_SERVICE_ENABLED = true;
 
 void app_main(void)
 {
-    const esp_flash_dispatcher_config_t flash_dispatcher_cfg = ESP_FLASH_DISPATCHER_DEFAULT_CONFIG;
+    // const esp_flash_dispatcher_config_t flash_dispatcher_cfg = ESP_FLASH_DISPATCHER_DEFAULT_CONFIG;
     const esp_vfs_littlefs_conf_t littlefs_cfg = {
         .base_path = APP_LITTLEFS_MOUNT_PATH,
         .partition_label = APP_LITTLEFS_PARTITION_LABEL,
@@ -58,7 +60,7 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(power_mgmt_service_init());
-    ESP_ERROR_CHECK(esp_flash_dispatcher_init(&flash_dispatcher_cfg));
+    // ESP_ERROR_CHECK(esp_flash_dispatcher_init(&flash_dispatcher_cfg));
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(ramdisk_service_init());
@@ -70,8 +72,19 @@ void app_main(void)
         ESP_ERROR_CHECK(cartridge_service_init(&cart_cfg));
 
 #if CONFIG_ETH_USE_OPENETH
-        ESP_LOGW(TAG,
-                 "skipping QEMU open_eth init; the ESP32 cache model still faults after DHCP on the emulated Ethernet path");
+        esp_err_t eth_err = qemu_openeth_service_init();
+        if (eth_err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "QEMU OpenETH init failed: %s", esp_err_to_name(eth_err));
+        }
+        else
+        {
+            eth_err = qemu_openeth_service_wait_for_ip(15000);
+            if (eth_err != ESP_OK)
+            {
+                ESP_LOGW(TAG, "QEMU OpenETH did not obtain an IPv4 lease within the startup window");
+            }
+        }
 #endif /* CONFIG_ETH_USE_OPENETH */
 
         ESP_ERROR_CHECK(ftp_service_init());
@@ -79,9 +92,32 @@ void app_main(void)
 
         if (QEMU_PCM_SERVICE_ENABLED)
         {
-            ESP_ERROR_CHECK(qemu_pcm_service_init());
-            ESP_ERROR_CHECK(qemu_pcm_service_register_pcm_provider(player_service_qemu_pcm_provider, NULL));
-            ESP_ERROR_CHECK(qemu_pcm_service_start_audio());
+            esp_err_t pcm_err = qemu_pcm_service_init();
+            if (pcm_err != ESP_OK)
+            {
+                ESP_LOGW(TAG, "QEMU PCM unavailable: %s", esp_err_to_name(pcm_err));
+            }
+            else
+            {
+                pcm_err = qemu_pcm_service_register_pcm_provider(player_service_qemu_pcm_provider, NULL);
+                if (pcm_err != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "failed to register QEMU PCM provider: %s", esp_err_to_name(pcm_err));
+                }
+                else
+                {
+                    pcm_err = qemu_pcm_service_start_audio();
+                    if (pcm_err != ESP_OK)
+                    {
+                        ESP_LOGW(TAG, "failed to start QEMU PCM audio: %s", esp_err_to_name(pcm_err));
+                    }
+                }
+            }
+        }
+
+        if (script_service_init() != ESP_OK)
+        {
+            ESP_LOGW(TAG, "script service init failed; continuing without WASM console support");
         }
 
         ESP_ERROR_CHECK(console_service_init());
@@ -114,5 +150,11 @@ void app_main(void)
 
     ESP_ERROR_CHECK(ftp_service_init());
     ESP_ERROR_CHECK(player_service_init());
+
+    if (script_service_init() != ESP_OK)
+    {
+        ESP_LOGW(TAG, "script service init failed; continuing without WASM console support");
+    }
+
     ESP_ERROR_CHECK(console_service_init());
 }

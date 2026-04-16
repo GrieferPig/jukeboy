@@ -60,8 +60,8 @@
 #define PLAYER_SVC_NVS_NAMESPACE "player_service"
 #define PLAYER_SVC_NVS_KEY_RESUME "resume"
 #define PLAYER_SVC_RESUME_STATE_VERSION 1U
-#define PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS 10
-#define PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS 2
+#define PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS 100
+#define PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS 100
 
 #define PLAYER_SVC_VOLUME_LEVEL_COUNT 11
 #define PLAYER_SVC_DEFAULT_VOLUME_LEVEL (PLAYER_SVC_VOLUME_LEVEL_COUNT - 1)
@@ -234,6 +234,18 @@ static StreamBufferHandle_t player_service_create_pcm_stream(void)
              "using %u-byte QEMU PCM stream buffer",
              (unsigned)PLAYER_SVC_QEMU_PCM_STREAM_BUF_SIZE);
     return xStreamBufferCreate(PLAYER_SVC_QEMU_PCM_STREAM_BUF_SIZE, 1);
+}
+
+static TickType_t player_service_qemu_pcm_wait_ticks(uint32_t wait_ms)
+{
+    TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
+
+    if (wait_ticks == 0)
+    {
+        wait_ticks = 1;
+    }
+
+    return wait_ticks;
 }
 
 static const char *player_service_playlist_filename(size_t index)
@@ -2104,7 +2116,7 @@ int32_t player_service_qemu_pcm_provider(uint8_t *data, int32_t len, void *user_
 
     target = (size_t)len;
 
-    if (!s_pcm_stream || s_paused)
+    if (!s_pcm_stream || s_paused || !s_playing)
     {
         memset(data, 0, target);
         return len;
@@ -2112,8 +2124,8 @@ int32_t player_service_qemu_pcm_provider(uint8_t *data, int32_t len, void *user_
 
     while (received < target)
     {
-        TickType_t wait_ticks = pdMS_TO_TICKS(received == 0 ? PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS
-                                                            : PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS);
+        TickType_t wait_ticks = player_service_qemu_pcm_wait_ticks(received == 0 ? PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS
+                                                                                 : PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS);
         size_t chunk = xStreamBufferReceive(s_pcm_stream,
                                             data + received,
                                             target - received,
@@ -2132,5 +2144,5 @@ int32_t player_service_qemu_pcm_provider(uint8_t *data, int32_t len, void *user_
     }
 
     player_service_apply_volume(data, received);
-    return len;
+    return (int32_t)received;
 }
