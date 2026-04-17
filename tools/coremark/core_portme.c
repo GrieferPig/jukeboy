@@ -22,12 +22,12 @@ Original Author: Shay Gal-on
 #include "coremark.h"
 
 __attribute__((import_module("jukeboy")))
-__attribute__((import_name("log")))
-int jukeboy_log(const char *message);
+__attribute__((import_name("log"))) int
+jukeboy_log(const char *message);
 
 __attribute__((import_module("jukeboy")))
-__attribute__((import_name("get_uptime_ms")))
-long long jukeboy_get_uptime_ms(void);
+__attribute__((import_name("get_uptime_ms"))) long long
+jukeboy_get_uptime_ms(void);
 
 #define EE_TICKS_PER_SEC 1000U
 

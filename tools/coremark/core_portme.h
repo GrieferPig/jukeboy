@@ -69,7 +69,7 @@ typedef size_t ee_size_t;
 typedef ee_u32 CORETIMETYPE;
 typedef ee_u32 CORE_TICKS;
 
-#define align_mem(x) (void *)(4 + (((ee_ptr_int)(x)-1) & ~3))
+#define align_mem(x) (void *)(4 + (((ee_ptr_int)(x) - 1) & ~3))
 
 #ifndef SEED_METHOD
 #define SEED_METHOD SEED_ARG

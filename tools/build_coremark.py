@@ -103,9 +103,15 @@ def build_coremark(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build CoreMark as wasm and Xtensa AOT, then stage it into flashfs/scripts.")
+    parser = argparse.ArgumentParser(
+        description="Build CoreMark as wasm and Xtensa AOT, then stage it into flashfs/scripts."
+    )
     parser.add_argument("--script-name", default="coremark")
-    parser.add_argument("--wamrc", default=DEFAULT_WAMRC, help="Path to the Linux wamrc binary relative to the repo root")
+    parser.add_argument(
+        "--wamrc",
+        default=DEFAULT_WAMRC,
+        help="Path to the Linux wamrc binary relative to the repo root",
+    )
     return parser.parse_args()
 
 
