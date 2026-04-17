@@ -23,6 +23,17 @@
 #endif
 
 int
+os_vprintf(const char *format, va_list ap);
+
+__attribute__((weak)) int
+wamr_host_vprintf_hook(const char *format, va_list ap)
+{
+    (void)format;
+    (void)ap;
+    return -1;
+}
+
+int
 bh_platform_init()
 {
     return 0;
@@ -39,11 +50,7 @@ os_printf(const char *format, ...)
     va_list ap;
 
     va_start(ap, format);
-#ifndef BH_VPRINTF
-    ret += vprintf(format, ap);
-#else
-    ret += BH_VPRINTF(format, ap);
-#endif
+    ret = os_vprintf(format, ap);
     va_end(ap);
 
     return ret;
@@ -52,6 +59,18 @@ os_printf(const char *format, ...)
 int
 os_vprintf(const char *format, va_list ap)
 {
+    int ret;
+    va_list hook_args;
+
+    va_copy(hook_args, ap);
+    ret = wamr_host_vprintf_hook(format, hook_args);
+    va_end(hook_args);
+
+    if (ret >= 0)
+    {
+        return ret;
+    }
+
 #ifndef BH_VPRINTF
     return vprintf(format, ap);
 #else

@@ -52,12 +52,16 @@ After staging `google-get.wasm` and rebuilding the firmware image, run it from t
 
 ```bash
 script run google-get
+script status
 ```
 
 Optional arguments let you override the host, path, and port:
 
 ```bash
 script run google-get example.com / 80
+script status
 ```
+
+`script run` now queues the module asynchronously and prints a run ID. Use `script status` to watch the active run and inspect the latest completed result.
 
 This example uses plain HTTP over TCP. `google.com` normally answers on port `80` with a redirect to HTTPS, so the example is mainly useful for demonstrating outbound DNS + TCP + HTTP request/response handling from Rust over the builtin socket shim.

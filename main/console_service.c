@@ -1,5 +1,6 @@
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "argtable3/argtable3.h"
 
@@ -32,6 +34,9 @@ static const char *TAG = "console_svc";
 #define TELEMETRY_INTERVAL_MS 5000
 #define TELEMETRY_TASK_STACK_SIZE 2048
 #define TELEMETRY_MAX_TASKS 32
+#define CONSOLE_REPL_TASK_STACK_SIZE (8 * 1024)
+
+static void script_print_output(const char *output);
 
 typedef struct
 {
@@ -1472,11 +1477,6 @@ static int cmd_sd(int argc, char **argv)
  *  Script commands                                                    *
  * ════════════════════════════════════════════════════════════════════ */
 
-static void script_print_root(void)
-{
-    printf("%s\n", script_service_get_root_path());
-}
-
 static int script_list_directory(const char *path)
 {
     DIR *dir = opendir(path);
@@ -1519,13 +1519,66 @@ static int script_list_directory(const char *path)
 
 static void script_print_status(void)
 {
-    printf("Script service: %s\n", script_service_status_name(script_service_get_status()));
+    script_service_status_snapshot_t snapshot = {0};
+    int64_t now_ms = esp_timer_get_time() / 1000;
+
+    script_service_get_status_snapshot(&snapshot);
+
+    printf("Script service: %s\n", script_service_status_name(snapshot.status));
     printf("Host module:    %s\n", SCRIPT_SERVICE_HOST_MODULE_NAME);
     printf("Run mode:       .wasm/.cwasm => %s\n",
            script_service_run_mode_name(SCRIPT_SERVICE_RUN_MODE_LIBC_BUILTIN));
     printf("Scripts root:   %s\n", script_service_get_root_path());
     printf("Lookup:         <name> -> %s/<name>/<name>.wasm|.cwasm\n",
            script_service_get_root_path());
+
+    printf("Running:        %s\n", snapshot.has_active_run ? "yes" : "no");
+    if (snapshot.has_active_run)
+    {
+        long elapsed_ms = 0;
+
+        if (snapshot.active_run_started_ms > 0 && now_ms >= snapshot.active_run_started_ms)
+        {
+            int64_t elapsed_ms64 = now_ms - snapshot.active_run_started_ms;
+
+            elapsed_ms = elapsed_ms64 > LONG_MAX ? LONG_MAX : (long)elapsed_ms64;
+        }
+
+        printf("Active run ID:  %u\n", (unsigned)snapshot.active_run.run_id);
+        printf("Active script:  %s\n", snapshot.active_run.resolved_path);
+        printf("Active mode:    %s\n", script_service_run_mode_name(snapshot.active_run.mode));
+        printf("Active size:    %u bytes\n", (unsigned)snapshot.active_run.script_size_bytes);
+        printf("Active for:     %ld ms\n", elapsed_ms);
+        if (snapshot.active_run.message[0] != '\0')
+        {
+            printf("Active note:    %s\n", snapshot.active_run.message);
+        }
+    }
+
+    if (snapshot.has_last_run)
+    {
+        long finished_ago_ms = 0;
+
+        if (snapshot.last_run_finished_ms > 0 && now_ms >= snapshot.last_run_finished_ms)
+        {
+            int64_t finished_ago_ms64 = now_ms - snapshot.last_run_finished_ms;
+
+            finished_ago_ms = finished_ago_ms64 > LONG_MAX ? LONG_MAX : (long)finished_ago_ms64;
+        }
+
+        printf("Last run ID:    %u\n", (unsigned)snapshot.last_run.run_id);
+        printf("Last script:    %s\n", snapshot.last_run.resolved_path);
+        printf("Last mode:      %s\n", script_service_run_mode_name(snapshot.last_run.mode));
+        printf("Last size:      %u bytes\n", (unsigned)snapshot.last_run.script_size_bytes);
+        printf("Last exit code: %ld\n", (long)snapshot.last_run.exit_code);
+        printf("Last state:     %s\n", snapshot.last_run_err == ESP_OK ? "ok" : "error");
+        if (snapshot.last_run.message[0] != '\0')
+        {
+            printf("Last message:   %s\n", snapshot.last_run.message);
+        }
+        printf("Last finished:  %ld ms ago\n", finished_ago_ms);
+        script_print_output(snapshot.last_run.output);
+    }
 }
 
 static void script_print_output(const char *output)
@@ -1545,13 +1598,67 @@ static void script_print_output(const char *output)
     }
 }
 
+static int script_print_log(const char *name)
+{
+    char log_path[SCRIPT_SERVICE_MAX_PATH_LEN];
+    FILE *file;
+    char buffer[256];
+    size_t bytes_read;
+    bool saw_output = false;
+    char last_byte = '\0';
+    esp_err_t err;
+
+    err = script_service_get_log_path(name, log_path, sizeof(log_path));
+    if (err != ESP_OK)
+    {
+        printf("Error: script name must be a bare filename under %s\n",
+               script_service_get_root_path());
+        return 1;
+    }
+
+    file = fopen(log_path, "rb");
+    if (!file)
+    {
+        printf("No log available for %s (%s)\n", name, log_path);
+        return 1;
+    }
+
+    printf("Log: %s\n", log_path);
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0)
+    {
+        saw_output = true;
+        last_byte = buffer[bytes_read - 1];
+        fwrite(buffer, 1, bytes_read, stdout);
+    }
+
+    if (ferror(file))
+    {
+        printf("\nError: failed to read %s\n", log_path);
+        fclose(file);
+        return 1;
+    }
+
+    fclose(file);
+    if (!saw_output)
+    {
+        printf("<empty>\n");
+    }
+    else if (last_byte != '\n')
+    {
+        printf("\n");
+    }
+
+    return 0;
+}
+
 static int cmd_script(int argc, char **argv)
 {
     static const char *usage =
         "Usage: script <subcommand> [args]\n"
         "  status                 Show runtime status and fixed scripts root\n"
         "  ls [name]              List /lfs/scripts or one script directory\n"
-        "  run <name> [args...]   Execute a builtin .wasm or .cwasm script\n";
+        "  log <name>             Print the ramdisk log for one script\n"
+        "  run <name> [args...]   Queue a builtin .wasm or .cwasm script\n";
 
     if (argc < 2 || strcmp(argv[1], "status") == 0)
     {
@@ -1603,7 +1710,7 @@ static int cmd_script(int argc, char **argv)
             return 1;
         }
 
-        err = script_service_run(argv[2], script_argc, script_argv, result);
+        err = script_service_start(argv[2], script_argc, script_argv, result);
         if (err != ESP_OK)
         {
             if (result->resolved_path[0] != '\0')
@@ -1618,19 +1725,24 @@ static int cmd_script(int argc, char **argv)
             return 1;
         }
 
+        printf("Run ID:    %u\n", (unsigned)result->run_id);
         printf("Resolved:  %s\n", result->resolved_path);
         printf("Mode:      %s\n", script_service_run_mode_name(result->mode));
         printf("Size:      %u bytes\n", (unsigned)result->script_size_bytes);
-        printf("Exit code: %ld\n", (long)result->exit_code);
-        script_print_output(result->output);
-        if (result->message[0] != '\0')
+        printf("Status:    running in background; use 'script status' to monitor completion\n");
+        free(result);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "log") == 0)
+    {
+        if (argc < 3)
         {
-            printf("Result:    %s\n", result->message);
+            printf("Usage: script log <name>\n");
+            return 1;
         }
 
-        err = result->exit_code == 0 ? 0 : 1;
-        free(result);
-        return err;
+        return script_print_log(argv[2]);
     }
 
     printf("Unknown subcommand '%s'.\n%s", argv[1], usage);
@@ -1700,6 +1812,7 @@ esp_err_t console_service_init(void)
 
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_config.prompt = "esp32> ";
+    repl_config.task_stack_size = CONSOLE_REPL_TASK_STACK_SIZE;
     repl_config.max_cmdline_length = 256;
 
     /* Register built-in help */

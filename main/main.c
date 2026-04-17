@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_pm.h"
+#include "esp_task_wdt.h"
 
 #include "audio_output_switch.h"
 #include "bluetooth_service.h"
@@ -60,7 +61,6 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(power_mgmt_service_init());
-    // ESP_ERROR_CHECK(esp_flash_dispatcher_init(&flash_dispatcher_cfg));
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(ramdisk_service_init());

@@ -4,6 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 use core::ffi::{c_char, CStr};
+use core::fmt::{self, Write as _};
 use core::panic::PanicInfo;
 
 use dlmalloc::GlobalDlmalloc;
@@ -12,6 +13,61 @@ use dlmalloc::GlobalDlmalloc;
 static ALLOCATOR: GlobalDlmalloc = GlobalDlmalloc;
 
 static PANIC_MESSAGE: &[u8] = b"jukeboy rust panic\0";
+
+struct FixedLogBuffer<const N: usize>
+{
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> FixedLogBuffer<N>
+{
+    const fn new() -> Self
+    {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str
+    {
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> fmt::Write for FixedLogBuffer<N>
+{
+    fn write_str(&mut self, text: &str) -> fmt::Result
+    {
+        if self.len >= self.bytes.len()
+        {
+            return Ok(());
+        }
+
+        let remaining = self.bytes.len() - self.len;
+        let copy_len = remaining.min(text.len());
+
+        self.bytes[self.len..self.len + copy_len].copy_from_slice(&text.as_bytes()[..copy_len]);
+        self.len += copy_len;
+        Ok(())
+    }
+}
+
+fn log_without_alloc(message: &str)
+{
+    let mut buffer = [0_u8; 192];
+    let message_bytes = message.as_bytes();
+    let copy_len = message_bytes.len().min(buffer.len().saturating_sub(1));
+
+    buffer[..copy_len].copy_from_slice(&message_bytes[..copy_len]);
+    buffer[copy_len] = 0;
+
+    unsafe {
+        crate::sys::log(buffer.as_ptr().cast());
+    }
+}
+
 pub struct StringWriter<'a>
 {
     inner: &'a mut String,
@@ -90,10 +146,19 @@ pub unsafe fn user_args_from_raw(argc: i32, argv: *const *const c_char) -> Vec<S
 
 #[cfg(not(test))]
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> !
+fn panic(info: &PanicInfo<'_>) -> !
 {
-    unsafe {
-        crate::sys::log(PANIC_MESSAGE.as_ptr().cast());
+    let mut message = FixedLogBuffer::<191>::new();
+
+    let _ = write!(&mut message, "panic: {}", info);
+    if message.len > 0
+    {
+        log_without_alloc(message.as_str());
+    }
+    else {
+        unsafe {
+            crate::sys::log(PANIC_MESSAGE.as_ptr().cast());
+        }
     }
     trap()
 }

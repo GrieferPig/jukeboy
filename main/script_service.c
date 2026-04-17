@@ -30,20 +30,29 @@
 #include "wm_wamr.h"
 
 #define SCRIPT_SERVICE_RUNNER_STACK_SIZE (16 * 1024)
-#define SCRIPT_SERVICE_WASM_STACK_SIZE (32 * 1024)
-#define SCRIPT_SERVICE_WASM_HEAP_SIZE (32 * 1024)
+/* Keep the CPU-bound guest runner at idle priority so it cannot starve the
+ * FreeRTOS idle tasks and trip the task watchdog during long script runs. */
+#define SCRIPT_SERVICE_RUNNER_PRIORITY tskIDLE_PRIORITY
+/* Managed WASM stack and heap allocations flow through wm_wamr.c, which places
+ * them in PSRAM when external RAM support is enabled. */
+#define SCRIPT_SERVICE_WASM_STACK_SIZE (128 * 1024)
+#define SCRIPT_SERVICE_WASM_HEAP_SIZE (128 * 1024)
 
 #define SCRIPT_LFS_ROOT_PATH APP_LITTLEFS_MOUNT_PATH "/scripts"
 #define SCRIPT_CWASM_EXTENSION ".cwasm"
+#define SCRIPT_LOG_ROOT_PATH RAMDISK_SERVICE_MOUNT_PATH "/script-logs"
 
 typedef struct
 {
     char requested_path[SCRIPT_SERVICE_MAX_PATH_LEN];
+    char log_path[SCRIPT_SERVICE_MAX_PATH_LEN];
     char **argv;
     int argc;
+    bool detach_on_finish;
     script_service_run_mode_t mode;
     uint8_t *script_buffer;
     uint32_t script_buffer_size;
+    int log_fd;
     esp_err_t err;
     SemaphoreHandle_t completion_sem;
     StaticSemaphore_t completion_sem_storage;
@@ -53,15 +62,22 @@ typedef struct
 static const char *TAG = "script_svc";
 
 static script_service_status_t s_status = SCRIPT_SERVICE_STATUS_UNINITIALIZED;
-static StaticSemaphore_t s_runtime_mutex_storage;
-static SemaphoreHandle_t s_runtime_mutex;
+static StaticSemaphore_t s_state_mutex_storage;
+static SemaphoreHandle_t s_state_mutex;
 static StaticSemaphore_t s_worker_request_sem_storage;
 static SemaphoreHandle_t s_worker_request_sem;
 static bool s_natives_registered;
 static script_run_context_t *s_active_run_context;
+static script_run_context_t *s_log_capture_context;
 static script_run_context_t *s_pending_context;
 static pthread_t s_worker_thread;
 static bool s_worker_thread_started;
+static bool s_last_result_valid;
+static script_service_run_result_t s_last_result;
+static esp_err_t s_last_run_err;
+static int64_t s_active_run_started_us;
+static int64_t s_last_run_finished_us;
+static uint32_t s_next_run_id = 1;
 
 static void script_set_result_message(script_service_run_result_t *result, const char *format, ...)
 {
@@ -111,6 +127,271 @@ static void script_append_output(script_service_run_result_t *result, const char
     }
 
     script_append_result_output(result, text, strlen(text));
+}
+
+static void script_init_result(script_service_run_result_t *result)
+{
+    if (!result)
+    {
+        return;
+    }
+
+    memset(result, 0, sizeof(*result));
+    result->mode = SCRIPT_SERVICE_RUN_MODE_LIBC_BUILTIN;
+    result->exit_code = -1;
+}
+
+static void script_free_context(script_run_context_t *context)
+{
+    if (!context)
+    {
+        return;
+    }
+
+    if (context->log_fd >= 0)
+    {
+        close(context->log_fd);
+        context->log_fd = -1;
+    }
+
+    free(context->script_buffer);
+    context->script_buffer = NULL;
+    context->script_buffer_size = 0;
+    free(context->argv);
+    context->argv = NULL;
+    free(context);
+}
+
+static void script_capture_last_result_locked(const script_run_context_t *context)
+{
+    if (!context)
+    {
+        return;
+    }
+
+    s_last_result = context->result;
+    s_last_run_err = context->err;
+    s_last_result_valid = true;
+    s_last_run_finished_us = esp_timer_get_time();
+}
+
+static void script_ensure_directory(const char *path);
+
+static esp_err_t script_build_log_path_from_resolved_path(const char *resolved_path,
+                                                          char *out_path,
+                                                          size_t out_path_size)
+{
+    const char *filename;
+    int written;
+
+    if (!resolved_path || resolved_path[0] == '\0' || !out_path || out_path_size == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    filename = strrchr(resolved_path, '/');
+    filename = filename ? filename + 1 : resolved_path;
+    if (filename[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    written = snprintf(out_path, out_path_size, "%s/%s.log", SCRIPT_LOG_ROOT_PATH, filename);
+    if (written <= 0 || (size_t)written >= out_path_size)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t script_trim_log_fd(int log_fd)
+{
+    off_t log_size;
+    char *buffer = NULL;
+    size_t keep_offset = 0;
+    esp_err_t err = ESP_OK;
+
+    if (log_fd < 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    log_size = lseek(log_fd, 0, SEEK_END);
+    if (log_size < 0)
+    {
+        return ESP_FAIL;
+    }
+
+    if ((size_t)log_size <= SCRIPT_SERVICE_LOG_MAX_SIZE)
+    {
+        return ESP_OK;
+    }
+
+    buffer = malloc((size_t)log_size);
+    if (!buffer)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (lseek(log_fd, 0, SEEK_SET) < 0)
+    {
+        err = ESP_FAIL;
+        goto done;
+    }
+
+    if (read(log_fd, buffer, (size_t)log_size) != log_size)
+    {
+        err = ESP_FAIL;
+        goto done;
+    }
+
+    while ((size_t)log_size - keep_offset > SCRIPT_SERVICE_LOG_MAX_SIZE)
+    {
+        char *newline = memchr(buffer + keep_offset, '\n', (size_t)log_size - keep_offset);
+
+        if (!newline)
+        {
+            keep_offset = (size_t)log_size - SCRIPT_SERVICE_LOG_MAX_SIZE;
+            break;
+        }
+
+        keep_offset = (size_t)(newline - buffer) + 1;
+    }
+
+    if (lseek(log_fd, 0, SEEK_SET) < 0)
+    {
+        err = ESP_FAIL;
+        goto done;
+    }
+
+    if (keep_offset < (size_t)log_size)
+    {
+        size_t kept_size = (size_t)log_size - keep_offset;
+
+        if (write(log_fd, buffer + keep_offset, kept_size) != (ssize_t)kept_size)
+        {
+            err = ESP_FAIL;
+            goto done;
+        }
+
+        if (ftruncate(log_fd, (off_t)kept_size) != 0)
+        {
+            err = ESP_FAIL;
+            goto done;
+        }
+    }
+    else if (ftruncate(log_fd, 0) != 0)
+    {
+        err = ESP_FAIL;
+        goto done;
+    }
+
+    if (lseek(log_fd, 0, SEEK_END) < 0)
+    {
+        err = ESP_FAIL;
+        goto done;
+    }
+
+done:
+    free(buffer);
+    return err;
+}
+
+static esp_err_t script_append_log_data(script_run_context_t *context,
+                                        const char *data,
+                                        size_t data_len)
+{
+    if (!context || context->log_fd < 0 || !data || data_len == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (write(context->log_fd, data, data_len) != (ssize_t)data_len)
+    {
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+int wamr_host_vprintf_hook(const char *format, va_list ap)
+{
+    script_run_context_t *context = s_log_capture_context;
+    va_list console_args;
+    va_list size_args;
+    va_list format_args;
+    int console_result;
+    int required_len;
+    char stack_buffer[256];
+    char *buffer = stack_buffer;
+
+    if (!format || !context || context->log_fd < 0)
+    {
+        return -1;
+    }
+
+    va_copy(console_args, ap);
+    console_result = vprintf(format, console_args);
+    va_end(console_args);
+
+    va_copy(size_args, ap);
+    required_len = vsnprintf(NULL, 0, format, size_args);
+    va_end(size_args);
+
+    if (required_len > 0)
+    {
+        if ((size_t)required_len >= sizeof(stack_buffer))
+        {
+            buffer = malloc((size_t)required_len + 1);
+        }
+
+        if (buffer)
+        {
+            va_copy(format_args, ap);
+            vsnprintf(buffer, (size_t)required_len + 1, format, format_args);
+            va_end(format_args);
+            script_append_log_data(context, buffer, (size_t)required_len);
+        }
+    }
+
+    if (buffer != stack_buffer)
+    {
+        free(buffer);
+    }
+
+    return console_result >= 0 ? console_result : required_len;
+}
+
+static esp_err_t script_prepare_log_file(script_run_context_t *context)
+{
+    int fd;
+
+    if (!context)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    script_ensure_directory(SCRIPT_LOG_ROOT_PATH);
+
+    if (script_build_log_path_from_resolved_path(context->result.resolved_path,
+                                                 context->log_path,
+                                                 sizeof(context->log_path)) != ESP_OK)
+    {
+        script_set_result_message(&context->result, "failed to prepare log path for %s",
+                                  context->result.resolved_path);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    fd = open(context->log_path, O_CREAT | O_TRUNC | O_RDWR, 0664);
+    if (fd < 0)
+    {
+        script_set_result_message(&context->result, "failed to open %s", context->log_path);
+        return ESP_FAIL;
+    }
+
+    context->log_fd = fd;
+    return ESP_OK;
 }
 
 static bool script_is_regular_file(const char *path)
@@ -475,14 +756,36 @@ static uint8_t *script_load_file(const char *path, uint32_t *size_out, script_se
 
 static int log_wrapper(wasm_exec_env_t exec_env, const char *message)
 {
+    script_run_context_t *context = NULL;
+
     (void)exec_env;
 
-    if (s_active_run_context)
+    if (s_state_mutex)
     {
-        script_append_output(&s_active_run_context->result, "[wasm] ");
-        script_append_output(&s_active_run_context->result, message ? message : "");
-        script_append_output(&s_active_run_context->result, "\n");
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        context = s_active_run_context;
+        if (context)
+        {
+            script_append_output(&context->result, "[wasm] ");
+            script_append_output(&context->result, message ? message : "");
+            script_append_output(&context->result, "\n");
+        }
+        xSemaphoreGive(s_state_mutex);
     }
+
+    if (context)
+    {
+        static const char prefix[] = "[wasm] ";
+        static const char newline[] = "\n";
+
+        script_append_log_data(context, prefix, sizeof(prefix) - 1);
+        if (message && message[0] != '\0')
+        {
+            script_append_log_data(context, message, strlen(message));
+        }
+        script_append_log_data(context, newline, sizeof(newline) - 1);
+    }
+
     return ESP_OK;
 }
 
@@ -705,6 +1008,26 @@ static esp_err_t script_prepare_builtin_argv(script_run_context_t *context,
     return ESP_OK;
 }
 
+static void script_yield_task(void *pvParameters)
+{
+    TaskHandle_t target_task = (TaskHandle_t)pvParameters;
+
+    while (1)
+    {
+        // Run every 1000 ms to give the watchdog a breather
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        
+        // Stop the heavy WAMR execution
+        vTaskSuspend(target_task);
+        
+        // Sleep for exactly 1 OS tick (10ms on ESP32 by default) to let IDLE1 run
+        vTaskDelay(1);
+        
+        // Restart the WAMR execution
+        vTaskResume(target_task);
+    }
+}
+
 static esp_err_t script_execute_builtin_module(script_run_context_t *context,
                                                wasm_module_inst_t module_inst)
 {
@@ -719,6 +1042,7 @@ static esp_err_t script_execute_builtin_module(script_run_context_t *context,
     uint64_t argv_offset = 0;
     uint32_t param_count;
     uint32_t result_count;
+    TaskHandle_t yield_task_handle = NULL;
     esp_err_t err = ESP_OK;
 
     main_function = wasm_runtime_lookup_function(module_inst, "main");
@@ -803,6 +1127,16 @@ static esp_err_t script_execute_builtin_module(script_run_context_t *context,
         goto cleanup;
     }
 
+    // Create the high priority task that will only exist while WAMR runs
+    // PRIORITY = tskIDLE_PRIORITY + 1 ensures it preempts the runner.
+    xTaskCreatePinnedToCore(script_yield_task, 
+                            "ScriptYield", 
+                            2048, 
+                            (void *)xTaskGetCurrentTaskHandle(), 
+                            24, 
+                            &yield_task_handle,
+                            1); // Ensure we pin to exactly the same core as ScriptRunner
+
     if (!wasm_runtime_call_wasm_a(exec_env,
                                   main_function,
                                   result_count,
@@ -822,6 +1156,12 @@ static esp_err_t script_execute_builtin_module(script_run_context_t *context,
     context->result.exit_code = result_count > 0 ? results[0].of.i32 : 0;
 
 cleanup:
+    if (yield_task_handle != NULL)
+    {
+        // Delete the yielding task as soon as WAMR completes or fails
+        vTaskDelete(yield_task_handle);
+    }
+
     if (argv_offset != 0)
     {
         wasm_runtime_module_free(module_inst, argv_offset);
@@ -933,9 +1273,23 @@ static void *script_runner_task(void *parameter)
 
     ESP_EARLY_LOGI(TAG, "runner env ready");
 
+    s_log_capture_context = context;
     context->err = script_execute_module(context);
 
 done:
+    if (s_log_capture_context == context)
+    {
+        s_log_capture_context = NULL;
+    }
+
+    if (context->log_fd >= 0)
+    {
+        if (script_trim_log_fd(context->log_fd) != ESP_OK)
+        {
+            ESP_LOGW(TAG, "failed to trim %s", context->log_path);
+        }
+    }
+
     if (thread_env_initialized_here)
     {
         wasm_runtime_destroy_thread_env();
@@ -944,21 +1298,219 @@ done:
     return NULL;
 }
 
+static esp_err_t script_prepare_context(const char *path,
+                                        int argc,
+                                        const char *const *argv,
+                                        script_run_context_t **context_out,
+                                        script_service_run_result_t *result)
+{
+    script_run_context_t *context = NULL;
+    esp_err_t err;
+
+    if (context_out)
+    {
+        *context_out = NULL;
+    }
+
+    script_init_result(result);
+
+    err = script_service_init();
+    if (err != ESP_OK)
+    {
+        script_set_result_message(result, "script service init failed");
+        return err;
+    }
+
+    if (!path || path[0] == '\0')
+    {
+        script_set_result_message(result, "script name is required");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    context = calloc(1, sizeof(*context));
+    if (!context)
+    {
+        script_set_result_message(result, "out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
+    context->completion_sem = xSemaphoreCreateBinaryStatic(&context->completion_sem_storage);
+    if (!context->completion_sem)
+    {
+        script_set_result_message(result, "failed to create script completion semaphore");
+        script_free_context(context);
+        return ESP_ERR_NO_MEM;
+    }
+
+    context->argc = 0;
+    context->mode = SCRIPT_SERVICE_RUN_MODE_LIBC_BUILTIN;
+    context->log_fd = -1;
+    context->err = ESP_OK;
+    script_init_result(&context->result);
+    snprintf(context->requested_path, sizeof(context->requested_path), "%s", path);
+
+    err = script_service_resolve_path(path,
+                                      context->result.resolved_path,
+                                      sizeof(context->result.resolved_path));
+    if (err != ESP_OK)
+    {
+        if (err == ESP_ERR_INVALID_ARG)
+        {
+            script_set_result_message(&context->result,
+                                      "script name must be a bare filename under %s",
+                                      script_service_get_root_path());
+        }
+        else
+        {
+            script_set_result_message(&context->result, "could not resolve %s", path);
+        }
+        if (result)
+        {
+            *result = context->result;
+        }
+        script_free_context(context);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "dispatching script %s", context->result.resolved_path);
+
+    context->mode = script_detect_run_mode(context->result.resolved_path);
+    context->result.mode = context->mode;
+
+    err = script_prepare_log_file(context);
+    if (err != ESP_OK)
+    {
+        if (result)
+        {
+            *result = context->result;
+        }
+        script_free_context(context);
+        return err;
+    }
+
+    context->argv = script_duplicate_argv(context->result.resolved_path,
+                                          argc,
+                                          argv,
+                                          &context->argc);
+    if (!context->argv)
+    {
+        script_set_result_message(&context->result, "out of memory copying arguments");
+        if (result)
+        {
+            *result = context->result;
+        }
+        script_free_context(context);
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "preloading script %s", context->result.resolved_path);
+    context->script_buffer = script_load_file(context->result.resolved_path,
+                                              &context->script_buffer_size,
+                                              &context->result);
+    if (!context->script_buffer)
+    {
+        if (result)
+        {
+            *result = context->result;
+        }
+        script_free_context(context);
+        return ESP_FAIL;
+    }
+
+    if (result)
+    {
+        *result = context->result;
+    }
+
+    if (context_out)
+    {
+        *context_out = context;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t script_queue_context(script_run_context_t *context)
+{
+    uint32_t run_id;
+
+    if (!context)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_status == SCRIPT_SERVICE_STATUS_BUSY || s_active_run_context || s_pending_context)
+    {
+        if (s_active_run_context && s_active_run_context->result.resolved_path[0] != '\0')
+        {
+            script_set_result_message(&context->result,
+                                      "script service is already running %s",
+                                      s_active_run_context->result.resolved_path);
+        }
+        else
+        {
+            script_set_result_message(&context->result, "script service is already busy");
+        }
+        context->err = ESP_ERR_INVALID_STATE;
+        xSemaphoreGive(s_state_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    run_id = s_next_run_id++;
+    if (s_next_run_id == 0)
+    {
+        s_next_run_id = 1;
+    }
+
+    context->result.run_id = run_id;
+    s_status = SCRIPT_SERVICE_STATUS_BUSY;
+    s_active_run_context = context;
+    s_pending_context = context;
+    s_active_run_started_us = esp_timer_get_time();
+    xSemaphoreGive(s_state_mutex);
+
+    ESP_LOGI(TAG, "queued script %s", context->result.resolved_path);
+    xSemaphoreGive(s_worker_request_sem);
+    return ESP_OK;
+}
+
 static void *script_worker_task(void *parameter)
 {
     (void)parameter;
 
     for (;;)
     {
+        script_run_context_t *context = NULL;
+
         xSemaphoreTake(s_worker_request_sem, portMAX_DELAY);
 
-        if (s_pending_context)
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        context = s_pending_context;
+        s_pending_context = NULL;
+        xSemaphoreGive(s_state_mutex);
+
+        if (context)
         {
-            ESP_LOGI(TAG, "worker picked up %s", s_pending_context->result.resolved_path);
-            script_runner_task(s_pending_context);
-            xSemaphoreGive(s_pending_context->completion_sem);
-            ESP_LOGI(TAG, "worker completed %s", s_pending_context->result.resolved_path);
-            s_pending_context = NULL;
+            ESP_LOGI(TAG, "worker picked up %s", context->result.resolved_path);
+            script_runner_task(context);
+
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            script_capture_last_result_locked(context);
+            if (s_active_run_context == context)
+            {
+                s_active_run_context = NULL;
+            }
+            s_status = SCRIPT_SERVICE_STATUS_READY;
+            xSemaphoreGive(s_state_mutex);
+
+            xSemaphoreGive(context->completion_sem);
+            ESP_LOGI(TAG, "worker completed %s", context->result.resolved_path);
+
+            if (context->detach_on_finish)
+            {
+                script_free_context(context);
+            }
         }
     }
 
@@ -977,8 +1529,8 @@ esp_err_t script_service_init(void)
         return ESP_FAIL;
     }
 
-    s_runtime_mutex = xSemaphoreCreateMutexStatic(&s_runtime_mutex_storage);
-    if (!s_runtime_mutex)
+    s_state_mutex = xSemaphoreCreateMutexStatic(&s_state_mutex_storage);
+    if (!s_state_mutex)
     {
         s_status = SCRIPT_SERVICE_STATUS_ERROR;
         return ESP_ERR_NO_MEM;
@@ -1020,10 +1572,10 @@ esp_err_t script_service_init(void)
         esp_pthread_cfg_t restore_cfg = esp_pthread_get_default_config();
 
         worker_cfg.stack_size = SCRIPT_SERVICE_RUNNER_STACK_SIZE;
-        worker_cfg.prio = 4;
+        worker_cfg.prio = SCRIPT_SERVICE_RUNNER_PRIORITY;
         worker_cfg.inherit_cfg = false;
         worker_cfg.thread_name = "ScriptRunner";
-        worker_cfg.pin_to_core = tskNO_AFFINITY;
+        worker_cfg.pin_to_core = 1;
 
         if (esp_pthread_set_cfg(&worker_cfg) != ESP_OK ||
             pthread_create(&s_worker_thread, NULL, script_worker_task, NULL) != 0)
@@ -1045,12 +1597,57 @@ esp_err_t script_service_init(void)
 
 bool script_service_is_ready(void)
 {
-    return s_status == SCRIPT_SERVICE_STATUS_READY || s_status == SCRIPT_SERVICE_STATUS_BUSY;
+    return script_service_get_status() == SCRIPT_SERVICE_STATUS_READY ||
+           script_service_get_status() == SCRIPT_SERVICE_STATUS_BUSY;
 }
 
 script_service_status_t script_service_get_status(void)
 {
-    return s_status;
+    script_service_status_t status;
+
+    if (!s_state_mutex)
+    {
+        return s_status;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    status = s_status;
+    xSemaphoreGive(s_state_mutex);
+    return status;
+}
+
+esp_err_t script_service_get_status_snapshot(script_service_status_snapshot_t *snapshot)
+{
+    if (!snapshot)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->status = s_status;
+
+    if (!s_state_mutex)
+    {
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    snapshot->status = s_status;
+    if (s_active_run_context)
+    {
+        snapshot->has_active_run = true;
+        snapshot->active_run = s_active_run_context->result;
+        snapshot->active_run_started_ms = s_active_run_started_us / 1000;
+    }
+    if (s_last_result_valid)
+    {
+        snapshot->has_last_run = true;
+        snapshot->last_run = s_last_result;
+        snapshot->last_run_err = s_last_run_err;
+        snapshot->last_run_finished_ms = s_last_run_finished_us / 1000;
+    }
+    xSemaphoreGive(s_state_mutex);
+    return ESP_OK;
 }
 
 const char *script_service_status_name(script_service_status_t status)
@@ -1086,6 +1683,25 @@ const char *script_service_get_root_path(void)
     return SCRIPT_LFS_ROOT_PATH;
 }
 
+esp_err_t script_service_get_log_path(const char *path, char *out_path, size_t out_path_size)
+{
+    char resolved_path[SCRIPT_SERVICE_MAX_PATH_LEN];
+    esp_err_t err;
+
+    if (!path || !out_path || out_path_size == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = script_service_resolve_path(path, resolved_path, sizeof(resolved_path));
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    return script_build_log_path_from_resolved_path(resolved_path, out_path, out_path_size);
+}
+
 esp_err_t script_service_get_script_directory(const char *name,
                                               char *out_path,
                                               size_t out_path_size)
@@ -1118,133 +1734,65 @@ esp_err_t script_service_resolve_path(const char *path, char *out_path, size_t o
     return script_try_path_variants(candidate, out_path, out_path_size) ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
+esp_err_t script_service_start(const char *path,
+                               int argc,
+                               const char *const *argv,
+                               script_service_run_result_t *result)
+{
+    script_service_run_result_t local_result;
+    script_service_run_result_t *effective_result = result ? result : &local_result;
+    script_run_context_t *context = NULL;
+    esp_err_t err;
+
+    err = script_prepare_context(path, argc, argv, &context, effective_result);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    context->detach_on_finish = true;
+    err = script_queue_context(context);
+    if (err != ESP_OK)
+    {
+        *effective_result = context->result;
+        script_free_context(context);
+        return err;
+    }
+
+    *effective_result = context->result;
+    return ESP_OK;
+}
+
 esp_err_t script_service_run(const char *path,
                              int argc,
                              const char *const *argv,
                              script_service_run_result_t *result)
 {
-    script_service_run_result_t *owned_result = NULL;
+    script_service_run_result_t local_result;
+    script_service_run_result_t *effective_result = result ? result : &local_result;
     script_run_context_t *context = NULL;
     esp_err_t err;
 
-    if (!result)
-    {
-        owned_result = calloc(1, sizeof(*owned_result));
-        if (!owned_result)
-        {
-            return ESP_ERR_NO_MEM;
-        }
-        result = owned_result;
-    }
-    memset(result, 0, sizeof(*result));
-    result->mode = SCRIPT_SERVICE_RUN_MODE_LIBC_BUILTIN;
-    result->exit_code = -1;
-
-    err = script_service_init();
+    err = script_prepare_context(path, argc, argv, &context, effective_result);
     if (err != ESP_OK)
     {
-        script_set_result_message(result, "script service init failed");
-        free(owned_result);
         return err;
     }
 
-    if (!path || path[0] == '\0')
-    {
-        script_set_result_message(result, "script name is required");
-        free(owned_result);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    context = calloc(1, sizeof(*context));
-    if (!context)
-    {
-        script_set_result_message(result, "out of memory");
-        free(owned_result);
-        return ESP_ERR_NO_MEM;
-    }
-
-    context->completion_sem = xSemaphoreCreateBinaryStatic(&context->completion_sem_storage);
-    if (!context->completion_sem)
-    {
-        script_set_result_message(result, "failed to create script completion semaphore");
-        free(context);
-        free(owned_result);
-        return ESP_ERR_NO_MEM;
-    }
-
-    context->argc = 0;
-    context->mode = SCRIPT_SERVICE_RUN_MODE_LIBC_BUILTIN;
-    context->result.exit_code = -1;
-    snprintf(context->requested_path, sizeof(context->requested_path), "%s", path);
-
-    err = script_service_resolve_path(path,
-                                      context->result.resolved_path,
-                                      sizeof(context->result.resolved_path));
+    context->detach_on_finish = false;
+    err = script_queue_context(context);
     if (err != ESP_OK)
     {
-        if (err == ESP_ERR_INVALID_ARG)
-        {
-            script_set_result_message(result,
-                                      "script name must be a bare filename under %s",
-                                      script_service_get_root_path());
-        }
-        else
-        {
-            script_set_result_message(result, "could not resolve %s", path);
-        }
-        free(context);
-        free(owned_result);
+        *effective_result = context->result;
+        script_free_context(context);
         return err;
     }
 
-    ESP_LOGI(TAG, "dispatching script %s", context->result.resolved_path);
-
-    context->mode = script_detect_run_mode(context->result.resolved_path);
-    context->result.mode = context->mode;
-
-    context->argv = script_duplicate_argv(context->result.resolved_path,
-                                          argc,
-                                          argv,
-                                          &context->argc);
-    if (!context->argv)
-    {
-        script_set_result_message(result, "out of memory copying arguments");
-        free(context);
-        free(owned_result);
-        return ESP_ERR_NO_MEM;
-    }
-
-    ESP_LOGI(TAG, "preloading script %s", context->result.resolved_path);
-    context->script_buffer = script_load_file(context->result.resolved_path,
-                                              &context->script_buffer_size,
-                                              &context->result);
-    if (!context->script_buffer)
-    {
-        free(context->argv);
-        free(context);
-        free(owned_result);
-        return ESP_FAIL;
-    }
-
-    xSemaphoreTake(s_runtime_mutex, portMAX_DELAY);
-    s_status = SCRIPT_SERVICE_STATUS_BUSY;
-    s_active_run_context = context;
-
-    s_pending_context = context;
-    ESP_LOGI(TAG, "queued script %s", context->result.resolved_path);
-    xSemaphoreGive(s_worker_request_sem);
     xSemaphoreTake(context->completion_sem, portMAX_DELAY);
     ESP_LOGI(TAG, "script wait complete for %s", context->result.resolved_path);
 
-    s_active_run_context = NULL;
-    s_status = SCRIPT_SERVICE_STATUS_READY;
-    xSemaphoreGive(s_runtime_mutex);
-
-    *result = context->result;
+    *effective_result = context->result;
     err = context->err;
-
-    free(context->argv);
-    free(context);
-    free(owned_result);
+    script_free_context(context);
     return err;
 }

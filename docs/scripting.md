@@ -4,9 +4,10 @@ The firmware embeds Espressif's WASMachine core and exposes a native host module
 
 ## Console commands
 
-- `script status` prints the service state, host module name, and fixed scripts root.
+- `script status` prints the service state, host module name, fixed scripts root, the currently running script if one is active, and the most recent completed run summary. Active and completed runs are tagged with run IDs.
 - `script ls [name]` lists `/lfs/scripts` when no argument is given, or one script directory when a filename is provided.
-- `script run <name> [args...]` runs a builtin module and forwards the remaining arguments to `main(argc, argv)`.
+- `script log <name>` prints the temporary ramdisk log for one resolved script.
+- `script run <name> [args...]` queues the script in the background, prints its run ID, and forwards the remaining arguments to `main(argc, argv)`.
 
 ## Script roots and resolution
 
@@ -29,14 +30,17 @@ Examples:
 
 `script run` prints:
 
+- `Run ID`
 - `Resolved`
 - `Mode`
 - `Size`
-- `Exit code`
-- `Output` when the script wrote through the `jukeboy.log()` host hook
-- `Result` or `Error`
+- `Status`
 
-Captured output is currently limited to 2048 bytes. A non-zero script exit code makes the console command fail even when the runtime completed normally.
+Captured output is currently limited to 2048 bytes. Use `script status` to monitor the active run and inspect the latest completed result, including exit code, output, and message.
+
+`script status` reports the active run ID while a script is still executing, then moves that run into the `Last ...` section when it finishes.
+
+Each resolved script also gets a temporary text log in `/tmp/script-logs/<resolved-filename>.log`. The runtime records script stdout and stderr there, appends `jukeboy.log()` lines, and trims whole oldest lines after completion so the file stays within 32 KiB. Use `script log <name>` to print it from the console.
 
 ## Host module
 
@@ -93,6 +97,10 @@ long long get_uptime_ms(void);
 Scripts now run only in libc-builtin mode. `.wasm` and `.cwasm` both resolve to builtin modules, and the runtime accepts either `main(argc, argv)` or `__main_argc_argv`.
 
 The firmware exposes the `jukeboy` host module for device control and an `env` socket shim that implements the existing `sock_*` API on top of ESP-IDF BSD sockets. That gives builtin scripts DNS lookup plus TCP and UDP access without WASI.
+
+The native `ScriptRunner` thread keeps its own stack in internal RAM, but it runs at idle priority so compute-heavy scripts do not starve the ESP-IDF idle tasks and trip the task watchdog. The managed WASM stack and heap are each 128 KiB and are allocated from PSRAM through the WAMR allocator when external RAM is enabled.
+
+The service still runs one script at a time. Launches are therefore serialized: a second `script run ...` will fail while another script is active, and `script status` will report that active run until it completes.
 
 ## QEMU validation flow
 

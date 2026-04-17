@@ -15,6 +15,7 @@ extern "C"
 #define SCRIPT_SERVICE_MAX_PATH_LEN 256
 #define SCRIPT_SERVICE_MAX_MESSAGE_LEN 160
 #define SCRIPT_SERVICE_MAX_OUTPUT_LEN 2048
+#define SCRIPT_SERVICE_LOG_MAX_SIZE (32 * 1024)
 
     typedef enum
     {
@@ -31,6 +32,7 @@ extern "C"
 
     typedef struct
     {
+        uint32_t run_id;
         char resolved_path[SCRIPT_SERVICE_MAX_PATH_LEN];
         char message[SCRIPT_SERVICE_MAX_MESSAGE_LEN];
         char output[SCRIPT_SERVICE_MAX_OUTPUT_LEN];
@@ -39,9 +41,22 @@ extern "C"
         int32_t exit_code;
     } script_service_run_result_t;
 
+    typedef struct
+    {
+        script_service_status_t status;
+        bool has_active_run;
+        script_service_run_result_t active_run;
+        int64_t active_run_started_ms;
+        bool has_last_run;
+        script_service_run_result_t last_run;
+        esp_err_t last_run_err;
+        int64_t last_run_finished_ms;
+    } script_service_status_snapshot_t;
+
     esp_err_t script_service_init(void);
     bool script_service_is_ready(void);
     script_service_status_t script_service_get_status(void);
+    esp_err_t script_service_get_status_snapshot(script_service_status_snapshot_t *snapshot);
     const char *script_service_status_name(script_service_status_t status);
     const char *script_service_run_mode_name(script_service_run_mode_t mode);
 
@@ -51,6 +66,11 @@ extern "C"
                                                   size_t out_path_size);
 
     esp_err_t script_service_resolve_path(const char *path, char *out_path, size_t out_path_size);
+    esp_err_t script_service_get_log_path(const char *path, char *out_path, size_t out_path_size);
+    esp_err_t script_service_start(const char *path,
+                                   int argc,
+                                   const char *const *argv,
+                                   script_service_run_result_t *result);
     esp_err_t script_service_run(const char *path,
                                  int argc,
                                  const char *const *argv,

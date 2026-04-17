@@ -1,5 +1,17 @@
 [build]
 target = "wasm32-unknown-unknown"
 
+[target.wasm32-unknown-unknown]
+# Rust's default wasm stack reservation leaves too little usable heap for
+# these modules under the ESP32 WAMR builtin runtime.
+rustflags = [
+	"-C",
+	"link-arg=-z",
+	"-C",
+	"link-arg=stack-size=131072",
+	"-C",
+	"link-arg=--max-memory=4194304",
+]
+
 [alias]
 build-examples = "build --release -p hello -p google-get -p player-control -p net-echo"
