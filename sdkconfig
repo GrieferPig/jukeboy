@@ -432,13 +432,6 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
-# FTP Service
-#
-CONFIG_FTP_SVC_USER="root"
-CONFIG_FTP_SVC_PASSWORD="root"
-# end of FTP Service
-
-#
 # WASMachine Configuration
 #
 

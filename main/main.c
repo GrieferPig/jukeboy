@@ -20,7 +20,6 @@
 #include "bluetooth_service.h"
 #include "cartridge_service.h"
 #include "console_service.h"
-#include "ftp_service.h"
 #include "i2s_service.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
@@ -71,7 +70,6 @@ void app_main(void)
         cartridge_service_config_t cart_cfg = CARTRIDGE_SERVICE_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(cartridge_service_init(&cart_cfg));
 
-#if CONFIG_ETH_USE_OPENETH
         esp_err_t eth_err = qemu_openeth_service_init();
         if (eth_err != ESP_OK)
         {
@@ -85,9 +83,7 @@ void app_main(void)
                 ESP_LOGW(TAG, "QEMU OpenETH did not obtain an IPv4 lease within the startup window");
             }
         }
-#endif /* CONFIG_ETH_USE_OPENETH */
 
-        ESP_ERROR_CHECK(ftp_service_init());
         ESP_ERROR_CHECK(player_service_init());
 
         if (QEMU_PCM_SERVICE_ENABLED)
@@ -148,7 +144,6 @@ void app_main(void)
     ESP_ERROR_CHECK(audio_output_switch_set_provider(player_service_pcm_provider, NULL));
     ESP_ERROR_CHECK(audio_output_switch_select(AUDIO_OUTPUT_TARGET_I2S));
 
-    ESP_ERROR_CHECK(ftp_service_init());
     ESP_ERROR_CHECK(player_service_init());
 
     if (script_service_init() != ESP_OK)
