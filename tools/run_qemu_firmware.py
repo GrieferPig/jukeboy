@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -130,13 +131,18 @@ def build_qemu_command(args: argparse.Namespace, root: Path) -> list[str]:
         else qemu_dir / "install" / "qemu" / "bin" / "qemu-system-xtensa.exe"
     )
     pc_bios_dir = qemu_dir / "pc-bios"
+    if not pc_bios_dir.exists():
+        share_qemu_dir = qemu_dir / "share" / "qemu"
+        if share_qemu_dir.exists():
+            pc_bios_dir = share_qemu_dir
     qemu_flash = build_dir / "qemu_flash.bin"
     qemu_efuse = build_dir / "qemu_efuse.bin"
     sd_image = build_dir / "sd_image.bin"
 
     ensure_exists(qemu_exe, "QEMU executable")
     ensure_exists(pc_bios_dir, "QEMU pc-bios directory")
-    ensure_exists(qemu_flash, "merged QEMU flash image")
+    if args.skip_flash_merge:
+        ensure_exists(qemu_flash, "merged QEMU flash image")
     if not qemu_efuse.exists():
         # QEMU expects a 128-byte blank eFuse backing file; create one on demand.
         print(f"Creating blank eFuse image: {qemu_efuse}")

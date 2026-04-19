@@ -45,9 +45,18 @@ extern "C"
                                                      esp_avrc_rsp_t rsp_code,
                                                      void *user_ctx);
 
+    typedef struct
+    {
+        bool pending;
+        esp_bd_addr_t remote_bda;
+        uint32_t numeric_value;
+    } bluetooth_service_pairing_confirm_t;
+
     esp_err_t bluetooth_service_init(void);
     esp_err_t bluetooth_service_pair_best_a2dp_sink(void);
     esp_err_t bluetooth_service_connect_last_bonded_a2dp_device(void);
+    esp_err_t bluetooth_service_get_pending_pairing_confirm(bluetooth_service_pairing_confirm_t *confirm);
+    esp_err_t bluetooth_service_reply_pairing_confirm(bool accept);
     esp_err_t bluetooth_service_disconnect_a2dp(void);
     esp_err_t bluetooth_service_start_audio(void);
     esp_err_t bluetooth_service_suspend_audio(void);

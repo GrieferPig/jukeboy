@@ -39,6 +39,8 @@ typedef enum
 {
     BT_SVC_CMD_PAIR_BEST,
     BT_SVC_CMD_CONNECT_LAST_BONDED,
+    BT_SVC_CMD_PAIRING_CONFIRM_REQUEST,
+    BT_SVC_CMD_PAIRING_CONFIRM_REPLY,
     BT_SVC_CMD_DISCONNECT_A2DP,
     BT_SVC_CMD_START_AUDIO,
     BT_SVC_CMD_SUSPEND_AUDIO,
@@ -80,6 +82,12 @@ typedef struct
             esp_bt_status_t status;
             char name[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
         } auth;
+        struct
+        {
+            esp_bd_addr_t bda;
+            uint32_t numeric_value;
+            bool accept;
+        } pairing_confirm;
         struct
         {
             esp_a2d_connection_state_t state;
@@ -131,6 +139,7 @@ static bool s_pair_request_pending;
 static bool s_discovery_running;
 static bool s_a2dp_connected;
 static esp_bd_addr_t s_connected_bda;
+static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t s_avrc_tl;
 static bool s_avrc_rn_vol_registered;
 static bool s_avrc_ct_vol_registered;
@@ -140,6 +149,9 @@ EXT_RAM_BSS_ATTR static bluetooth_service_discovery_result_t s_discovered[BT_SVC
 static size_t s_discovered_count;
 static bluetooth_service_pcm_provider_t s_pcm_provider;
 static void *s_pcm_provider_ctx;
+static bool s_pairing_confirm_pending;
+static esp_bd_addr_t s_pairing_confirm_bda;
+static uint32_t s_pairing_confirm_numeric_value;
 static bluetooth_service_connection_cb_t s_connection_cb;
 static void *s_connection_cb_ctx;
 static bluetooth_service_media_key_cb_t s_media_key_cb;
@@ -155,6 +167,67 @@ static void bt_svc_post_event(bluetooth_service_event_id_t event_id, const void 
 static bool bt_svc_queue_send(const bluetooth_service_msg_t *msg)
 {
     return s_cmd_queue && xQueueSend(s_cmd_queue, msg, 0) == pdPASS;
+}
+
+static void bt_svc_set_pending_pairing_confirm(const esp_bd_addr_t bda, uint32_t numeric_value)
+{
+    taskENTER_CRITICAL(&s_state_lock);
+    s_pairing_confirm_pending = true;
+    memcpy(s_pairing_confirm_bda, bda, sizeof(s_pairing_confirm_bda));
+    s_pairing_confirm_numeric_value = numeric_value;
+    taskEXIT_CRITICAL(&s_state_lock);
+}
+
+static void bt_svc_clear_pending_pairing_confirm(void)
+{
+    taskENTER_CRITICAL(&s_state_lock);
+    s_pairing_confirm_pending = false;
+    memset(s_pairing_confirm_bda, 0, sizeof(s_pairing_confirm_bda));
+    s_pairing_confirm_numeric_value = 0;
+    taskEXIT_CRITICAL(&s_state_lock);
+}
+
+static bool bt_svc_get_pending_pairing_confirm(bluetooth_service_pairing_confirm_t *confirm)
+{
+    bool pending;
+
+    if (!confirm)
+    {
+        return false;
+    }
+
+    memset(confirm, 0, sizeof(*confirm));
+    taskENTER_CRITICAL(&s_state_lock);
+    pending = s_pairing_confirm_pending;
+    confirm->pending = pending;
+    if (pending)
+    {
+        memcpy(confirm->remote_bda, s_pairing_confirm_bda, sizeof(confirm->remote_bda));
+        confirm->numeric_value = s_pairing_confirm_numeric_value;
+    }
+    taskEXIT_CRITICAL(&s_state_lock);
+    return pending;
+}
+
+static bool bt_svc_take_pending_pairing_confirm(esp_bd_addr_t bda, uint32_t *numeric_value)
+{
+    bool pending;
+
+    taskENTER_CRITICAL(&s_state_lock);
+    pending = s_pairing_confirm_pending;
+    if (pending)
+    {
+        memcpy(bda, s_pairing_confirm_bda, ESP_BD_ADDR_LEN);
+        if (numeric_value)
+        {
+            *numeric_value = s_pairing_confirm_numeric_value;
+        }
+        s_pairing_confirm_pending = false;
+        memset(s_pairing_confirm_bda, 0, sizeof(s_pairing_confirm_bda));
+        s_pairing_confirm_numeric_value = 0;
+    }
+    taskEXIT_CRITICAL(&s_state_lock);
+    return pending;
 }
 
 static esp_err_t bt_svc_validate_a2dp_state(bool require_connected, const char *action)
@@ -307,6 +380,8 @@ static void bt_svc_store_discovery_result(const bluetooth_service_discovery_resu
 
 static int32_t bt_svc_a2dp_data_cb(uint8_t *data, int32_t len)
 {
+    bluetooth_service_pcm_provider_t provider;
+    void *provider_ctx;
     int32_t filled = 0;
 
     if (!data || len <= 0)
@@ -316,9 +391,14 @@ static int32_t bt_svc_a2dp_data_cb(uint8_t *data, int32_t len)
 
     memset(data, 0, (size_t)len);
 
-    if (s_pcm_provider)
+    taskENTER_CRITICAL(&s_state_lock);
+    provider = s_pcm_provider;
+    provider_ctx = s_pcm_provider_ctx;
+    taskEXIT_CRITICAL(&s_state_lock);
+
+    if (provider)
     {
-        filled = s_pcm_provider(data, len, s_pcm_provider_ctx);
+        filled = provider(data, len, provider_ctx);
         if (filled < 0)
         {
             filled = 0;
@@ -423,7 +503,10 @@ static void bt_svc_gap_bt_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t 
         break;
     }
     case ESP_BT_GAP_CFM_REQ_EVT:
-        esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+        msg.cmd = BT_SVC_CMD_PAIRING_CONFIRM_REQUEST;
+        memcpy(msg.data.pairing_confirm.bda, param->cfm_req.bda, ESP_BD_ADDR_LEN);
+        msg.data.pairing_confirm.numeric_value = param->cfm_req.num_val;
+        bt_svc_queue_send(&msg);
         break;
     default:
         break;
@@ -682,6 +765,33 @@ static void bt_svc_task(void *arg)
             if (s_a2dp_connected)
             {
                 ESP_LOGW(TAG, "ignoring pair request: A2DP device already connected");
+        case BT_SVC_CMD_PAIRING_CONFIRM_REQUEST:
+            bt_svc_set_pending_pairing_confirm(msg.data.pairing_confirm.bda,
+                                               msg.data.pairing_confirm.numeric_value);
+            ESP_LOGW(TAG,
+                     "pairing confirm pending for " ESP_BD_ADDR_STR " passkey=%06lu; use 'bt confirm accept' or 'bt confirm reject'",
+                     ESP_BD_ADDR_HEX(msg.data.pairing_confirm.bda),
+                     (unsigned long)msg.data.pairing_confirm.numeric_value);
+            break;
+        case BT_SVC_CMD_PAIRING_CONFIRM_REPLY:
+        {
+            esp_bd_addr_t remote_bda = {0};
+            uint32_t numeric_value = 0;
+
+            if (!bt_svc_take_pending_pairing_confirm(remote_bda, &numeric_value))
+            {
+                ESP_LOGW(TAG, "ignoring pairing confirm reply: no pending confirmation");
+                break;
+            }
+
+            ESP_LOGI(TAG,
+                     "%s pairing confirm for " ESP_BD_ADDR_STR " passkey=%06lu",
+                     msg.data.pairing_confirm.accept ? "accepting" : "rejecting",
+                     ESP_BD_ADDR_HEX(remote_bda),
+                     (unsigned long)numeric_value);
+            esp_bt_gap_ssp_confirm_reply(remote_bda, msg.data.pairing_confirm.accept);
+            break;
+        }
                 break;
             }
             bt_svc_reset_discovery_results();
@@ -740,6 +850,7 @@ static void bt_svc_task(void *arg)
             }
             break;
         case BT_SVC_CMD_AUTH_COMPLETE:
+            bt_svc_clear_pending_pairing_confirm();
             if (msg.data.auth.status == ESP_BT_STATUS_SUCCESS)
             {
                 ESP_LOGI(TAG,
@@ -999,6 +1110,32 @@ esp_err_t bluetooth_service_connect_last_bonded_a2dp_device(void)
     return xQueueSend(s_cmd_queue, &msg, pdMS_TO_TICKS(1000)) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
+esp_err_t bluetooth_service_get_pending_pairing_confirm(bluetooth_service_pairing_confirm_t *confirm)
+{
+    if (!confirm)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bt_svc_get_pending_pairing_confirm(confirm);
+    return ESP_OK;
+}
+
+esp_err_t bluetooth_service_reply_pairing_confirm(bool accept)
+{
+    bluetooth_service_msg_t msg = {
+        .cmd = BT_SVC_CMD_PAIRING_CONFIRM_REPLY,
+    };
+
+    if (!s_cmd_queue)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    msg.data.pairing_confirm.accept = accept;
+    return xQueueSend(s_cmd_queue, &msg, pdMS_TO_TICKS(1000)) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
 esp_err_t bluetooth_service_disconnect_a2dp(void)
 {
     bluetooth_service_msg_t msg = {.cmd = BT_SVC_CMD_DISCONNECT_A2DP};
@@ -1045,8 +1182,10 @@ esp_err_t bluetooth_service_send_media_key(uint8_t key_code)
 
 esp_err_t bluetooth_service_register_pcm_provider(bluetooth_service_pcm_provider_t provider, void *user_ctx)
 {
+    taskENTER_CRITICAL(&s_state_lock);
     s_pcm_provider = provider;
     s_pcm_provider_ctx = user_ctx;
+    taskEXIT_CRITICAL(&s_state_lock);
     return ESP_OK;
 }
 

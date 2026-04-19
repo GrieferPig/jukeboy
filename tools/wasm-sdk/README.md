@@ -44,7 +44,7 @@ cp target/wasm32-unknown-unknown/release/net-echo.wasm ../../flashfs/scripts/net
 
 On Windows PowerShell, use `Copy-Item` with the same paths.
 
-If you also want the scripts available from the staged QEMU SD image, copy them into `../../tools/out/scripts/<name>/<name>.wasm` as well before running `tools/run_qemu_firmware.py`.
+If you also want the scripts available from the staged QEMU SD image, copy them into `../../tools/out/scripts/<name>/<name>.wasm`, regenerate `../../build/sd_image.bin` with `python ../../tools/ensure_sd_image.py --image-path ../../build/sd_image.bin --source-dir ../../tools/out`, and then run `tools/run_qemu_firmware.py`.
 
 ## Run the Google example
 

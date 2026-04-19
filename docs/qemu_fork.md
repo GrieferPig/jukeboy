@@ -82,6 +82,8 @@ Two QOM device properties allow capturing the PCM stream for automated testing. 
 
 **Example — capture 5 seconds then exit:**
 
+Use `pc-bios` when launching from a source checkout. Installed or packaged QEMU layouts place the ROM files under `share/qemu` instead.
+
 ```sh
 # 48000 Hz × 2 ch × 2 bytes/sample × 5 s = 960 000 bytes
 qemu-system-xtensa.exe \
@@ -217,6 +219,8 @@ esptool.py --chip esp32 merge_bin --fill-flash-size 8MB -o qemu_flash.bin @flash
 ```
 
 Then launch:
+
+Use `qemu-official-9.0.0/pc-bios` when launching from the source tree. Installed or packaged QEMU layouts use `qemu-official-9.0.0/share/qemu` instead. `tools/run_qemu_firmware.py` handles that lookup automatically.
 
 ```sh
 qemu-official-9.0.0/install/qemu/bin/qemu-system-xtensa.exe \

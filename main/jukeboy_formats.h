@@ -51,6 +51,11 @@ extern "C"
         uint32_t file_num;
     } jukeboy_jbm_track_t;
 
+#define JUKEBOY_JBM_TRACK_ENTRY_BYTES ((uint32_t)sizeof(jukeboy_jbm_track_t))
+#define JUKEBOY_JBM_HEADER_BYTES ((uint32_t)sizeof(jukeboy_jbm_header_t))
+#define JUKEBOY_JBM_MAX_SIZE_BYTES \
+    (JUKEBOY_JBM_HEADER_BYTES + (JUKEBOY_MAX_TRACK_FILES * JUKEBOY_JBM_TRACK_ENTRY_BYTES))
+
     _Static_assert(sizeof(jukeboy_jba_header_t) == 9, "Unexpected .jba header size");
     _Static_assert(sizeof(jukeboy_jbm_header_t) == 1652, "Unexpected .jbm header size");
     _Static_assert(sizeof(jukeboy_jbm_track_t) == 392, "Unexpected .jbm track size");

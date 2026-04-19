@@ -14,6 +14,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_pthread.h"
 #include "esp_system.h"
@@ -37,6 +38,12 @@
  * them in PSRAM when external RAM support is enabled. */
 #define SCRIPT_SERVICE_WASM_STACK_SIZE (128 * 1024)
 #define SCRIPT_SERVICE_WASM_HEAP_SIZE (128 * 1024)
+#define SCRIPT_SERVICE_MAX_SCRIPT_SIZE (512 * 1024)
+#define SCRIPT_SERVICE_MAX_ARGC 32
+#define SCRIPT_SERVICE_MAX_ARG_LEN 256
+#define SCRIPT_SERVICE_MAX_ARG_STORAGE_BYTES \
+    ((SCRIPT_SERVICE_MAX_ARGC + 1U) * (SCRIPT_SERVICE_MAX_ARG_LEN + 1U))
+#define SCRIPT_SERVICE_MAX_PRINTF_CAPTURE_LEN 512
 
 #define SCRIPT_LFS_ROOT_PATH APP_LITTLEFS_MOUNT_PATH "/scripts"
 #define SCRIPT_CWASM_EXTENSION ".cwasm"
@@ -78,6 +85,104 @@ static esp_err_t s_last_run_err;
 static int64_t s_active_run_started_us;
 static int64_t s_last_run_finished_us;
 static uint32_t s_next_run_id = 1;
+EXT_RAM_BSS_ATTR static char s_log_trim_buffer[SCRIPT_SERVICE_LOG_MAX_SIZE];
+
+static esp_err_t script_validate_guest_buffer_from_native(wasm_exec_env_t exec_env,
+                                                          void *native_ptr,
+                                                          uint32_t size,
+                                                          bool allow_null,
+                                                          void **out_ptr)
+{
+    wasm_module_inst_t module_inst;
+    uint32_t offset;
+
+    if (!out_ptr)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_ptr = NULL;
+
+    if (!exec_env)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    module_inst = wasm_runtime_get_module_inst(exec_env);
+    if (!module_inst)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!native_ptr)
+    {
+        return allow_null ? ESP_OK : ESP_ERR_INVALID_ARG;
+    }
+
+    if (!wasm_runtime_validate_native_addr(module_inst, native_ptr, size == 0 ? 1 : size))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    offset = wasm_runtime_addr_native_to_app(module_inst, native_ptr);
+    if (offset == 0)
+    {
+        return allow_null ? ESP_OK : ESP_ERR_INVALID_ARG;
+    }
+
+    return script_socket_get_guest_buffer(module_inst, offset, size, allow_null, out_ptr) ==
+                   SCRIPT_SOCKET_WASI_ESUCCESS
+               ? ESP_OK
+               : ESP_ERR_INVALID_ARG;
+}
+
+static esp_err_t script_validate_guest_string_from_native(wasm_exec_env_t exec_env,
+                                                          const char *native_ptr,
+                                                          bool allow_null,
+                                                          const char **out_ptr)
+{
+    wasm_module_inst_t module_inst;
+    uint32_t offset;
+
+    if (!out_ptr)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_ptr = NULL;
+
+    if (!exec_env)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    module_inst = wasm_runtime_get_module_inst(exec_env);
+    if (!module_inst)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!native_ptr)
+    {
+        return allow_null ? ESP_OK : ESP_ERR_INVALID_ARG;
+    }
+
+    if (!wasm_runtime_validate_native_addr(module_inst, (void *)native_ptr, 1))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    offset = wasm_runtime_addr_native_to_app(module_inst, (void *)native_ptr);
+    if (offset == 0)
+    {
+        return allow_null ? ESP_OK : ESP_ERR_INVALID_ARG;
+    }
+
+    return script_socket_get_guest_string(module_inst, offset, allow_null, out_ptr) ==
+                   SCRIPT_SOCKET_WASI_ESUCCESS
+               ? ESP_OK
+               : ESP_ERR_INVALID_ARG;
+}
 
 static void script_set_result_message(script_service_run_result_t *result, const char *format, ...)
 {
@@ -208,7 +313,8 @@ static esp_err_t script_build_log_path_from_resolved_path(const char *resolved_p
 static esp_err_t script_trim_log_fd(int log_fd)
 {
     off_t log_size;
-    char *buffer = NULL;
+    off_t read_offset;
+    ssize_t bytes_read;
     size_t keep_offset = 0;
     esp_err_t err = ESP_OK;
 
@@ -228,35 +334,33 @@ static esp_err_t script_trim_log_fd(int log_fd)
         return ESP_OK;
     }
 
-    buffer = malloc((size_t)log_size);
-    if (!buffer)
+    read_offset = log_size - SCRIPT_SERVICE_LOG_MAX_SIZE;
+    if (read_offset < 0)
     {
-        return ESP_ERR_NO_MEM;
+        read_offset = 0;
     }
 
-    if (lseek(log_fd, 0, SEEK_SET) < 0)
+    if (lseek(log_fd, read_offset, SEEK_SET) < 0)
     {
         err = ESP_FAIL;
         goto done;
     }
 
-    if (read(log_fd, buffer, (size_t)log_size) != log_size)
+    bytes_read = read(log_fd, s_log_trim_buffer, sizeof(s_log_trim_buffer));
+    if (bytes_read < 0)
     {
         err = ESP_FAIL;
         goto done;
     }
 
-    while ((size_t)log_size - keep_offset > SCRIPT_SERVICE_LOG_MAX_SIZE)
+    if (read_offset > 0)
     {
-        char *newline = memchr(buffer + keep_offset, '\n', (size_t)log_size - keep_offset);
+        char *newline = memchr(s_log_trim_buffer, '\n', (size_t)bytes_read);
 
-        if (!newline)
+        if (newline)
         {
-            keep_offset = (size_t)log_size - SCRIPT_SERVICE_LOG_MAX_SIZE;
-            break;
+            keep_offset = (size_t)(newline - s_log_trim_buffer) + 1;
         }
-
-        keep_offset = (size_t)(newline - buffer) + 1;
     }
 
     if (lseek(log_fd, 0, SEEK_SET) < 0)
@@ -265,11 +369,11 @@ static esp_err_t script_trim_log_fd(int log_fd)
         goto done;
     }
 
-    if (keep_offset < (size_t)log_size)
+    if (keep_offset < (size_t)bytes_read)
     {
-        size_t kept_size = (size_t)log_size - keep_offset;
+        size_t kept_size = (size_t)bytes_read - keep_offset;
 
-        if (write(log_fd, buffer + keep_offset, kept_size) != (ssize_t)kept_size)
+        if (write(log_fd, s_log_trim_buffer + keep_offset, kept_size) != (ssize_t)kept_size)
         {
             err = ESP_FAIL;
             goto done;
@@ -294,7 +398,6 @@ static esp_err_t script_trim_log_fd(int log_fd)
     }
 
 done:
-    free(buffer);
     return err;
 }
 
@@ -317,16 +420,14 @@ static esp_err_t script_append_log_data(script_run_context_t *context,
 
 int wamr_host_vprintf_hook(const char *format, va_list ap)
 {
-    script_run_context_t *context = s_log_capture_context;
+    script_run_context_t *context = NULL;
     va_list console_args;
-    va_list size_args;
     va_list format_args;
     int console_result;
-    int required_len;
-    char stack_buffer[256];
-    char *buffer = stack_buffer;
+    int formatted_len = -1;
+    char buffer[SCRIPT_SERVICE_MAX_PRINTF_CAPTURE_LEN];
 
-    if (!format || !context || context->log_fd < 0)
+    if (!format)
     {
         return -1;
     }
@@ -335,32 +436,35 @@ int wamr_host_vprintf_hook(const char *format, va_list ap)
     console_result = vprintf(format, console_args);
     va_end(console_args);
 
-    va_copy(size_args, ap);
-    required_len = vsnprintf(NULL, 0, format, size_args);
-    va_end(size_args);
-
-    if (required_len > 0)
+    if (s_state_mutex)
     {
-        if ((size_t)required_len >= sizeof(stack_buffer))
-        {
-            buffer = malloc((size_t)required_len + 1);
-        }
-
-        if (buffer)
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        context = s_log_capture_context;
+        if (context && context->log_fd >= 0)
         {
             va_copy(format_args, ap);
-            vsnprintf(buffer, (size_t)required_len + 1, format, format_args);
+            formatted_len = vsnprintf(buffer, sizeof(buffer), format, format_args);
             va_end(format_args);
-            script_append_log_data(context, buffer, (size_t)required_len);
+
+            if (formatted_len > 0)
+            {
+                size_t copy_len = (size_t)formatted_len;
+
+                if (copy_len >= sizeof(buffer))
+                {
+                    copy_len = sizeof(buffer) - 1;
+                }
+
+                if (script_append_log_data(context, buffer, copy_len) != ESP_OK)
+                {
+                    formatted_len = -1;
+                }
+            }
         }
+        xSemaphoreGive(s_state_mutex);
     }
 
-    if (buffer != stack_buffer)
-    {
-        free(buffer);
-    }
-
-    return console_result >= 0 ? console_result : required_len;
+    return console_result >= 0 ? console_result : formatted_len;
 }
 
 static esp_err_t script_prepare_log_file(script_run_context_t *context)
@@ -639,6 +743,7 @@ static void script_ensure_directory(const char *path)
 static char **script_duplicate_argv(const char *program_path,
                                     int argc,
                                     const char *const *argv,
+                                    script_service_run_result_t *result,
                                     int *argc_out)
 {
     size_t total_bytes = 0;
@@ -646,18 +751,60 @@ static char **script_duplicate_argv(const char *program_path,
     char **argv_copy;
     char *storage;
     const char *effective_program_path = program_path && program_path[0] ? program_path : "script";
+    size_t program_len;
 
     if (argc_out)
     {
         *argc_out = 0;
     }
 
-    total_bytes += strlen(effective_program_path) + 1;
+    if (argc < 0 || argc > SCRIPT_SERVICE_MAX_ARGC)
+    {
+        script_set_result_message(result,
+                                  "too many script arguments (max %u)",
+                                  (unsigned)SCRIPT_SERVICE_MAX_ARGC);
+        return NULL;
+    }
+
+    if (argc > 0 && !argv)
+    {
+        script_set_result_message(result, "missing script arguments");
+        return NULL;
+    }
+
+    program_len = strnlen(effective_program_path, SCRIPT_SERVICE_MAX_ARG_LEN + 1);
+    if (program_len == 0 || program_len > SCRIPT_SERVICE_MAX_ARG_LEN)
+    {
+        script_set_result_message(result,
+                                  "script path exceeds max length (%u)",
+                                  (unsigned)SCRIPT_SERVICE_MAX_ARG_LEN);
+        return NULL;
+    }
+
+    total_bytes += program_len + 1;
 
     for (int index = 0; index < argc; index++)
     {
         const char *arg = argv[index] ? argv[index] : "";
-        total_bytes += strlen(arg) + 1;
+        size_t arg_len = strnlen(arg, SCRIPT_SERVICE_MAX_ARG_LEN + 1);
+
+        if (arg_len > SCRIPT_SERVICE_MAX_ARG_LEN)
+        {
+            script_set_result_message(result,
+                                      "script argument %d exceeds max length (%u)",
+                                      index,
+                                      (unsigned)SCRIPT_SERVICE_MAX_ARG_LEN);
+            return NULL;
+        }
+
+        total_bytes += arg_len + 1;
+        if (total_bytes > SCRIPT_SERVICE_MAX_ARG_STORAGE_BYTES)
+        {
+            script_set_result_message(result,
+                                      "script arguments exceed max storage (%u bytes)",
+                                      (unsigned)SCRIPT_SERVICE_MAX_ARG_STORAGE_BYTES);
+            return NULL;
+        }
     }
 
     argv_copy = malloc(sizeof(char *) * (size_t)(total_argc + 1) + total_bytes);
@@ -668,8 +815,8 @@ static char **script_duplicate_argv(const char *program_path,
 
     storage = (char *)(argv_copy + total_argc + 1);
     argv_copy[0] = storage;
-    memcpy(storage, effective_program_path, strlen(effective_program_path) + 1);
-    storage += strlen(effective_program_path) + 1;
+    memcpy(storage, effective_program_path, program_len + 1);
+    storage += program_len + 1;
 
     for (int index = 0; index < argc; index++)
     {
@@ -723,6 +870,15 @@ static uint8_t *script_load_file(const char *path, uint32_t *size_out, script_se
         return NULL;
     }
 
+    if ((size_t)file_size > SCRIPT_SERVICE_MAX_SCRIPT_SIZE)
+    {
+        fclose(file);
+        script_set_result_message(result,
+                                  "script exceeds max size (%u bytes)",
+                                  (unsigned)SCRIPT_SERVICE_MAX_SCRIPT_SIZE);
+        return NULL;
+    }
+
     if (fseek(file, 0, SEEK_SET) != 0)
     {
         fclose(file);
@@ -756,34 +912,41 @@ static uint8_t *script_load_file(const char *path, uint32_t *size_out, script_se
 
 static int log_wrapper(wasm_exec_env_t exec_env, const char *message)
 {
+    const char *guest_message = NULL;
     script_run_context_t *context = NULL;
 
-    (void)exec_env;
+    if (script_validate_guest_string_from_native(exec_env, message, false, &guest_message) != ESP_OK)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
 
     if (s_state_mutex)
     {
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-        context = s_active_run_context;
+        context = s_log_capture_context;
         if (context)
         {
             script_append_output(&context->result, "[wasm] ");
-            script_append_output(&context->result, message ? message : "");
+            script_append_output(&context->result, guest_message);
             script_append_output(&context->result, "\n");
+            if (context->log_fd >= 0)
+            {
+                static const char prefix[] = "[wasm] ";
+                static const char newline[] = "\n";
+
+                if (script_append_log_data(context, prefix, sizeof(prefix) - 1) == ESP_OK)
+                {
+                    size_t message_len = strlen(guest_message);
+
+                    if (message_len > 0)
+                    {
+                        (void)script_append_log_data(context, guest_message, message_len);
+                    }
+                    (void)script_append_log_data(context, newline, sizeof(newline) - 1);
+                }
+            }
         }
         xSemaphoreGive(s_state_mutex);
-    }
-
-    if (context)
-    {
-        static const char prefix[] = "[wasm] ";
-        static const char newline[] = "\n";
-
-        script_append_log_data(context, prefix, sizeof(prefix) - 1);
-        if (message && message[0] != '\0')
-        {
-            script_append_log_data(context, message, strlen(message));
-        }
-        script_append_log_data(context, newline, sizeof(newline) - 1);
     }
 
     return ESP_OK;
@@ -893,12 +1056,16 @@ static int get_track_count_wrapper(wasm_exec_env_t exec_env)
 
 static int get_track_title_wrapper(wasm_exec_env_t exec_env, int index, char *buf, uint32_t buf_len)
 {
+    char *guest_buf = NULL;
     const char *title;
     size_t title_len;
 
-    (void)exec_env;
-
     if (!buf || buf_len == 0 || index < 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (script_validate_guest_buffer_from_native(exec_env, buf, buf_len, false, (void **)&guest_buf) != ESP_OK)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -906,7 +1073,7 @@ static int get_track_title_wrapper(wasm_exec_env_t exec_env, int index, char *bu
     title = cartridge_service_get_track_name((size_t)index);
     if (!title)
     {
-        buf[0] = '\0';
+        guest_buf[0] = '\0';
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -916,8 +1083,8 @@ static int get_track_title_wrapper(wasm_exec_env_t exec_env, int index, char *bu
         title_len = buf_len - 1;
     }
 
-    memcpy(buf, title, title_len);
-    buf[title_len] = '\0';
+    memcpy(guest_buf, title, title_len);
+    guest_buf[title_len] = '\0';
     return ESP_OK;
 }
 
@@ -1016,13 +1183,13 @@ static void script_yield_task(void *pvParameters)
     {
         // Run every 1000 ms to give the watchdog a breather
         vTaskDelay(pdMS_TO_TICKS(1000));
-        
+
         // Stop the heavy WAMR execution
         vTaskSuspend(target_task);
-        
+
         // Sleep for exactly 1 OS tick (10ms on ESP32 by default) to let IDLE1 run
         vTaskDelay(1);
-        
+
         // Restart the WAMR execution
         vTaskResume(target_task);
     }
@@ -1129,11 +1296,11 @@ static esp_err_t script_execute_builtin_module(script_run_context_t *context,
 
     // Create the high priority task that will only exist while WAMR runs
     // PRIORITY = tskIDLE_PRIORITY + 1 ensures it preempts the runner.
-    xTaskCreatePinnedToCore(script_yield_task, 
-                            "ScriptYield", 
-                            2048, 
-                            (void *)xTaskGetCurrentTaskHandle(), 
-                            24, 
+    xTaskCreatePinnedToCore(script_yield_task,
+                            "ScriptYield",
+                            2048,
+                            (void *)xTaskGetCurrentTaskHandle(),
+                            24,
                             &yield_task_handle,
                             1); // Ensure we pin to exactly the same core as ScriptRunner
 
@@ -1221,6 +1388,7 @@ static esp_err_t script_execute_module(script_run_context_t *context)
     ESP_EARLY_LOGI(TAG, "exec instantiated");
 
     err = script_execute_builtin_module(context, module_inst);
+
     if (err != ESP_OK)
     {
         goto cleanup;
@@ -1273,14 +1441,18 @@ static void *script_runner_task(void *parameter)
 
     ESP_EARLY_LOGI(TAG, "runner env ready");
 
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_log_capture_context = context;
+    xSemaphoreGive(s_state_mutex);
     context->err = script_execute_module(context);
 
 done:
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     if (s_log_capture_context == context)
     {
         s_log_capture_context = NULL;
     }
+    xSemaphoreGive(s_state_mutex);
 
     if (context->log_fd >= 0)
     {
@@ -1391,6 +1563,7 @@ static esp_err_t script_prepare_context(const char *path,
     context->argv = script_duplicate_argv(context->result.resolved_path,
                                           argc,
                                           argv,
+                                          &context->result,
                                           &context->argc);
     if (!context->argv)
     {

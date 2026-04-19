@@ -7,10 +7,10 @@
 #include "esp_vfs_fat.h"
 #include "esp_log.h"
 #include "esp_attr.h"
-#include "esp_heap_caps.h"
 #include "esp_rom_crc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "cartridge_service.h"
@@ -25,10 +25,14 @@ static bool s_initialised = false;
 static bool s_mounted = false;
 static sdmmc_card_t *s_card = NULL;
 static cartridge_status_t s_status = CARTRIDGE_STATUS_EMPTY;
+static StaticSemaphore_t s_state_mutex_storage;
+static SemaphoreHandle_t s_state_mutex;
 static uint8_t *s_metadata_blob = NULL;
 static size_t s_metadata_blob_len = 0;
 static const jukeboy_jbm_header_t *s_metadata_header = NULL;
 static const jukeboy_jbm_track_t *s_metadata_tracks = NULL;
+static uint32_t s_mount_generation = 1;
+EXT_RAM_BSS_ATTR static uint8_t s_metadata_blob_storage[JUKEBOY_JBM_MAX_SIZE_BYTES];
 
 /* ---- Double-buffer async read state ---- */
 
@@ -51,6 +55,7 @@ typedef struct
 {
     char filename[256];
     size_t offset;
+    uint32_t generation;
     TaskHandle_t notify_task;
 } cartridge_read_request_t;
 
@@ -62,6 +67,16 @@ static uint32_t cartridge_service_crc32(const uint8_t *data, size_t len)
     return esp_rom_crc32_le(0, data, (uint32_t)len);
 }
 
+static void cartridge_service_close_file_locked(void)
+{
+    if (s_open_file)
+    {
+        fclose(s_open_file);
+        s_open_file = NULL;
+    }
+    s_open_filename[0] = '\0';
+}
+
 static void cartridge_service_set_status(cartridge_status_t status)
 {
     s_status = status;
@@ -69,15 +84,37 @@ static void cartridge_service_set_status(cartridge_status_t status)
 
 static void cartridge_service_free_metadata(void)
 {
-    if (s_metadata_blob)
-    {
-        free(s_metadata_blob);
-    }
-
+    memset(s_metadata_blob_storage, 0, sizeof(s_metadata_blob_storage));
     s_metadata_blob = NULL;
     s_metadata_blob_len = 0;
     s_metadata_header = NULL;
     s_metadata_tracks = NULL;
+}
+
+static void cartridge_service_sanitize_metadata_strings(jukeboy_jbm_header_t *header)
+{
+    jukeboy_jbm_track_t *tracks;
+
+    if (!header)
+    {
+        return;
+    }
+
+    header->album_name[JUKEBOY_JBM_ALBUM_NAME_BYTES - 1] = '\0';
+    header->album_description[JUKEBOY_JBM_ALBUM_DESCRIPTION_BYTES - 1] = '\0';
+    header->artist[JUKEBOY_JBM_ARTIST_BYTES - 1] = '\0';
+    header->genre[JUKEBOY_JBM_GENRE_BYTES - 1] = '\0';
+    for (size_t index = 0; index < JUKEBOY_JBM_TAG_COUNT; ++index)
+    {
+        header->tag[index][JUKEBOY_JBM_TAG_BYTES - 1] = '\0';
+    }
+
+    tracks = (jukeboy_jbm_track_t *)((uint8_t *)header + sizeof(*header));
+    for (size_t index = 0; index < header->track_count; ++index)
+    {
+        tracks[index].track_name[JUKEBOY_JBM_TRACK_NAME_BYTES - 1] = '\0';
+        tracks[index].artists[JUKEBOY_JBM_TRACK_ARTISTS_BYTES - 1] = '\0';
+    }
 }
 
 static esp_err_t cartridge_service_validate_metadata(uint8_t *blob, size_t blob_len)
@@ -129,6 +166,8 @@ static esp_err_t cartridge_service_validate_metadata(uint8_t *blob, size_t blob_
         return ESP_ERR_INVALID_CRC;
     }
 
+    cartridge_service_sanitize_metadata_strings(header);
+
     return ESP_OK;
 }
 
@@ -164,7 +203,7 @@ static esp_err_t cartridge_service_load_metadata(void)
     }
 
     file_size = ftell(metadata_file);
-    if (file_size <= 0)
+    if (file_size <= 0 || (unsigned long)file_size > JUKEBOY_JBM_MAX_SIZE_BYTES)
     {
         fclose(metadata_file);
         cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
@@ -178,18 +217,11 @@ static esp_err_t cartridge_service_load_metadata(void)
         return ESP_FAIL;
     }
 
-    blob = (uint8_t *)heap_caps_malloc((size_t)file_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!blob)
-    {
-        fclose(metadata_file);
-        cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
-        return ESP_ERR_NO_MEM;
-    }
+    blob = s_metadata_blob_storage;
 
     if (fread(blob, 1, (size_t)file_size, metadata_file) != (size_t)file_size)
     {
         fclose(metadata_file);
-        free(blob);
         cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
         return ESP_FAIL;
     }
@@ -199,7 +231,6 @@ static esp_err_t cartridge_service_load_metadata(void)
     err = cartridge_service_validate_metadata(blob, (size_t)file_size);
     if (err != ESP_OK)
     {
-        free(blob);
         cartridge_service_set_status(CARTRIDGE_STATUS_INVALID);
         return err;
     }
@@ -232,12 +263,25 @@ static void cartridge_reader_task(void *param)
             continue;
         }
 
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+
+        if (!s_mounted || req.generation != s_mount_generation)
+        {
+            s_result_data = NULL;
+            s_result_len = 0;
+            s_result_status = ESP_ERR_INVALID_STATE;
+            xSemaphoreGive(s_state_mutex);
+            if (req.notify_task)
+            {
+                xTaskNotifyGive(req.notify_task);
+            }
+            continue;
+        }
+
         /* If filename changed, close old and open new */
         if (s_open_file && strcmp(s_open_filename, req.filename) != 0)
         {
-            fclose(s_open_file);
-            s_open_file = NULL;
-            s_open_filename[0] = '\0';
+            cartridge_service_close_file_locked();
         }
 
         if (!s_open_file)
@@ -252,6 +296,7 @@ static void cartridge_reader_task(void *param)
                 s_result_data = NULL;
                 s_result_len = 0;
                 s_result_status = ESP_ERR_NOT_FOUND;
+                xSemaphoreGive(s_state_mutex);
                 if (req.notify_task)
                 {
                     xTaskNotifyGive(req.notify_task);
@@ -271,6 +316,7 @@ static void cartridge_reader_task(void *param)
             s_result_data = buf;
             s_result_len = 0;
             s_result_status = ESP_FAIL;
+            xSemaphoreGive(s_state_mutex);
             if (req.notify_task)
             {
                 xTaskNotifyGive(req.notify_task);
@@ -284,6 +330,8 @@ static void cartridge_reader_task(void *param)
         s_result_status = ESP_OK;
 
         ESP_LOGD(TAG, "read %u bytes at offset %u", (unsigned)bytes_read, (unsigned)req.offset);
+
+        xSemaphoreGive(s_state_mutex);
 
         if (req.notify_task)
         {
@@ -301,6 +349,15 @@ esp_err_t cartridge_service_init(const cartridge_service_config_t *config)
 
     s_config = *config;
     s_initialised = true;
+
+    if (!s_state_mutex)
+    {
+        s_state_mutex = xSemaphoreCreateMutexStatic(&s_state_mutex_storage);
+        if (!s_state_mutex)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     /* Create the async reader task and its request queue */
     if (!s_read_queue)
@@ -399,6 +456,13 @@ esp_err_t cartridge_service_mount(void)
     }
 
     s_mounted = true;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_mount_generation++;
+    if (s_mount_generation == 0)
+    {
+        s_mount_generation = 1;
+    }
+    xSemaphoreGive(s_state_mutex);
     sdmmc_card_print_info(stdout, s_card);
     ESP_LOGI(TAG, "SD card mounted at %s", s_config.mount_point);
     if (cartridge_service_load_metadata() != ESP_OK)
@@ -416,12 +480,19 @@ esp_err_t cartridge_service_unmount(void)
         return ESP_OK;
     }
 
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     esp_vfs_fat_sdcard_unmount(s_config.mount_point, s_card);
-    cartridge_service_close_file();
+    cartridge_service_close_file_locked();
     cartridge_service_free_metadata();
     s_card = NULL;
     s_mounted = false;
+    s_mount_generation++;
+    if (s_mount_generation == 0)
+    {
+        s_mount_generation = 1;
+    }
     cartridge_service_set_status(CARTRIDGE_STATUS_EMPTY);
+    xSemaphoreGive(s_state_mutex);
     ESP_LOGI(TAG, "SD card unmounted");
     cartridge_service_post_event(CARTRIDGE_SVC_EVENT_UNMOUNTED);
     return ESP_OK;
@@ -577,9 +648,12 @@ esp_err_t cartridge_service_read_chunk_async(const char *filename,
     }
 
     cartridge_read_request_t req = {0};
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     strncpy(req.filename, filename, sizeof(req.filename) - 1);
     req.offset = offset;
+    req.generation = s_mount_generation;
     req.notify_task = notify_task;
+    xSemaphoreGive(s_state_mutex);
 
     if (xQueueSend(s_read_queue, &req, 0) != pdTRUE)
     {
@@ -605,10 +679,13 @@ esp_err_t cartridge_service_get_read_result(const uint8_t **out_data,
 
 void cartridge_service_close_file(void)
 {
-    if (s_open_file)
+    if (!s_state_mutex)
     {
-        fclose(s_open_file);
-        s_open_file = NULL;
+        cartridge_service_close_file_locked();
+        return;
     }
-    s_open_filename[0] = '\0';
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    cartridge_service_close_file_locked();
+    xSemaphoreGive(s_state_mutex);
 }

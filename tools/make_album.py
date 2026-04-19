@@ -10,6 +10,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,8 +40,9 @@ TARGET_CHANNELS = 2
 TARGET_BITRATE = 160000
 FRAME_DURATION_MS = 20
 PACKETS_PER_SECOND = 1000 // FRAME_DURATION_MS
-MAX_OUTPUT_FILES = 1000
+MAX_OUTPUT_FILES = 999
 MAX_CHUNK_BYTES = 24 * 1024
+UINT32_MAX = 0xFFFFFFFF
 JBM_ALBUM_NAME_BYTES = 128
 JBM_ALBUM_DESCRIPTION_BYTES = 1024
 JBM_ARTIST_BYTES = 256
@@ -125,44 +127,60 @@ def collect_audio_files(input_path: Path) -> list[Path]:
 
 
 def run_ffmpeg(ffmpeg: str, input_file: Path) -> bytes:
-    command = [
-        ffmpeg,
-        "-v",
-        "error",
-        "-nostdin",
-        "-i",
-        str(input_file),
-        "-map",
-        "a:0",
-        "-vn",
-        "-sn",
-        "-dn",
-        "-c:a",
-        "libopus",
-        "-b:a",
-        str(TARGET_BITRATE),
-        "-vbr",
-        "off",
-        "-application",
-        "audio",
-        "-frame_duration",
-        str(FRAME_DURATION_MS),
-        "-ar",
-        str(TARGET_SAMPLE_RATE),
-        "-ac",
-        str(TARGET_CHANNELS),
-        "-f",
-        "ogg",
-        "pipe:1",
-    ]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_path = Path(temp_dir) / "transcoded.ogg"
+        command = [
+            ffmpeg,
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(input_file),
+            "-map",
+            "a:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            str(TARGET_BITRATE),
+            "-vbr",
+            "off",
+            "-application",
+            "audio",
+            "-frame_duration",
+            str(FRAME_DURATION_MS),
+            "-ar",
+            str(TARGET_SAMPLE_RATE),
+            "-ac",
+            str(TARGET_CHANNELS),
+            "-f",
+            "ogg",
+            str(output_path),
+        ]
 
-    result = subprocess.run(command, capture_output=True, check=False)
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"ffmpeg failed for {input_file}: {stderr or 'unknown error'}"
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
         )
-    return result.stdout
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"ffmpeg failed for {input_file}: {stderr or 'unknown error'}"
+            )
+        if not output_path.is_file():
+            raise RuntimeError(f"ffmpeg did not produce output for {input_file}")
+        return output_path.read_bytes()
+
+
+def require_uint32(value: int, description: str) -> int:
+    if value < 0 or value > UINT32_MAX:
+        raise ValueError(f"{description} must fit in uint32; got {value}")
+    return value
 
 
 def probe_duration_seconds(ffmpeg: str, input_file: Path) -> int:
@@ -287,16 +305,21 @@ def build_jba(chunks: list[bytes]) -> bytes:
 
     lookup_table = []
     offset = 0
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
+        require_uint32(offset, f"lookup offset for chunk {index}")
         lookup_table.append(offset)
         offset += len(chunk)
+        require_uint32(offset, "combined JBA payload size")
 
+    require_uint32(len(lookup_table), "lookup table entry count")
     lookup_bytes = b"".join(struct.pack("<I", entry) for entry in lookup_table)
     header_size = struct.calcsize("<BII") + len(lookup_bytes)
     header_blocks = (header_size + HEADER_BLOCK_SIZE - 1) // HEADER_BLOCK_SIZE
+    require_uint32(header_blocks, "JBA header block count")
     header = struct.pack("<BII", JBA_VERSION, header_blocks, len(lookup_table))
     padding_len = header_blocks * HEADER_BLOCK_SIZE - (len(header) + len(lookup_bytes))
     padding = b"\x00" * padding_len
+    require_uint32(header_blocks * HEADER_BLOCK_SIZE + offset, "JBA file size")
     return header + lookup_bytes + padding + b"".join(chunks)
 
 
@@ -416,6 +439,10 @@ def build_jbm(album: AlbumMetadata) -> bytes:
     if len(album.tracks) > MAX_OUTPUT_FILES:
         raise ValueError(f"track count exceeds {MAX_OUTPUT_FILES}")
 
+    require_uint32(album.year, "album year")
+    require_uint32(album.duration_sec, "album duration")
+    require_uint32(len(album.tracks), "track count")
+
     header = bytearray()
     header.extend(struct.pack("<I", JBM_VERSION))
     header.extend(struct.pack("<I", 0))
@@ -434,12 +461,15 @@ def build_jbm(album: AlbumMetadata) -> bytes:
 
     tracks = bytearray()
     for track in album.tracks:
+        require_uint32(track.duration_sec, f"duration for track {track.file_num}")
+        require_uint32(track.file_num, f"file number for track {track.file_num}")
         tracks.extend(encode_fixed_string(track.track_name, JBM_TRACK_NAME_BYTES))
         tracks.extend(encode_fixed_string(track.artists, JBM_TRACK_ARTISTS_BYTES))
         tracks.extend(struct.pack("<I", track.duration_sec))
         tracks.extend(struct.pack("<I", track.file_num))
 
     payload = header + tracks
+    require_uint32(len(payload), "JBM metadata size")
     checksum = binascii.crc32(payload) & 0xFFFFFFFF
     struct.pack_into("<I", payload, 4, checksum)
     return bytes(payload)

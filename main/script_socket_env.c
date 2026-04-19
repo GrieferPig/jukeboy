@@ -269,11 +269,11 @@ static uint8_t script_socket_type_from_native(int socket_type)
     }
 }
 
-static uint16_t script_socket_get_guest_buffer(wasm_module_inst_t module_inst,
-                                               uint32_t offset,
-                                               uint32_t size,
-                                               bool allow_null,
-                                               void **out_ptr)
+uint16_t script_socket_get_guest_buffer(wasm_module_inst_t module_inst,
+                                        uint32_t offset,
+                                        uint32_t size,
+                                        bool allow_null,
+                                        void **out_ptr)
 {
     if (!out_ptr)
     {
@@ -296,10 +296,10 @@ static uint16_t script_socket_get_guest_buffer(wasm_module_inst_t module_inst,
     return *out_ptr || size == 0 ? WASI_ESUCCESS : WASI_EFAULT;
 }
 
-static uint16_t script_socket_get_guest_string(wasm_module_inst_t module_inst,
-                                               uint32_t offset,
-                                               bool allow_null,
-                                               const char **out_ptr)
+uint16_t script_socket_get_guest_string(wasm_module_inst_t module_inst,
+                                        uint32_t offset,
+                                        bool allow_null,
+                                        const char **out_ptr)
 {
     if (!out_ptr)
     {

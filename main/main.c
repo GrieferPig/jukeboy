@@ -5,6 +5,7 @@
  */
 
 #include "nvs_flash.h"
+#include "esp_partition.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 // #include "esp_flash_dispatcher.h"
@@ -34,6 +35,53 @@
 static const char *TAG = "main";
 static const bool QEMU_PCM_SERVICE_ENABLED = true;
 
+static esp_err_t app_init_secure_nvs(void)
+{
+    const esp_partition_t *keys_partition;
+    nvs_sec_cfg_t security_cfg = {0};
+    esp_err_t err;
+
+    keys_partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                              ESP_PARTITION_SUBTYPE_DATA_NVS_KEYS,
+                                              "nvs_keys");
+    if (!keys_partition)
+    {
+        ESP_LOGE(TAG, "missing nvs_keys partition for secure NVS init");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    err = nvs_flash_read_security_cfg(keys_partition, &security_cfg);
+    if (err == ESP_ERR_NVS_KEYS_NOT_INITIALIZED)
+    {
+        ESP_LOGW(TAG, "NVS keys are not initialized; generating fresh keys");
+        err = nvs_flash_generate_keys(keys_partition, &security_cfg);
+    }
+    else if (err == ESP_ERR_NVS_CORRUPT_KEY_PART)
+    {
+        ESP_LOGW(TAG, "NVS key partition is corrupt; erasing and regenerating keys");
+        err = esp_partition_erase_range(keys_partition, 0, keys_partition->size);
+        if (err == ESP_OK)
+        {
+            err = nvs_flash_generate_keys(keys_partition, &security_cfg);
+        }
+    }
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = nvs_flash_secure_init(&security_cfg);
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_LOGW(TAG, "erasing default NVS partition before secure re-init: %s", esp_err_to_name(err));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_secure_init(&security_cfg);
+    }
+
+    return err;
+}
+
 void app_main(void)
 {
     // const esp_flash_dispatcher_config_t flash_dispatcher_cfg = ESP_FLASH_DISPATCHER_DEFAULT_CONFIG;
@@ -61,7 +109,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(power_mgmt_service_init());
 
-    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(app_init_secure_nvs());
     ESP_ERROR_CHECK(ramdisk_service_init());
     ESP_ERROR_CHECK(esp_vfs_littlefs_register(&littlefs_cfg));
 

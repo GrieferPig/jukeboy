@@ -91,6 +91,42 @@ static bool s_initialised;
 static StaticTask_t s_task_tcb;
 static StackType_t s_task_stack[SVC_TASK_STACK_SIZE];
 
+static void wifi_zero_buffer(void *buffer, size_t len)
+{
+    volatile uint8_t *cursor = (volatile uint8_t *)buffer;
+
+    while (cursor && len-- > 0)
+    {
+        *cursor++ = 0;
+    }
+}
+
+static esp_err_t wifi_copy_cstring(char *dest, size_t dest_len, const char *src)
+{
+    size_t copy_len;
+
+    if (!dest || dest_len == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!src)
+    {
+        dest[0] = '\0';
+        return ESP_OK;
+    }
+
+    copy_len = strnlen(src, dest_len);
+    if (copy_len >= dest_len)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    memcpy(dest, src, copy_len);
+    dest[copy_len] = '\0';
+    return ESP_OK;
+}
+
 /* ── Helpers: NVS ───────────────────────────────────────────────────── */
 
 static esp_err_t nvs_save_creds(const char *ssid, const char *password)
@@ -98,10 +134,20 @@ static esp_err_t nvs_save_creds(const char *ssid, const char *password)
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK)
+    {
         return err;
-    nvs_set_str(h, NVS_KEY_SSID, ssid);
-    nvs_set_str(h, NVS_KEY_PASS, password);
-    err = nvs_commit(h);
+    }
+
+    err = nvs_set_str(h, NVS_KEY_SSID, ssid ? ssid : "");
+    if (err == ESP_OK)
+    {
+        err = nvs_set_str(h, NVS_KEY_PASS, password ? password : "");
+    }
+
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(h);
+    }
     nvs_close(h);
     return err;
 }
@@ -139,38 +185,54 @@ static esp_err_t wifi_service_connect_saved_credentials(void)
     char ssid[33] = {0};
     char password[65] = {0};
     wifi_config_t cfg = {0};
+    esp_err_t err;
+
     cfg.sta.listen_interval = 3;
-    esp_err_t err = nvs_load_creds(ssid, sizeof(ssid), password, sizeof(password));
+    err = nvs_load_creds(ssid, sizeof(ssid), password, sizeof(password));
 
     if (err != ESP_OK)
     {
         ESP_LOGW(TAG, "no saved WiFi credentials available for reconnect: %s", esp_err_to_name(err));
-        return err;
+        goto cleanup;
     }
 
-    strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
-    strncpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+    password[sizeof(password) - 1] = '\0';
+
+    err = wifi_copy_cstring((char *)cfg.sta.ssid, sizeof(cfg.sta.ssid), ssid);
+    if (err == ESP_OK)
+    {
+        err = wifi_copy_cstring((char *)cfg.sta.password, sizeof(cfg.sta.password), password);
+    }
+    if (err != ESP_OK)
+    {
+        goto cleanup;
+    }
 
     err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "failed to apply saved WiFi config: %s", esp_err_to_name(err));
-        return err;
+        goto cleanup;
     }
 
     err = esp_wifi_connect();
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "esp_wifi_connect failed using saved credentials: %s", esp_err_to_name(err));
-        return err;
+        goto cleanup;
     }
 
-    ESP_LOGI(TAG, "connecting using saved credentials for SSID '%s'", ssid);
+    ESP_LOGI(TAG, "connecting using saved credentials");
     s_state = WIFI_SVC_STATE_CONNECTING;
     s_have_ip_info = false;
     memset(&s_ip_info, 0, sizeof(s_ip_info));
     post_event(WIFI_SVC_EVENT_CONNECTING, NULL, 0);
-    return ESP_OK;
+
+cleanup:
+    wifi_zero_buffer(password, sizeof(password));
+    wifi_zero_buffer(cfg.sta.password, sizeof(cfg.sta.password));
+    return err;
 }
 
 /* ── DNS connectivity test (runs in service task context) ───────────── */
@@ -289,19 +351,26 @@ static void wifi_service_task(void *arg)
 
             case CMD_CONNECT:
             {
-                ESP_LOGI(TAG, "connecting to '%s'", msg.payload.connect.ssid);
-                nvs_save_creds(msg.payload.connect.ssid,
-                               msg.payload.connect.password);
-
                 wifi_config_t cfg = {0};
+
+                ESP_LOGI(TAG, "starting WiFi connection request");
                 cfg.sta.listen_interval = 3;
 
-                strncpy((char *)cfg.sta.ssid,
-                        msg.payload.connect.ssid,
-                        sizeof(cfg.sta.ssid) - 1);
-                strncpy((char *)cfg.sta.password,
-                        msg.payload.connect.password,
-                        sizeof(cfg.sta.password) - 1);
+                if (wifi_copy_cstring((char *)cfg.sta.ssid,
+                                      sizeof(cfg.sta.ssid),
+                                      msg.payload.connect.ssid) != ESP_OK ||
+                    wifi_copy_cstring((char *)cfg.sta.password,
+                                      sizeof(cfg.sta.password),
+                                      msg.payload.connect.password) != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "rejected WiFi credentials with oversized SSID or password");
+                    wifi_zero_buffer(msg.payload.connect.password, sizeof(msg.payload.connect.password));
+                    wifi_zero_buffer(cfg.sta.password, sizeof(cfg.sta.password));
+                    break;
+                }
+
+                (void)nvs_save_creds(msg.payload.connect.ssid,
+                                     msg.payload.connect.password);
 
                 esp_wifi_disconnect(); /* in case already connected */
                 esp_wifi_set_config(WIFI_IF_STA, &cfg);
@@ -310,6 +379,8 @@ static void wifi_service_task(void *arg)
                 s_have_ip_info = false;
                 memset(&s_ip_info, 0, sizeof(s_ip_info));
                 post_event(WIFI_SVC_EVENT_CONNECTING, NULL, 0);
+                wifi_zero_buffer(msg.payload.connect.password, sizeof(msg.payload.connect.password));
+                wifi_zero_buffer(cfg.sta.password, sizeof(cfg.sta.password));
                 break;
             }
 
@@ -494,16 +565,35 @@ esp_err_t wifi_service_init(void)
 
 esp_err_t wifi_service_connect(const char *ssid, const char *password)
 {
+    esp_err_t err;
+
     if (!ssid)
-        return ESP_ERR_INVALID_ARG;
-    wifi_svc_msg_t msg = {.cmd = CMD_CONNECT};
-    strncpy(msg.payload.connect.ssid, ssid,
-            sizeof(msg.payload.connect.ssid) - 1);
-    if (password)
     {
-        strncpy(msg.payload.connect.password, password,
-                sizeof(msg.payload.connect.password) - 1);
+        return ESP_ERR_INVALID_ARG;
     }
+
+    if (!s_cmd_queue)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    wifi_svc_msg_t msg = {.cmd = CMD_CONNECT};
+    err = wifi_copy_cstring(msg.payload.connect.ssid,
+                            sizeof(msg.payload.connect.ssid),
+                            ssid);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = wifi_copy_cstring(msg.payload.connect.password,
+                            sizeof(msg.payload.connect.password),
+                            password ? password : "");
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
     return xQueueSend(s_cmd_queue, &msg, pdMS_TO_TICKS(1000)) == pdPASS
                ? ESP_OK
                : ESP_ERR_TIMEOUT;

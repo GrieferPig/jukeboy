@@ -53,7 +53,7 @@ extern "C"
     /**
      * Initialise the WiFi service: creates the service task, command queue,
      * default netif, WiFi driver in STA mode, and posts WIFI_SVC_EVENT_STARTED.
-     * Must be called after nvs_flash_init().
+        * Must be called after the application's secure NVS initialization step.
      */
     esp_err_t wifi_service_init(void);
 

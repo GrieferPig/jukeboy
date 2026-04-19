@@ -2,7 +2,7 @@
 
 #include "diskio_impl.h"
 #include "esp_check.h"
-#include "esp_heap_caps.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "ff.h"
@@ -28,6 +28,7 @@ typedef struct
 static ramdisk_service_state_t s_state = {
     .pdrv = FF_DRV_NOT_USED,
 };
+EXT_RAM_BSS_ATTR static uint8_t s_ramdisk_storage[RAMDISK_SERVICE_SIZE_BYTES];
 
 static bool ramdisk_service_bounds_valid(LBA_t sector, UINT count)
 {
@@ -234,10 +235,7 @@ esp_err_t ramdisk_service_init(void)
         return ESP_OK;
     }
 
-    s_state.storage = heap_caps_malloc(RAMDISK_SERVICE_SIZE_BYTES,
-                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    ESP_RETURN_ON_FALSE(s_state.storage != NULL, ESP_ERR_NO_MEM, TAG, "failed to allocate %u-byte PSRAM ramdisk", (unsigned)RAMDISK_SERVICE_SIZE_BYTES);
-
+    s_state.storage = s_ramdisk_storage;
     memset(s_state.storage, 0, RAMDISK_SERVICE_SIZE_BYTES);
     s_state.storage_size = RAMDISK_SERVICE_SIZE_BYTES;
     s_state.sector_count = RAMDISK_SERVICE_SIZE_BYTES / RAMDISK_SECTOR_SIZE;
@@ -245,7 +243,6 @@ esp_err_t ramdisk_service_init(void)
     err = ff_diskio_get_drive(&s_state.pdrv);
     if (err != ESP_OK)
     {
-        heap_caps_free(s_state.storage);
         s_state.storage = NULL;
         return err;
     }
@@ -257,7 +254,6 @@ esp_err_t ramdisk_service_init(void)
     err = ramdisk_service_format_and_mount();
     if (err != ESP_OK)
     {
-        heap_caps_free(s_state.storage);
         s_state.storage = NULL;
         s_state.pdrv = FF_DRV_NOT_USED;
         s_state.storage_size = 0;

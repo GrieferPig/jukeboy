@@ -62,6 +62,7 @@
 #define PLAYER_SVC_RESUME_STATE_VERSION 1U
 #define PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS 100
 #define PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS 100
+#define PLAYER_SVC_MAX_LOOKUP_ENTRIES (24U * 60U * 60U)
 
 #define PLAYER_SVC_VOLUME_LEVEL_COUNT 11
 #define PLAYER_SVC_DEFAULT_VOLUME_LEVEL (PLAYER_SVC_VOLUME_LEVEL_COUNT - 1)
@@ -193,6 +194,9 @@ static player_service_playlist_entry_t *s_playlist = NULL;
 static size_t s_playlist_capacity = 0;
 static size_t *s_shuffle_order = NULL; /* PSRAM array; length == s_playlist_count */
 static size_t s_shuffle_position = 0;  /* position of current track in s_shuffle_order; SIZE_MAX = not started */
+EXT_RAM_BSS_ATTR static player_service_playlist_entry_t s_playlist_storage[JUKEBOY_MAX_TRACK_FILES];
+EXT_RAM_BSS_ATTR static size_t s_shuffle_order_storage[JUKEBOY_MAX_TRACK_FILES];
+EXT_RAM_BSS_ATTR static uint32_t s_lookup_table_storage[PLAYER_SVC_MAX_LOOKUP_ENTRIES];
 
 static void player_service_post_event(player_service_event_id_t event_id, const void *data, size_t len)
 {
@@ -348,11 +352,6 @@ static bool player_service_wait_for_notification(uint32_t generation)
 
 static void player_service_free_track_info(void)
 {
-    if (s_track_info.lookup_table)
-    {
-        free(s_track_info.lookup_table);
-    }
-
     memset(&s_track_info, 0, sizeof(s_track_info));
 }
 
@@ -532,6 +531,7 @@ static esp_err_t player_service_shutdown_callback(void *user_ctx)
 static bool player_service_load_saved_playback_status(size_t *track_index, size_t *start_chunk)
 {
     const jukeboy_jbm_header_t *metadata = cartridge_service_get_metadata_header();
+    size_t metadata_track_count = cartridge_service_get_metadata_track_count();
     nvs_handle_t handle;
     player_service_resume_state_t status;
     size_t status_size = sizeof(status);
@@ -586,12 +586,15 @@ static bool player_service_load_saved_playback_status(size_t *track_index, size_
         return false;
     }
 
-    if (status.track_count != metadata->track_count || (size_t)status.current_track_num >= s_playlist_count)
+    if (status.track_count != metadata->track_count ||
+        (size_t)status.current_track_num >= metadata_track_count ||
+        (size_t)status.current_track_num >= s_playlist_count)
     {
         ESP_LOGW(TAG,
-                 "discarding resume state with invalid track index %lu for %lu-track cartridge",
+                 "discarding resume state with invalid track index %lu for metadata=%lu playlist=%u",
                  (unsigned long)status.current_track_num,
-                 (unsigned long)metadata->track_count);
+                 (unsigned long)metadata_track_count,
+                 (unsigned)s_playlist_count);
         (void)player_service_erase_saved_playback_status_locked(handle);
         nvs_close(handle);
         return false;
@@ -641,6 +644,7 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
     const uint8_t *buf = NULL;
     size_t buf_len = 0;
     size_t total_file_size = 0;
+    uint64_t data_offset = 0;
     esp_err_t err;
 
     if (!filename || !info)
@@ -678,7 +682,34 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    info->data_offset = (size_t)header.header_len_in_blocks * 512U;
+    if (header.lookup_table_len > (SIZE_MAX - sizeof(jukeboy_jba_header_t)) / sizeof(uint32_t))
+    {
+        ESP_LOGE(TAG, "lookup table length %lu overflows size calculations for %s",
+                 (unsigned long)header.lookup_table_len,
+                 filename);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (header.lookup_table_len > PLAYER_SVC_MAX_LOOKUP_ENTRIES)
+    {
+        ESP_LOGE(TAG,
+                 "lookup table length %lu exceeds static cap %u for %s",
+                 (unsigned long)header.lookup_table_len,
+                 (unsigned)PLAYER_SVC_MAX_LOOKUP_ENTRIES,
+                 filename);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    data_offset = (uint64_t)header.header_len_in_blocks * JUKEBOY_JBA_HEADER_BLOCK_SIZE;
+    if (data_offset == 0 || data_offset > SIZE_MAX)
+    {
+        ESP_LOGE(TAG, "invalid header data offset %llu for %s",
+                 (unsigned long long)data_offset,
+                 filename);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    info->data_offset = (size_t)data_offset;
     info->lookup_table_len = header.lookup_table_len;
     if (info->data_offset == 0 || info->lookup_table_len == 0)
     {
@@ -688,19 +719,13 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
 
     size_t lt_bytes = info->lookup_table_len * sizeof(uint32_t);
     size_t min_header_bytes = sizeof(jukeboy_jba_header_t) + lt_bytes;
-    lookup_table = (uint32_t *)heap_caps_malloc(lt_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!lookup_table)
-    {
-        ESP_LOGE(TAG, "failed to allocate lookup table (%u bytes)", (unsigned)lt_bytes);
-        return ESP_ERR_NO_MEM;
-    }
+    lookup_table = s_lookup_table_storage;
 
     snprintf(full_path, sizeof(full_path), "%s/%s", cartridge_service_get_mount_point(), filename);
     struct stat st;
     if (stat(full_path, &st) != 0)
     {
         ESP_LOGE(TAG, "failed to stat %s for file size", full_path);
-        free(lookup_table);
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -708,7 +733,6 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
     if (file_size <= 0 || (size_t)file_size <= info->data_offset)
     {
         ESP_LOGE(TAG, "invalid file size %ld for %s", file_size, full_path);
-        free(lookup_table);
         return ESP_FAIL;
     }
     total_file_size = (size_t)file_size;
@@ -716,8 +740,7 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
     if (info->data_offset < min_header_bytes)
     {
         ESP_LOGE(TAG, "data offset too small for %s", filename);
-        free(lookup_table);
-        return ESP_FAIL;
+        return ESP_ERR_INVALID_SIZE;
     }
 
     size_t lt_offset = sizeof(jukeboy_jba_header_t);
@@ -771,7 +794,6 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
         if (remaining > 0)
         {
             ESP_LOGE(TAG, "failed to read full lookup table for %s", filename);
-            free(lookup_table);
             return err == ESP_OK ? ESP_FAIL : err;
         }
     }
@@ -780,7 +802,6 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
     if (lookup_table[0] != 0)
     {
         ESP_LOGE(TAG, "lookup table must start at offset 0 for %s", filename);
-        free(lookup_table);
         return ESP_FAIL;
     }
 
@@ -792,21 +813,18 @@ static esp_err_t player_service_load_track_info(const char *filename, player_ser
         if (chunk_start > total_data_bytes || chunk_end > total_data_bytes || chunk_end < chunk_start)
         {
             ESP_LOGE(TAG, "invalid lookup table entry %u for %s", (unsigned)index, filename);
-            free(lookup_table);
             return ESP_FAIL;
         }
 
         if ((chunk_end - chunk_start) <= PLAYER_SVC_CHUNK_CRC_BYTES)
         {
             ESP_LOGE(TAG, "chunk %u too small for crc32 in %s", (unsigned)index, filename);
-            free(lookup_table);
             return ESP_FAIL;
         }
 
         if ((chunk_end - chunk_start) > PLAYER_SVC_CHUNK_MAX_BYTES)
         {
             ESP_LOGE(TAG, "chunk %u exceeds max size in %s", (unsigned)index, filename);
-            free(lookup_table);
             return ESP_FAIL;
         }
     }
@@ -992,17 +1010,14 @@ static void player_service_build_shuffle_order(void)
 
 static void player_service_free_playlist(void)
 {
-    if (s_playlist)
+    if (s_playlist_count > 0)
     {
-        heap_caps_free(s_playlist);
-        s_playlist = NULL;
+        memset(s_playlist_storage, 0, s_playlist_count * sizeof(s_playlist_storage[0]));
+        memset(s_shuffle_order_storage, 0, s_playlist_count * sizeof(s_shuffle_order_storage[0]));
     }
 
-    if (s_shuffle_order)
-    {
-        heap_caps_free(s_shuffle_order);
-        s_shuffle_order = NULL;
-    }
+    s_playlist = NULL;
+    s_shuffle_order = NULL;
 
     s_playlist_count = 0;
     s_playlist_capacity = 0;
@@ -1022,14 +1037,18 @@ static void player_service_scan_playlist(void)
         return;
     }
 
-    s_playlist = heap_caps_calloc(metadata_track_count, sizeof(player_service_playlist_entry_t),
-                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_playlist)
+    if (metadata_track_count > JUKEBOY_MAX_TRACK_FILES)
     {
-        ESP_LOGE(TAG, "failed to allocate playlist for %u tracks", (unsigned)metadata_track_count);
+        ESP_LOGE(TAG, "metadata track count %u exceeds playlist storage cap %u",
+                 (unsigned)metadata_track_count,
+                 (unsigned)JUKEBOY_MAX_TRACK_FILES);
         return;
     }
-    s_playlist_capacity = metadata_track_count;
+
+    memset(s_playlist_storage, 0, sizeof(s_playlist_storage));
+    memset(s_shuffle_order_storage, 0, sizeof(s_shuffle_order_storage));
+    s_playlist = s_playlist_storage;
+    s_playlist_capacity = JUKEBOY_MAX_TRACK_FILES;
 
     for (size_t index = 0; index < metadata_track_count; ++index)
     {
@@ -1069,16 +1088,8 @@ static void player_service_scan_playlist(void)
 
     if (s_playlist_count > 0)
     {
-        s_shuffle_order = heap_caps_malloc(s_playlist_count * sizeof(size_t),
-                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_shuffle_order)
-        {
-            player_service_build_shuffle_order();
-        }
-        else
-        {
-            ESP_LOGW(TAG, "failed to allocate shuffle order; shuffle falls back to random-per-step");
-        }
+        s_shuffle_order = s_shuffle_order_storage;
+        player_service_build_shuffle_order();
     }
     s_shuffle_position = SIZE_MAX;
 
@@ -1336,29 +1347,33 @@ static void player_service_decoder_task(void *param)
 
             s_current_chunk = msg.chunk_index;
 
-            if (msg.len <= PLAYER_SVC_CHUNK_CRC_BYTES)
+            if (!msg.data ||
+                msg.len <= PLAYER_SVC_CHUNK_CRC_BYTES ||
+                msg.len > PLAYER_SVC_CHUNK_MAX_BYTES)
             {
-                ESP_LOGE(TAG, "chunk %u missing crc32", (unsigned)msg.chunk_index);
+                ESP_LOGE(TAG,
+                         "chunk %u has invalid length %u",
+                         (unsigned)msg.chunk_index,
+                         (unsigned)msg.len);
                 continue;
             }
 
-            // CRC is not too important so skip it for now
-
-            // uint32_t expected_crc = 0;
-            // memcpy(&expected_crc, msg.data, sizeof(expected_crc));
-
+            uint32_t expected_crc = 0;
             const uint8_t *chunk_data = msg.data + PLAYER_SVC_CHUNK_CRC_BYTES;
             size_t chunk_len = msg.len - PLAYER_SVC_CHUNK_CRC_BYTES;
-            // uint32_t actual_crc = player_service_crc32(chunk_data, chunk_len);
-            // if (actual_crc != expected_crc)
-            // {
-            //     ESP_LOGE(TAG,
-            //              "crc32 mismatch in chunk %u: expected 0x%08lx got 0x%08lx",
-            //              (unsigned)msg.chunk_index,
-            //              (unsigned long)expected_crc,
-            //              (unsigned long)actual_crc);
-            //     continue;
-            // }
+            uint32_t actual_crc;
+
+            memcpy(&expected_crc, msg.data, sizeof(expected_crc));
+            actual_crc = player_service_crc32(chunk_data, chunk_len);
+            if (actual_crc != expected_crc)
+            {
+                ESP_LOGE(TAG,
+                         "crc32 mismatch in chunk %u: expected 0x%08lx got 0x%08lx",
+                         (unsigned)msg.chunk_index,
+                         (unsigned long)expected_crc,
+                         (unsigned long)actual_crc);
+                continue;
+            }
 
             size_t cursor = 0;
             while (cursor < chunk_len)

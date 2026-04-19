@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "esp_console.h"
@@ -36,6 +37,7 @@ static const char *TAG = "console_svc";
 #define CONSOLE_REPL_TASK_STACK_SIZE (8 * 1024)
 
 static void script_print_output(const char *output);
+static const char *auth_mode_str(wifi_auth_mode_t mode);
 
 typedef struct
 {
@@ -48,6 +50,9 @@ static volatile bool s_memory_telemetry_enabled = false;
 static UBaseType_t s_prev_snapshot_count;
 static configRUN_TIME_COUNTER_TYPE s_prev_total_runtime;
 static uint8_t s_snapshot_idx;
+static StaticSemaphore_t s_telemetry_mutex_storage;
+static SemaphoreHandle_t s_telemetry_mutex;
+static esp_event_handler_instance_t s_wifi_scan_done_handler;
 
 EXT_RAM_BSS_ATTR static TaskStatus_t s_task_state_buf[TELEMETRY_MAX_TASKS];
 EXT_RAM_BSS_ATTR static telemetry_task_snapshot_t s_snapshot_bufs[2][TELEMETRY_MAX_TASKS];
@@ -72,6 +77,11 @@ static void capture_runtime_snapshot(void)
     UBaseType_t task_count = uxTaskGetNumberOfTasks();
     configRUN_TIME_COUNTER_TYPE total_runtime = 0;
 
+    if (s_telemetry_mutex)
+    {
+        xSemaphoreTake(s_telemetry_mutex, portMAX_DELAY);
+    }
+
     if (task_count > TELEMETRY_MAX_TASKS)
     {
         task_count = TELEMETRY_MAX_TASKS;
@@ -91,6 +101,11 @@ static void capture_runtime_snapshot(void)
     s_snapshot_idx = next_idx;
     s_prev_snapshot_count = task_count;
     s_prev_total_runtime = total_runtime;
+
+    if (s_telemetry_mutex)
+    {
+        xSemaphoreGive(s_telemetry_mutex);
+    }
 }
 
 static void print_memory_stats(void)
@@ -105,6 +120,11 @@ static void print_memory_stats(void)
 
     UBaseType_t task_count = uxTaskGetNumberOfTasks();
     configRUN_TIME_COUNTER_TYPE total_runtime = 0;
+
+    if (s_telemetry_mutex)
+    {
+        xSemaphoreTake(s_telemetry_mutex, portMAX_DELAY);
+    }
 
     if (task_count > TELEMETRY_MAX_TASKS)
     {
@@ -172,6 +192,50 @@ static void print_memory_stats(void)
     s_snapshot_idx = next_idx;
     s_prev_snapshot_count = task_count;
     s_prev_total_runtime = total_runtime;
+
+    if (s_telemetry_mutex)
+    {
+        xSemaphoreGive(s_telemetry_mutex);
+    }
+}
+
+static void console_print_wifi_scan_results(const wifi_svc_scan_result_t *result)
+{
+    if (!result || result->count == 0)
+    {
+        printf("No access points found.\n");
+        return;
+    }
+
+    printf("\n%-4s %-32s %6s %4s %-8s\n", "#", "SSID", "RSSI", "CH", "AUTH");
+    printf("---- -------------------------------- ------ ---- --------\n");
+    for (uint16_t index = 0; index < result->count; ++index)
+    {
+        printf("%-4u %-32s %4d   %2d   %-8s\n",
+               (unsigned)(index + 1),
+               (char *)result->records[index].ssid,
+               result->records[index].rssi,
+               result->records[index].primary,
+               auth_mode_str(result->records[index].authmode));
+    }
+    printf("\n");
+}
+
+static void console_wifi_event_handler(void *handler_arg,
+                                       esp_event_base_t event_base,
+                                       int32_t event_id,
+                                       void *event_data)
+{
+    (void)handler_arg;
+    (void)event_base;
+
+    if (event_id != WIFI_SVC_EVENT_SCAN_DONE)
+    {
+        return;
+    }
+
+    printf("WiFi scan complete.\n");
+    console_print_wifi_scan_results((const wifi_svc_scan_result_t *)event_data);
 }
 
 static void telemetry_task(void *param)
@@ -325,6 +389,52 @@ static int bt_disconnect_handler(int argc, char **argv)
     }
 
     printf("Disconnect request sent.\n");
+    return 0;
+}
+
+static int bt_confirm_handler(int argc, char **argv)
+{
+    bluetooth_service_pairing_confirm_t confirm = {0};
+    const char *action = argc >= 2 ? argv[1] : NULL;
+
+    esp_err_t err = bluetooth_service_get_pending_pairing_confirm(&confirm);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    if (!confirm.pending)
+    {
+        printf("No Bluetooth pairing confirmation is pending.\n");
+        return 1;
+    }
+
+    if (!action)
+    {
+        printf("Pending pairing confirmation for ");
+        bt_print_bda(confirm.remote_bda);
+        printf(" passkey=%06lu\n", (unsigned long)confirm.numeric_value);
+        printf("Usage: bt confirm <accept|reject>\n");
+        return 0;
+    }
+
+    if (strcmp(action, "accept") != 0 && strcmp(action, "reject") != 0)
+    {
+        printf("Usage: bt confirm <accept|reject>\n");
+        return 1;
+    }
+
+    err = bluetooth_service_reply_pairing_confirm(strcmp(action, "accept") == 0);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Bluetooth pairing confirmation %s for ", action);
+    bt_print_bda(confirm.remote_bda);
+    printf(" passkey=%06lu\n", (unsigned long)confirm.numeric_value);
     return 0;
 }
 
@@ -628,6 +738,7 @@ static int cmd_bt(int argc, char **argv)
         "Usage: bt <subcommand> [args]\n"
         "  pair                     Discover and pair the best A2DP sink\n"
         "  connect                  Reconnect to last bonded A2DP device\n"
+        "  confirm <accept|reject>  Reply to pending SSP pairing confirmation\n"
         "  disconnect               Disconnect current A2DP link\n"
         "  audio <start|suspend>    Control A2DP audio streaming\n"
         "  media_key <key>          Send AVRCP media key (play/pause/stop/next/prev/...)\n"
@@ -644,6 +755,8 @@ static int cmd_bt(int argc, char **argv)
         return bt_pair_handler(argc - 1, argv + 1);
     if (strcmp(sub, "connect") == 0)
         return bt_connect_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "confirm") == 0)
+        return bt_confirm_handler(argc - 1, argv + 1);
     if (strcmp(sub, "disconnect") == 0)
         return bt_disconnect_handler(argc - 1, argv + 1);
     if (strcmp(sub, "audio") == 0)
@@ -730,7 +843,12 @@ static const char *auth_mode_str(wifi_auth_mode_t mode)
 
 static int wifi_scan_handler(int argc, char **argv)
 {
-    printf("Scanning...\n");
+    if (wifi_service_get_state() == WIFI_SVC_STATE_SCANNING)
+    {
+        printf("WiFi scan already in progress. Results will print when ready.\n");
+        return 0;
+    }
+
     esp_err_t err = wifi_service_scan();
     if (err != ESP_OK)
     {
@@ -738,34 +856,7 @@ static int wifi_scan_handler(int argc, char **argv)
         return 1;
     }
 
-    /* Poll until scan finishes (max 10 s) */
-    for (int i = 0; i < 20; i++)
-    {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        if (wifi_service_get_state() != WIFI_SVC_STATE_SCANNING)
-            break;
-    }
-
-    wifi_svc_scan_result_t res;
-    wifi_service_get_scan_results(&res);
-    if (res.count == 0)
-    {
-        printf("No access points found.\n");
-        return 0;
-    }
-
-    printf("\n%-4s %-32s %6s %4s %-8s\n", "#", "SSID", "RSSI", "CH", "AUTH");
-    printf("---- -------------------------------- ------ ---- --------\n");
-    for (int i = 0; i < res.count; i++)
-    {
-        printf("%-4d %-32s %4d   %2d   %-8s\n",
-               i + 1,
-               (char *)res.records[i].ssid,
-               res.records[i].rssi,
-               res.records[i].primary,
-               auth_mode_str(res.records[i].authmode));
-    }
-    printf("\n");
+    printf("Scan started. Results will print asynchronously when ready.\n");
     return 0;
 }
 
@@ -1067,14 +1158,20 @@ static bool sd_parse_index(const char *value, size_t *index)
         return false;
     }
 
+    errno = 0;
     parsed = strtoul(value, &end, 10);
-    if (!end || *end != '\0')
+    if (errno != 0 || end == value || !end || *end != '\0')
     {
         return false;
     }
 
     *index = (size_t)parsed;
     return true;
+}
+
+static void sd_print_metadata_string(const char *value)
+{
+    printf("%s\n", value ? value : "");
 }
 
 static int sd_unmount_handler(int argc, char **argv)
@@ -1147,17 +1244,17 @@ static int sd_meta_handler(int argc, char **argv)
     }
     if (strcmp(field, "album_name") == 0)
     {
-        printf("%s\n", cartridge_service_get_album_name());
+        sd_print_metadata_string(cartridge_service_get_album_name());
         return 0;
     }
     if (strcmp(field, "album_description") == 0)
     {
-        printf("%s\n", cartridge_service_get_album_description());
+        sd_print_metadata_string(cartridge_service_get_album_description());
         return 0;
     }
     if (strcmp(field, "artist") == 0)
     {
-        printf("%s\n", cartridge_service_get_album_artist());
+        sd_print_metadata_string(cartridge_service_get_album_artist());
         return 0;
     }
     if (strcmp(field, "year") == 0)
@@ -1172,7 +1269,7 @@ static int sd_meta_handler(int argc, char **argv)
     }
     if (strcmp(field, "genre") == 0)
     {
-        printf("%s\n", cartridge_service_get_album_genre());
+        sd_print_metadata_string(cartridge_service_get_album_genre());
         return 0;
     }
     if (strcmp(field, "track_count") == 0)
@@ -1195,7 +1292,7 @@ static int sd_meta_handler(int argc, char **argv)
             printf("Invalid tag index\n");
             return 1;
         }
-        printf("%s\n", string_value);
+        sd_print_metadata_string(string_value);
         return 0;
     }
 
@@ -1207,7 +1304,7 @@ static int sd_meta_handler(int argc, char **argv)
             printf("Invalid track index\n");
             return 1;
         }
-        printf("%s\n", string_value);
+        sd_print_metadata_string(string_value);
         return 0;
     }
 
@@ -1219,7 +1316,7 @@ static int sd_meta_handler(int argc, char **argv)
             printf("Invalid track index\n");
             return 1;
         }
-        printf("%s\n", string_value);
+        sd_print_metadata_string(string_value);
         return 0;
     }
 
@@ -1620,6 +1717,15 @@ esp_err_t console_service_init(void)
     repl_config.task_stack_size = CONSOLE_REPL_TASK_STACK_SIZE;
     repl_config.max_cmdline_length = 256;
 
+    if (!s_telemetry_mutex)
+    {
+        s_telemetry_mutex = xSemaphoreCreateMutexStatic(&s_telemetry_mutex_storage);
+        if (!s_telemetry_mutex)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     /* Register built-in help */
     esp_console_register_help_command();
 
@@ -1644,7 +1750,7 @@ esp_err_t console_service_init(void)
     /* Bluetooth command group */
     const esp_console_cmd_t bt_cmd = {
         .command = "bt",
-        .help = "Bluetooth: bt <pair|connect|disconnect|audio|media_key|bonded> [args]",
+        .help = "Bluetooth: bt <pair|connect|confirm|disconnect|audio|media_key|bonded> [args]",
         .hint = NULL,
         .func = cmd_bt,
     };
@@ -1698,6 +1804,16 @@ esp_err_t console_service_init(void)
     register_reboot();
     register_meminfo();
     register_telemetry();
+
+    esp_err_t event_err = esp_event_handler_instance_register(WIFI_SERVICE_EVENT,
+                                                              WIFI_SVC_EVENT_SCAN_DONE,
+                                                              console_wifi_event_handler,
+                                                              NULL,
+                                                              &s_wifi_scan_done_handler);
+    if (event_err != ESP_OK && event_err != ESP_ERR_INVALID_STATE)
+    {
+        return event_err;
+    }
 
     if (!xTaskCreateStaticPinnedToCore(telemetry_task,
                                        "ConsoleTelemetry",
