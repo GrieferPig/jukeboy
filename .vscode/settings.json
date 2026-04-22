@@ -17,5 +17,5 @@
     "--compile-commands-dir=c:\\Users\\GrieferPig\\bttest\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM10"
+  "idf.portWin": "COM8"
 }

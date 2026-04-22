@@ -27,6 +27,7 @@ extern "C"
                                                             void *user_ctx,
                                                             int priority);
     esp_err_t power_mgmt_service_reboot(void);
+    esp_err_t power_mgmt_service_reboot_to_download(void);
 
 #ifdef __cplusplus
 }

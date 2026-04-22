@@ -31,6 +31,7 @@
 #include "script_service.h"
 #include "storage_paths.h"
 #include "wifi_service.h"
+#include <soc/soc.h>
 
 static const char *TAG = "main";
 static const bool QEMU_PCM_SERVICE_ENABLED = true;
@@ -83,8 +84,7 @@ static esp_err_t app_init_secure_nvs(void)
 }
 
 void app_main(void)
-{
-    // const esp_flash_dispatcher_config_t flash_dispatcher_cfg = ESP_FLASH_DISPATCHER_DEFAULT_CONFIG;
+{    // const esp_flash_dispatcher_config_t flash_dispatcher_cfg = ESP_FLASH_DISPATCHER_DEFAULT_CONFIG;
     const esp_vfs_littlefs_conf_t littlefs_cfg = {
         .base_path = APP_LITTLEFS_MOUNT_PATH,
         .partition_label = APP_LITTLEFS_PARTITION_LABEL,

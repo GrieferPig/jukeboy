@@ -1040,6 +1040,37 @@ static void register_reboot(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 
+/* ── rdl ─────────────────────────────────────────────────────────────── */
+
+static int cmd_rdl(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    cartridge_service_unmount();
+    printf("Rebooting into download mode...\n");
+
+    esp_err_t err = power_mgmt_service_reboot_to_download();
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    return 0;
+}
+
+static void register_rdl(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "rdl",
+        .help = "Reboot into esptool download mode",
+        .hint = NULL,
+        .func = cmd_rdl,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
 /* ── meminfo ────────────────────────────────────────────────────────── */
 
 static int cmd_meminfo(int argc, char **argv)
@@ -1802,6 +1833,7 @@ esp_err_t console_service_init(void)
 
     /* System commands */
     register_reboot();
+    register_rdl();
     register_meminfo();
     register_telemetry();
 

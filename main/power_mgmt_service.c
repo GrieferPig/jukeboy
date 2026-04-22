@@ -6,6 +6,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include <soc/soc.h>
 
 ESP_EVENT_DEFINE_BASE(POWER_MGMT_SERVICE_EVENT);
 
@@ -25,6 +26,9 @@ static SemaphoreHandle_t s_service_lock;
 static power_mgmt_service_shutdown_entry_t s_shutdown_callbacks[POWER_MGMT_MAX_SHUTDOWN_CALLBACKS];
 static size_t s_shutdown_callback_count;
 static bool s_initialized;
+
+#define CUSTOM_DOWNLOAD_MAGIC_WORD 0xDEADBEEF
+#define CUSTOM_FLAG_ADDR ((volatile uint32_t *)0x3FF81FFC)
 
 esp_err_t power_mgmt_service_init(void)
 {
@@ -91,10 +95,8 @@ esp_err_t power_mgmt_service_register_shutdown_callback(power_mgmt_service_shutd
     return ESP_OK;
 }
 
-esp_err_t power_mgmt_service_reboot(void)
+static esp_err_t power_mgmt_service_run_shutdown_callbacks(void)
 {
-    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "power management service is not initialized");
-
     power_mgmt_service_shutdown_entry_t callbacks[POWER_MGMT_MAX_SHUTDOWN_CALLBACKS];
     size_t callback_count = 0;
 
@@ -129,8 +131,56 @@ esp_err_t power_mgmt_service_reboot(void)
         }
     }
 
+    return ESP_OK;
+}
+
+static void power_mgmt_service_reboot_to_download_task(void *param)
+{
+    (void)param;
+
+    ESP_LOGI(TAG, "shutdown callbacks complete, entering download mode");
+    (*CUSTOM_FLAG_ADDR) = CUSTOM_DOWNLOAD_MAGIC_WORD;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_restart();
+}
+
+esp_err_t power_mgmt_service_reboot(void)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "power management service is not initialized");
+
+    esp_err_t err = power_mgmt_service_run_shutdown_callbacks();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
     ESP_LOGI(TAG, "shutdown callbacks complete, restarting");
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
+    return ESP_OK;
+}
+
+esp_err_t power_mgmt_service_reboot_to_download(void)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "power management service is not initialized");
+
+    esp_err_t err = power_mgmt_service_run_shutdown_callbacks();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    BaseType_t task_created = xTaskCreatePinnedToCore(power_mgmt_service_reboot_to_download_task,
+                                                      "rdl",
+                                                      2048,
+                                                      NULL,
+                                                      configMAX_PRIORITIES - 1,
+                                                      NULL,
+                                                      0);
+    if (task_created != pdPASS)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
     return ESP_OK;
 }

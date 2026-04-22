@@ -762,10 +762,26 @@ static void bt_svc_task(void *arg)
         switch (msg.cmd)
         {
         case BT_SVC_CMD_PAIR_BEST:
+        {
             if (s_a2dp_connected)
             {
                 ESP_LOGW(TAG, "ignoring pair request: A2DP device already connected");
+                break;
+            }
+            bt_svc_reset_discovery_results();
+            s_pair_request_pending = true;
+            if (s_discovery_running)
+            {
+                esp_bt_gap_cancel_discovery();
+            }
+            ESP_LOGI(TAG, "starting discovery for A2DP sink pairing");
+            esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY,
+                                       BT_SVC_DISCOVERY_LENGTH,
+                                       0);
+            break;
+        }
         case BT_SVC_CMD_PAIRING_CONFIRM_REQUEST:
+        {
             bt_svc_set_pending_pairing_confirm(msg.data.pairing_confirm.bda,
                                                msg.data.pairing_confirm.numeric_value);
             ESP_LOGW(TAG,
@@ -773,6 +789,7 @@ static void bt_svc_task(void *arg)
                      ESP_BD_ADDR_HEX(msg.data.pairing_confirm.bda),
                      (unsigned long)msg.data.pairing_confirm.numeric_value);
             break;
+        }
         case BT_SVC_CMD_PAIRING_CONFIRM_REPLY:
         {
             esp_bd_addr_t remote_bda = {0};
@@ -792,19 +809,6 @@ static void bt_svc_task(void *arg)
             esp_bt_gap_ssp_confirm_reply(remote_bda, msg.data.pairing_confirm.accept);
             break;
         }
-                break;
-            }
-            bt_svc_reset_discovery_results();
-            s_pair_request_pending = true;
-            if (s_discovery_running)
-            {
-                esp_bt_gap_cancel_discovery();
-            }
-            ESP_LOGI(TAG, "starting discovery for A2DP sink pairing");
-            esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY,
-                                       BT_SVC_DISCOVERY_LENGTH,
-                                       0);
-            break;
         case BT_SVC_CMD_CONNECT_LAST_BONDED:
         {
             if (s_a2dp_connected)
@@ -820,6 +824,7 @@ static void bt_svc_task(void *arg)
             break;
         }
         case BT_SVC_CMD_DISCONNECT_A2DP:
+        {
             if (!s_a2dp_connected)
             {
                 ESP_LOGW(TAG, "ignoring disconnect request: no A2DP device connected");
@@ -827,21 +832,32 @@ static void bt_svc_task(void *arg)
             }
             esp_a2d_source_disconnect(s_connected_bda);
             break;
+        }
         case BT_SVC_CMD_START_AUDIO:
+        {
+
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
             break;
+        }
         case BT_SVC_CMD_SUSPEND_AUDIO:
+        {
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
             break;
+        }
         case BT_SVC_CMD_SEND_MEDIA_KEY:
+        {
             esp_avrc_ct_send_passthrough_cmd(s_avrc_tl, msg.data.media_key, ESP_AVRC_PT_CMD_STATE_PRESSED);
             esp_avrc_ct_send_passthrough_cmd(s_avrc_tl, msg.data.media_key, ESP_AVRC_PT_CMD_STATE_RELEASED);
             s_avrc_tl = (uint8_t)((s_avrc_tl + 1U) & 0x0F);
             break;
+        }
         case BT_SVC_CMD_DISCOVERY_RESULT:
+        {
             bt_svc_store_discovery_result(&msg.data.discovery_result);
             break;
+        }
         case BT_SVC_CMD_DISCOVERY_STATE:
+        {
             s_discovery_running = (msg.data.discovery_state == ESP_BT_GAP_DISCOVERY_STARTED);
             if (msg.data.discovery_state == ESP_BT_GAP_DISCOVERY_STOPPED && s_pair_request_pending)
             {
@@ -849,7 +865,9 @@ static void bt_svc_task(void *arg)
                 bt_svc_select_and_connect_best_sink();
             }
             break;
+        }
         case BT_SVC_CMD_AUTH_COMPLETE:
+        {
             bt_svc_clear_pending_pairing_confirm();
             if (msg.data.auth.status == ESP_BT_STATUS_SUCCESS)
             {
@@ -871,7 +889,9 @@ static void bt_svc_task(void *arg)
                          msg.data.auth.status);
             }
             break;
+        }
         case BT_SVC_CMD_A2DP_CONNECTION_STATE:
+        {
             if (msg.data.a2dp_connection.state == ESP_A2D_CONNECTION_STATE_CONNECTED)
             {
                 s_a2dp_connected = true;
@@ -888,14 +908,18 @@ static void bt_svc_task(void *arg)
             bt_svc_invoke_connection_callback(BLUETOOTH_SVC_CONNECTION_EVENT_A2DP_CONNECTION_STATE,
                                               msg.data.a2dp_connection.remote_bda);
             break;
+        }
         case BT_SVC_CMD_A2DP_AUDIO_STATE:
+        {
             bt_svc_post_event(BLUETOOTH_SVC_EVENT_A2DP_AUDIO_STATE,
                               &msg.data.a2dp_audio.state,
                               sizeof(msg.data.a2dp_audio.state));
             bt_svc_invoke_connection_callback(BLUETOOTH_SVC_CONNECTION_EVENT_A2DP_AUDIO_STATE,
                                               msg.data.a2dp_audio.remote_bda);
             break;
+        }
         case BT_SVC_CMD_AVRCP_PASSTHROUGH_RSP:
+        {
             if (s_media_key_cb)
             {
                 s_media_key_cb(msg.data.avrc_rsp.key_code,
@@ -904,7 +928,9 @@ static void bt_svc_task(void *arg)
                                s_media_key_cb_ctx);
             }
             break;
+        }
         case BT_SVC_CMD_AVRCP_PASSTHROUGH_CMD:
+        {
             if (msg.data.avrc_cmd.key_state == ESP_AVRC_PT_CMD_STATE_PRESSED)
             {
                 bool handled = false;
@@ -926,6 +952,7 @@ static void bt_svc_task(void *arg)
                 }
             }
             break;
+        }
         case BT_SVC_CMD_AVRCP_SET_ABS_VOL:
         {
             uint8_t avrc_vol = msg.data.abs_vol.volume;
@@ -939,9 +966,10 @@ static void bt_svc_task(void *arg)
                                         ESP_AVRC_RN_RSP_CHANGED, &rn);
                 s_avrc_rn_vol_registered = false;
             }
+            break;
         }
-        break;
         case BT_SVC_CMD_AVRCP_CT_RN_CAPS:
+        {
             if (esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST,
                                                    &msg.data.ct_rn_caps,
                                                    ESP_AVRC_RN_VOLUME_CHANGE))
@@ -958,6 +986,7 @@ static void bt_svc_task(void *arg)
                 ESP_LOGI(TAG, "remote TG does not support VOLUME_CHANGE notifications");
             }
             break;
+        }
         case BT_SVC_CMD_AVRCP_CT_VOL_CHANGE:
         {
             uint8_t remote_vol = msg.data.ct_vol_change.volume;
@@ -971,9 +1000,10 @@ static void bt_svc_task(void *arg)
                                                            ESP_AVRC_RN_VOLUME_CHANGE,
                                                            0);
             }
+            break;
         }
-        break;
         case BT_SVC_CMD_AVRCP_REG_VOL_NOTIFY:
+        {
             if (msg.data.reg_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE)
             {
                 s_avrc_rn_vol_registered = true;
@@ -986,14 +1016,19 @@ static void bt_svc_task(void *arg)
                          (unsigned)rn.volume);
             }
             break;
+        }
         case BT_SVC_CMD_SPP_CONNECTED:
+        {
             bt_svc_invoke_connection_callback(BLUETOOTH_SVC_CONNECTION_EVENT_SPP_CONNECTED,
                                               msg.data.spp_remote.remote_bda);
             break;
+        }
         case BT_SVC_CMD_SPP_DISCONNECTED:
+        {
             bt_svc_invoke_connection_callback(BLUETOOTH_SVC_CONNECTION_EVENT_SPP_DISCONNECTED,
                                               msg.data.spp_remote.remote_bda);
             break;
+        }
         default:
             break;
         }
