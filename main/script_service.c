@@ -772,12 +772,12 @@ static char **script_duplicate_argv(const char *program_path,
         return NULL;
     }
 
-    program_len = strnlen(effective_program_path, SCRIPT_SERVICE_MAX_ARG_LEN + 1);
-    if (program_len == 0 || program_len > SCRIPT_SERVICE_MAX_ARG_LEN)
+    program_len = strnlen(effective_program_path, SCRIPT_SERVICE_MAX_ARG_LEN);
+    if (program_len == 0 || program_len >= SCRIPT_SERVICE_MAX_ARG_LEN)
     {
         script_set_result_message(result,
                                   "script path exceeds max length (%u)",
-                                  (unsigned)SCRIPT_SERVICE_MAX_ARG_LEN);
+                                  (unsigned)SCRIPT_SERVICE_MAX_ARG_LEN - 1);
         return NULL;
     }
 
@@ -786,14 +786,14 @@ static char **script_duplicate_argv(const char *program_path,
     for (int index = 0; index < argc; index++)
     {
         const char *arg = argv[index] ? argv[index] : "";
-        size_t arg_len = strnlen(arg, SCRIPT_SERVICE_MAX_ARG_LEN + 1);
+        size_t arg_len = strnlen(arg, SCRIPT_SERVICE_MAX_ARG_LEN);
 
-        if (arg_len > SCRIPT_SERVICE_MAX_ARG_LEN)
+        if (arg_len >= SCRIPT_SERVICE_MAX_ARG_LEN)
         {
             script_set_result_message(result,
                                       "script argument %d exceeds max length (%u)",
                                       index,
-                                      (unsigned)SCRIPT_SERVICE_MAX_ARG_LEN);
+                                      (unsigned)SCRIPT_SERVICE_MAX_ARG_LEN - 1);
             return NULL;
         }
 

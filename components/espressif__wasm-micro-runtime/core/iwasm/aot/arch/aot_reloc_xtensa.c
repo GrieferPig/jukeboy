@@ -159,22 +159,32 @@ check_reloc_offset(uint32 target_section_size, uint64 reloc_offset,
 static void
 put_imm16_to_addr(int16 imm16, int16 *addr)
 {
-    int8 bytes[8];
-    int32 *addr_aligned1, *addr_aligned2;
+    volatile uint32 *addr_aligned1, *addr_aligned2;
+    uintptr_t byte_offset = (uintptr_t)addr & 3;
 
-    addr_aligned1 = (int32 *)((intptr_t)addr & ~3);
+    addr_aligned1 = (volatile uint32 *)((uintptr_t)addr & ~(uintptr_t)3);
 
-    if ((intptr_t)addr % 4 != 3) {
-        *(int32 *)bytes = *addr_aligned1;
-        *(int16 *)(bytes + ((intptr_t)addr % 4)) = imm16;
-        *addr_aligned1 = *(int32 *)bytes;
+    if (byte_offset != 3) {
+        uint32 word;
+        uint8 *word_bytes = (uint8 *)&word;
+
+        word = *addr_aligned1;
+        word_bytes[byte_offset] = (uint8)imm16;
+        word_bytes[byte_offset + 1] = (uint8)((uint16)imm16 >> 8);
+        *addr_aligned1 = word;
     }
     else {
-        addr_aligned2 = (int32 *)(((intptr_t)addr + 3) & ~3);
-        *(int32 *)bytes = *addr_aligned1;
-        *(int32 *)(bytes + 4) = *addr_aligned2;
-        *(int16 *)(bytes + 3) = imm16;
-        memcpy(addr_aligned1, bytes, 8);
+        uint32 words[2];
+        uint8 *word_bytes = (uint8 *)words;
+
+        addr_aligned2 =
+            (volatile uint32 *)(((uintptr_t)addr + 3) & ~(uintptr_t)3);
+        words[0] = *addr_aligned1;
+        words[1] = *addr_aligned2;
+        word_bytes[3] = (uint8)imm16;
+        word_bytes[4] = (uint8)((uint16)imm16 >> 8);
+        *addr_aligned1 = words[0];
+        *addr_aligned2 = words[1];
     }
 }
 
@@ -221,18 +231,22 @@ apply_relocation(AOTModule *module, uint8 *target_section_addr,
             insn_addr = os_get_dbus_mirror((void *)insn_addr);
             bh_assert(insn_addr != NULL);
 #endif
-            int32 initial_addend;
-            /* (S + A) */
             if ((intptr_t)insn_addr & 3) {
                 set_error_buf(error_buf, error_buf_size,
                               "AOT module load failed: "
                               "instruction address unaligned.");
                 return false;
             }
-            CHECK_RELOC_OFFSET(4);
-            initial_addend = *(int32 *)insn_addr;
-            *(uintptr_t *)insn_addr = (uintptr_t)symbol_addr + initial_addend
-                                      + (intptr_t)reloc_addend;
+            {
+                int32 initial_addend;
+
+                /* (S + A) */
+                CHECK_RELOC_OFFSET(4);
+                initial_addend = *(int32 *)insn_addr;
+                *(uintptr_t *)insn_addr = (uintptr_t)symbol_addr
+                                          + initial_addend
+                                          + (intptr_t)reloc_addend;
+            }
             break;
         }
 
