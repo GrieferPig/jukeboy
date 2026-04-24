@@ -37,6 +37,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hid-demo"
+version = "0.1.0"
+dependencies = [
+ "jukeboy",
+ "ufmt",
+]
+
+[[package]]
 name = "jukeboy"
 version = "0.1.0"
 dependencies = [

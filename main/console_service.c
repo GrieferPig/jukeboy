@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "driver/gpio.h"
 #include "esp_console.h"
 #include "esp_attr.h"
 #include "esp_log.h"
@@ -19,12 +20,13 @@
 #include "esp_wifi.h"
 #include "argtable3/argtable3.h"
 
-// #include "esp_flash_dispatcher.h"
 #include "bluetooth_service.h"
 #include "wifi_service.h"
 #include "console_service.h"
 #include "cartridge_service.h"
 #include "audio_output_switch.h"
+#include "hid_service.h"
+#include "pin_defs.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
 #include "script_service.h"
@@ -34,10 +36,11 @@ static const char *TAG = "console_svc";
 #define TELEMETRY_INTERVAL_MS 5000
 #define TELEMETRY_TASK_STACK_SIZE 2048
 #define TELEMETRY_MAX_TASKS 32
-#define CONSOLE_REPL_TASK_STACK_SIZE (8 * 1024)
+#define CONSOLE_REPL_TASK_STACK_SIZE (4 * 1024)
 
 static void script_print_output(const char *output);
 static const char *auth_mode_str(wifi_auth_mode_t mode);
+static const char *hid_button_name(hid_button_t button);
 
 typedef struct
 {
@@ -47,11 +50,13 @@ typedef struct
 } telemetry_task_snapshot_t;
 
 static volatile bool s_memory_telemetry_enabled = false;
+static volatile bool s_hid_log_enabled = false;
 static UBaseType_t s_prev_snapshot_count;
 static configRUN_TIME_COUNTER_TYPE s_prev_total_runtime;
 static uint8_t s_snapshot_idx;
 static StaticSemaphore_t s_telemetry_mutex_storage;
 static SemaphoreHandle_t s_telemetry_mutex;
+static esp_event_handler_instance_t s_hid_button_down_handler;
 static esp_event_handler_instance_t s_wifi_scan_done_handler;
 
 EXT_RAM_BSS_ATTR static TaskStatus_t s_task_state_buf[TELEMETRY_MAX_TASKS];
@@ -236,6 +241,44 @@ static void console_wifi_event_handler(void *handler_arg,
 
     printf("WiFi scan complete.\n");
     console_print_wifi_scan_results((const wifi_svc_scan_result_t *)event_data);
+}
+
+static const char *hid_button_name(hid_button_t button)
+{
+    switch (button)
+    {
+    case HID_BUTTON_MAIN_1:
+        return "main1";
+    case HID_BUTTON_MAIN_2:
+        return "main2";
+    case HID_BUTTON_MAIN_3:
+        return "main3";
+    case HID_BUTTON_MISC_1:
+        return "misc1";
+    case HID_BUTTON_MISC_2:
+        return "misc2";
+    case HID_BUTTON_MISC_3:
+        return "misc3";
+    default:
+        return "unknown";
+    }
+}
+
+static void console_hid_event_handler(void *handler_arg,
+                                      esp_event_base_t event_base,
+                                      int32_t event_id,
+                                      void *event_data)
+{
+    (void)handler_arg;
+    (void)event_base;
+
+    if (!s_hid_log_enabled || event_id != HID_EVENT_BUTTON_DOWN || event_data == NULL)
+    {
+        return;
+    }
+
+    hid_button_t button = *(const hid_button_t *)event_data;
+    printf("HID button pressed: %s\n", hid_button_name(button));
 }
 
 static void telemetry_task(void *param)
@@ -1001,6 +1044,384 @@ static int cmd_wifi(int argc, char **argv)
         return wifi_autoreconnect_handler(argc - 1, argv + 1);
 
     printf("Unknown subcommand '%s'.\n%s", sub, usage);
+    return 1;
+}
+
+/* ════════════════════════════════════════════════════════════════════ *
+ *  Power and HID commands                                             *
+ * ════════════════════════════════════════════════════════════════════ */
+
+static const char *power_rail_name(power_mgmt_rail_t rail)
+{
+    switch (rail)
+    {
+    case POWER_MGMT_RAIL_DAC:
+        return "dac";
+    case POWER_MGMT_RAIL_LED:
+        return "led";
+    default:
+        return "unknown";
+    }
+}
+
+static const char *power_override_name(power_mgmt_rail_override_t override_mode)
+{
+    switch (override_mode)
+    {
+    case POWER_MGMT_OVERRIDE_AUTO:
+        return "auto";
+    case POWER_MGMT_OVERRIDE_FORCE_ON:
+        return "on";
+    case POWER_MGMT_OVERRIDE_FORCE_OFF:
+        return "off";
+    default:
+        return "unknown";
+    }
+}
+
+static gpio_num_t power_rail_gate_pin(power_mgmt_rail_t rail)
+{
+    switch (rail)
+    {
+    case POWER_MGMT_RAIL_DAC:
+        return HAL_DAC_POWER_GATE_PIN;
+    case POWER_MGMT_RAIL_LED:
+        return HAL_LED_GATE_PIN;
+    default:
+        return GPIO_NUM_NC;
+    }
+}
+
+static bool power_parse_rail(const char *value, power_mgmt_rail_t *rail_out)
+{
+    if (!value || !rail_out)
+    {
+        return false;
+    }
+
+    if (strcmp(value, "dac") == 0)
+    {
+        *rail_out = POWER_MGMT_RAIL_DAC;
+        return true;
+    }
+    if (strcmp(value, "led") == 0)
+    {
+        *rail_out = POWER_MGMT_RAIL_LED;
+        return true;
+    }
+
+    return false;
+}
+
+static bool power_parse_override(const char *value, power_mgmt_rail_override_t *override_out)
+{
+    if (!value || !override_out)
+    {
+        return false;
+    }
+
+    if (strcmp(value, "auto") == 0)
+    {
+        *override_out = POWER_MGMT_OVERRIDE_AUTO;
+        return true;
+    }
+    if (strcmp(value, "on") == 0 || strcmp(value, "force_on") == 0)
+    {
+        *override_out = POWER_MGMT_OVERRIDE_FORCE_ON;
+        return true;
+    }
+    if (strcmp(value, "off") == 0 || strcmp(value, "force_off") == 0)
+    {
+        *override_out = POWER_MGMT_OVERRIDE_FORCE_OFF;
+        return true;
+    }
+
+    return false;
+}
+
+static bool console_parse_uint_in_range(const char *value, unsigned max_value, unsigned *parsed_out)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!value || !parsed_out)
+    {
+        return false;
+    }
+
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || !end || *end != '\0' || parsed > max_value)
+    {
+        return false;
+    }
+
+    *parsed_out = (unsigned)parsed;
+    return true;
+}
+
+static int power_status_handler(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    for (int rail = 0; rail < POWER_MGMT_RAIL_COUNT; rail++)
+    {
+        bool enabled = false;
+        size_t refcount = 0;
+        power_mgmt_rail_override_t override_mode = POWER_MGMT_OVERRIDE_AUTO;
+        esp_err_t err = power_mgmt_service_rail_is_enabled((power_mgmt_rail_t)rail, &enabled);
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        err = power_mgmt_service_rail_get_refcount((power_mgmt_rail_t)rail, &refcount);
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        err = power_mgmt_service_rail_get_override((power_mgmt_rail_t)rail, &override_mode);
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        gpio_num_t gate_pin = power_rail_gate_pin((power_mgmt_rail_t)rail);
+        printf("rail=%s enabled=%d refcount=%u override=%s gate_gpio=%d gate_level=%d",
+               power_rail_name((power_mgmt_rail_t)rail),
+               enabled ? 1 : 0,
+               (unsigned)refcount,
+               power_override_name(override_mode),
+               gate_pin,
+               gate_pin == GPIO_NUM_NC ? -1 : gpio_get_level(gate_pin));
+        if (rail == POWER_MGMT_RAIL_DAC)
+        {
+            printf(" mute_gpio=%d mute_level=%d", HAL_DAC_MUTE_PIN, gpio_get_level(HAL_DAC_MUTE_PIN));
+        }
+        printf("\n");
+    }
+
+    return 0;
+}
+
+static int power_set_handler(int argc, char **argv)
+{
+    power_mgmt_rail_t rail;
+    power_mgmt_rail_override_t override_mode;
+
+    if (argc < 3 || !power_parse_rail(argv[1], &rail) || !power_parse_override(argv[2], &override_mode))
+    {
+        printf("Usage: power set <dac|led> <auto|on|off>\n");
+        return 1;
+    }
+
+    esp_err_t err = power_mgmt_service_rail_set_override(rail, override_mode);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Power override set: rail=%s override=%s\n",
+           power_rail_name(rail),
+           power_override_name(override_mode));
+    return 0;
+}
+
+static int cmd_power(int argc, char **argv)
+{
+    static const char *usage =
+        "Usage: power <subcommand> [args]\n"
+        "  status                      Show DAC/LED rail state, refcount, and override\n"
+        "  set <dac|led> <auto|on|off> Set a manual rail override\n";
+
+    if (argc < 2 || strcmp(argv[1], "status") == 0)
+    {
+        return power_status_handler(argc - 1, argv + 1);
+    }
+
+    if (strcmp(argv[1], "set") == 0)
+    {
+        return power_set_handler(argc - 1, argv + 1);
+    }
+
+    printf("Unknown subcommand '%s'.\n%s", argv[1], usage);
+    return 1;
+}
+
+static int hid_buttons_handler(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    static const hid_button_t buttons[] = {
+        HID_BUTTON_MAIN_1,
+        HID_BUTTON_MAIN_2,
+        HID_BUTTON_MAIN_3,
+        HID_BUTTON_MISC_1,
+        HID_BUTTON_MISC_2,
+        HID_BUTTON_MISC_3,
+    };
+
+    uint32_t button_state = 0;
+    hid_service_adc_status_t adc_status = {0};
+    esp_err_t err = hid_service_get_button_state(&button_state);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    err = hid_service_get_adc_status(&adc_status);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    for (size_t index = 0; index < sizeof(buttons) / sizeof(buttons[0]); index++)
+    {
+        printf("%s=%s%s",
+               hid_button_name(buttons[index]),
+               (button_state & (1UL << buttons[index])) != 0 ? "pressed" : "released",
+               index + 1 == sizeof(buttons) / sizeof(buttons[0]) ? "" : " ");
+    }
+    printf(" bitmap=0x%02lx adc_main=%u adc_misc=%u\n",
+           (unsigned long)button_state,
+           (unsigned)adc_status.main_raw,
+           (unsigned)adc_status.misc_raw);
+    return 0;
+}
+
+static int hid_log_handler(int argc, char **argv)
+{
+    static const char *usage =
+        "Usage: hid log <on|off>\n";
+
+    if (argc < 2)
+    {
+        printf("hid log is %s\n", s_hid_log_enabled ? "on" : "off");
+        printf("%s", usage);
+        return 1;
+    }
+
+    if (strcmp(argv[1], "on") == 0)
+    {
+        s_hid_log_enabled = true;
+    }
+    else if (strcmp(argv[1], "off") == 0)
+    {
+        s_hid_log_enabled = false;
+    }
+    else
+    {
+        printf("%s", usage);
+        return 1;
+    }
+
+    printf("HID button logging %s\n", s_hid_log_enabled ? "enabled" : "disabled");
+    return 0;
+}
+
+static int hid_led_handler(int argc, char **argv)
+{
+    static const char *usage =
+        "Usage: hid led <r> <g> <b>\n"
+        "       hid led off\n"
+        "       hid led brightness <0-100>\n";
+    unsigned value = 0;
+
+    if (argc < 2)
+    {
+        printf("%s", usage);
+        return 1;
+    }
+
+    if (strcmp(argv[1], "off") == 0)
+    {
+        esp_err_t err = hid_service_led_off();
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("LED off\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "brightness") == 0)
+    {
+        if (argc < 3 || !console_parse_uint_in_range(argv[2], 100, &value))
+        {
+            printf("%s", usage);
+            return 1;
+        }
+
+        esp_err_t err = hid_service_led_set_brightness((uint8_t)value);
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("LED brightness set to %u%%\n", value);
+        return 0;
+    }
+
+    unsigned red = 0;
+    unsigned green = 0;
+    unsigned blue = 0;
+    if (argc < 4 ||
+        !console_parse_uint_in_range(argv[1], 255, &red) ||
+        !console_parse_uint_in_range(argv[2], 255, &green) ||
+        !console_parse_uint_in_range(argv[3], 255, &blue))
+    {
+        printf("%s", usage);
+        return 1;
+    }
+
+    esp_err_t err = hid_service_led_set_rgb((uint8_t)red, (uint8_t)green, (uint8_t)blue);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("LED set to rgb(%u, %u, %u)\n", red, green, blue);
+    return 0;
+}
+
+static int cmd_hid(int argc, char **argv)
+{
+    static const char *usage =
+        "Usage: hid <subcommand> [args]\n"
+        "  buttons                    Show button state bitmap and ladder ADC readings\n"
+        "  status                     Alias for buttons\n"
+        "  log <on|off>               Print a log line on each button press\n"
+        "  led <r> <g> <b>           Set the RGB LED\n"
+        "  led off                   Turn the RGB LED off\n"
+        "  led brightness <0-100>    Set LED brightness scaling\n";
+
+    if (argc < 2 || strcmp(argv[1], "buttons") == 0 || strcmp(argv[1], "status") == 0)
+    {
+        return hid_buttons_handler(argc - 1, argv + 1);
+    }
+
+    if (strcmp(argv[1], "led") == 0)
+    {
+        return hid_led_handler(argc - 1, argv + 1);
+    }
+
+    if (strcmp(argv[1], "log") == 0)
+    {
+        return hid_log_handler(argc - 1, argv + 1);
+    }
+
+    printf("Unknown subcommand '%s'.\n%s", argv[1], usage);
     return 1;
 }
 
@@ -1831,6 +2252,22 @@ esp_err_t console_service_init(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&script_cmd));
 
+    const esp_console_cmd_t power_cmd = {
+        .command = "power",
+        .help = "Power rails: power <status|set> [args]",
+        .hint = NULL,
+        .func = cmd_power,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&power_cmd));
+
+    const esp_console_cmd_t hid_cmd = {
+        .command = "hid",
+        .help = "HID and RGB LED: hid <buttons|status|log|led> [args]",
+        .hint = NULL,
+        .func = cmd_hid,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&hid_cmd));
+
     /* System commands */
     register_reboot();
     register_rdl();
@@ -1842,6 +2279,16 @@ esp_err_t console_service_init(void)
                                                               console_wifi_event_handler,
                                                               NULL,
                                                               &s_wifi_scan_done_handler);
+    if (event_err != ESP_OK && event_err != ESP_ERR_INVALID_STATE)
+    {
+        return event_err;
+    }
+
+    event_err = esp_event_handler_instance_register(HID_SERVICE_EVENT,
+                                                    HID_EVENT_BUTTON_DOWN,
+                                                    console_hid_event_handler,
+                                                    NULL,
+                                                    &s_hid_button_down_handler);
     if (event_err != ESP_OK && event_err != ESP_ERR_INVALID_STATE)
     {
         return event_err;

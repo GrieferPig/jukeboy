@@ -14,4 +14,4 @@ rustflags = [
 ]
 
 [alias]
-build-examples = "build --release -p hello -p google-get -p player-control -p net-echo"
+build-examples = "build --release -p hello -p google-get -p player-control -p net-echo -p hid-demo"

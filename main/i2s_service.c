@@ -11,6 +11,7 @@
 
 #include "i2s_service.h"
 #include "pin_defs.h"
+#include "power_mgmt_service.h"
 
 /* 48 kHz, 16-bit stereo — one 20 ms Opus frame worth of PCM. */
 #define I2S_SVC_SAMPLE_RATE 48000
@@ -25,6 +26,8 @@
 #define I2S_SVC_TASK_PRIORITY 5
 #define I2S_SVC_QUEUE_DEPTH 4
 #define I2S_SVC_CMD_POLL_MS 5
+#define I2S_SVC_RAIL_SETTLE_MS 10
+#define I2S_SVC_MUTE_SETTLE_MS 1
 
 static const char *TAG = "i2s_svc";
 
@@ -48,7 +51,108 @@ static i2s_chan_handle_t s_tx_channel;
 static i2s_service_pcm_provider_t s_pcm_provider;
 static void *s_pcm_provider_ctx;
 static bool s_running;
+static bool s_dac_rail_requested;
 static uint8_t s_pcm_buf[I2S_SVC_PCM_BUF_BYTES];
+
+static esp_err_t i2s_service_prepare_dac_power_off(void *user_ctx)
+{
+    (void)user_ctx;
+
+    if (s_tx_channel == NULL || !s_running)
+    {
+        return ESP_OK;
+    }
+
+    esp_err_t err = i2s_channel_disable(s_tx_channel);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGW(TAG, "failed to stop I2S TX before DAC power off: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    s_running = false;
+    ESP_LOGI(TAG, "I2S TX disabled for DAC power off");
+    return ESP_OK;
+}
+
+static esp_err_t i2s_service_enable_output(void)
+{
+    esp_err_t err;
+
+    if (!s_dac_rail_requested)
+    {
+        err = power_mgmt_service_rail_request(POWER_MGMT_RAIL_DAC);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "failed to request DAC rail: %s", esp_err_to_name(err));
+            return err;
+        }
+        s_dac_rail_requested = true;
+        vTaskDelay(pdMS_TO_TICKS(I2S_SVC_RAIL_SETTLE_MS));
+    }
+
+    err = i2s_channel_enable(s_tx_channel);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "failed to enable I2S TX channel: %s", esp_err_to_name(err));
+        if (s_dac_rail_requested)
+        {
+            power_mgmt_service_rail_release(POWER_MGMT_RAIL_DAC);
+            s_dac_rail_requested = false;
+        }
+        return err;
+    }
+
+    err = power_mgmt_service_set_dac_muted(false);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "failed to unmute DAC: %s", esp_err_to_name(err));
+        i2s_channel_disable(s_tx_channel);
+        if (s_dac_rail_requested)
+        {
+            power_mgmt_service_rail_release(POWER_MGMT_RAIL_DAC);
+            s_dac_rail_requested = false;
+        }
+        return err;
+    }
+
+    s_running = true;
+    ESP_LOGI(TAG, "I2S TX enabled");
+    return ESP_OK;
+}
+
+static void i2s_service_disable_output(void)
+{
+    esp_err_t err = power_mgmt_service_set_dac_muted(true);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to mute DAC: %s", esp_err_to_name(err));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(I2S_SVC_MUTE_SETTLE_MS));
+
+    err = i2s_channel_disable(s_tx_channel);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to disable I2S TX channel: %s", esp_err_to_name(err));
+    }
+
+    if (s_dac_rail_requested)
+    {
+        err = power_mgmt_service_rail_release(POWER_MGMT_RAIL_DAC);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "failed to release DAC rail: %s", esp_err_to_name(err));
+        }
+        else
+        {
+            s_dac_rail_requested = false;
+        }
+    }
+
+    s_running = false;
+    ESP_LOGI(TAG, "I2S TX disabled");
+}
 
 static void i2s_service_process_cmd(const i2s_service_msg_t *msg)
 {
@@ -57,24 +161,14 @@ static void i2s_service_process_cmd(const i2s_service_msg_t *msg)
     case I2S_SVC_CMD_START:
         if (!s_running && s_tx_channel)
         {
-            if (i2s_channel_enable(s_tx_channel) == ESP_OK)
-            {
-                s_running = true;
-                ESP_LOGI(TAG, "I2S TX enabled");
-            }
-            else
-            {
-                ESP_LOGE(TAG, "failed to enable I2S TX channel");
-            }
+            i2s_service_enable_output();
         }
         break;
 
     case I2S_SVC_CMD_SUSPEND:
         if (s_running && s_tx_channel)
         {
-            i2s_channel_disable(s_tx_channel);
-            s_running = false;
-            ESP_LOGI(TAG, "I2S TX disabled");
+            i2s_service_disable_output();
         }
         break;
 
@@ -175,9 +269,9 @@ esp_err_t i2s_service_init(void)
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
-            .bclk = HAL_I2S_BCLK_PIN,
-            .ws = HAL_I2S_WS_PIN,
-            .dout = HAL_I2S_DATA_PIN,
+            .bclk = I2S_GPIO_UNUSED,
+            .ws = I2S_GPIO_UNUSED,
+            .dout = I2S_GPIO_UNUSED,
             .din = I2S_GPIO_UNUSED,
             .invert_flags = {
                 .mclk_inv = false,
@@ -191,6 +285,17 @@ esp_err_t i2s_service_init(void)
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "failed to init I2S STD mode: %s", esp_err_to_name(err));
+        i2s_del_channel(s_tx_channel);
+        s_tx_channel = NULL;
+        return err;
+    }
+
+    err = power_mgmt_service_bind_dac_i2s_channel(s_tx_channel,
+                                                  i2s_service_prepare_dac_power_off,
+                                                  NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "failed to bind DAC I2S pins to power management: %s", esp_err_to_name(err));
         i2s_del_channel(s_tx_channel);
         s_tx_channel = NULL;
         return err;

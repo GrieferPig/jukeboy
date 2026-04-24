@@ -15,6 +15,9 @@
 #include "bootloader_common.h"
 #include <soc/rtc_cntl_reg.h>
 #include <soc/soc.h>
+#include "esp_rom_gpio.h"
+#include "hal/gpio_ll.h"
+#include "soc/gpio_sig_map.h"
 
 #define CUSTOM_DOWNLOAD_MAGIC_WORD 0xDEADBEEF
 #define CUSTOM_FLAG_ADDR ((volatile uint32_t *)0x3FF81FFC)
@@ -22,6 +25,65 @@
 static const char *TAG = "boot";
 
 static int select_partition_number(bootloader_state_t *bs);
+
+static void bootloader_gpio_make_disabled(int gpio_num)
+{
+    esp_rom_gpio_pad_select_gpio(gpio_num);
+    esp_rom_gpio_connect_out_signal(gpio_num, SIG_GPIO_OUT_IDX, false, false);
+    gpio_ll_pullup_dis(&GPIO, gpio_num);
+    gpio_ll_pulldown_dis(&GPIO, gpio_num);
+    gpio_ll_input_disable(&GPIO, gpio_num);
+    gpio_ll_output_disable(&GPIO, gpio_num);
+}
+
+static void bootloader_gpio_make_input_nopull(int gpio_num)
+{
+    esp_rom_gpio_pad_select_gpio(gpio_num);
+    esp_rom_gpio_connect_out_signal(gpio_num, SIG_GPIO_OUT_IDX, false, false);
+    gpio_ll_pullup_dis(&GPIO, gpio_num);
+    gpio_ll_pulldown_dis(&GPIO, gpio_num);
+    gpio_ll_output_disable(&GPIO, gpio_num);
+    gpio_ll_input_enable(&GPIO, gpio_num);
+}
+
+static void bootloader_gpio_make_output_low(int gpio_num)
+{
+    esp_rom_gpio_pad_select_gpio(gpio_num);
+    esp_rom_gpio_connect_out_signal(gpio_num, SIG_GPIO_OUT_IDX, false, false);
+    gpio_ll_pullup_dis(&GPIO, gpio_num);
+    gpio_ll_pulldown_dis(&GPIO, gpio_num);
+    gpio_ll_input_disable(&GPIO, gpio_num);
+    gpio_ll_set_level(&GPIO, gpio_num, 0);
+    gpio_ll_output_enable(&GPIO, gpio_num);
+}
+
+void bootloader_user_gpio_init(void)
+{
+    /* Disable input and output */
+    bootloader_gpio_make_disabled(25);
+    bootloader_gpio_make_disabled(26);
+    bootloader_gpio_make_disabled(27);
+    bootloader_gpio_make_disabled(14);
+    bootloader_gpio_make_disabled(13);
+    bootloader_gpio_make_disabled(22);
+    bootloader_gpio_make_disabled(21);
+    bootloader_gpio_make_disabled(18);
+    bootloader_gpio_make_disabled(2);
+    bootloader_gpio_make_disabled(15);
+
+    /* Enable input, no pull-up */
+    bootloader_gpio_make_input_nopull(34);
+    bootloader_gpio_make_input_nopull(35);
+
+    /* Enable output low */
+    bootloader_gpio_make_output_low(32);
+    bootloader_gpio_make_output_low(33);
+    bootloader_gpio_make_output_low(23);
+    bootloader_gpio_make_output_low(19);
+    bootloader_gpio_make_output_low(5);
+    bootloader_gpio_make_output_low(4);
+    bootloader_gpio_make_output_low(12);
+}
 
 /* =====================================================================
  * esptool-compatible SLIP/download protocol
@@ -37,26 +99,26 @@ static int select_partition_number(bootloader_state_t *bs);
  * ===================================================================== */
 
 /* ---- SLIP framing constants ---- */
-#define SLIP_END      0xC0u
-#define SLIP_ESC      0xDBu
-#define SLIP_ESC_END  0xDCu
-#define SLIP_ESC_ESC  0xDDu
+#define SLIP_END 0xC0u
+#define SLIP_ESC 0xDBu
+#define SLIP_ESC_END 0xDCu
+#define SLIP_ESC_ESC 0xDDu
 
 /* ---- Packet direction bytes ---- */
-#define DIR_REQ   0x00u
-#define DIR_RESP  0x01u
+#define DIR_REQ 0x00u
+#define DIR_RESP 0x01u
 
 /* ---- Command opcodes ---- */
-#define CMD_MEM_BEGIN  0x05u
-#define CMD_MEM_END    0x06u
-#define CMD_MEM_DATA   0x07u
-#define CMD_SYNC       0x08u
-#define CMD_WRITE_REG  0x09u
-#define CMD_READ_REG   0x0Au
+#define CMD_MEM_BEGIN 0x05u
+#define CMD_MEM_END 0x06u
+#define CMD_MEM_DATA 0x07u
+#define CMD_SYNC 0x08u
+#define CMD_WRITE_REG 0x09u
+#define CMD_READ_REG 0x0Au
 
 /* ---- ROM-compatible error codes ---- */
 #define ROM_ERR_INVALID_FORMAT 0x05u
-#define ROM_ERR_CHECKSUM       0x07u
+#define ROM_ERR_CHECKSUM 0x07u
 
 /* ---- Checksum seed (XOR starting value, per esptool spec) ---- */
 #define CHKSUM_SEED 0xEFu
@@ -79,7 +141,9 @@ static uint32_t s_mem_blksz;
 static inline uint8_t dl_uart_getc(void)
 {
     uint8_t c;
-    while (uart_rx_one_char(&c) != ETS_OK) { /* spin until byte available */ }
+    while (uart_rx_one_char(&c) != ETS_OK)
+    { /* spin until byte available */
+    }
     return c;
 }
 
@@ -93,13 +157,18 @@ static inline void dl_uart_putc(uint8_t c)
 /* Transmit one SLIP-escaped byte */
 static void dl_slip_putc(uint8_t c)
 {
-    if (c == SLIP_END) {
+    if (c == SLIP_END)
+    {
         dl_uart_putc(SLIP_ESC);
         dl_uart_putc(SLIP_ESC_END);
-    } else if (c == SLIP_ESC) {
+    }
+    else if (c == SLIP_ESC)
+    {
         dl_uart_putc(SLIP_ESC);
         dl_uart_putc(SLIP_ESC_ESC);
-    } else {
+    }
+    else
+    {
         dl_uart_putc(c);
     }
 }
@@ -118,29 +187,42 @@ static int dl_slip_recv(uint8_t *buf, int buflen)
     uint8_t c;
 
     /* Wait for the opening END marker, discarding any preceding garbage */
-    do { c = dl_uart_getc(); } while (c != (uint8_t)SLIP_END);
+    do
+    {
+        c = dl_uart_getc();
+    } while (c != (uint8_t)SLIP_END);
 
     int len = 0;
     bool in_esc = false;
 
-    for (;;) {
+    for (;;)
+    {
         c = dl_uart_getc();
 
-        if (in_esc) {
+        if (in_esc)
+        {
             in_esc = false;
-            if      (c == (uint8_t)SLIP_ESC_END) c = (uint8_t)SLIP_END;
-            else if (c == (uint8_t)SLIP_ESC_ESC) c = (uint8_t)SLIP_ESC;
+            if (c == (uint8_t)SLIP_ESC_END)
+                c = (uint8_t)SLIP_END;
+            else if (c == (uint8_t)SLIP_ESC_ESC)
+                c = (uint8_t)SLIP_ESC;
             /* else: unknown escape – pass raw byte through */
-        } else if (c == (uint8_t)SLIP_END) {
-            if (len > 0) return len;  /* valid end-of-packet */
+        }
+        else if (c == (uint8_t)SLIP_END)
+        {
+            if (len > 0)
+                return len; /* valid end-of-packet */
             /* consecutive END bytes (inter-frame gap) – restart */
             continue;
-        } else if (c == (uint8_t)SLIP_ESC) {
+        }
+        else if (c == (uint8_t)SLIP_ESC)
+        {
             in_esc = true;
             continue;
         }
 
-        if (len < buflen) buf[len] = c;
+        if (len < buflen)
+            buf[len] = c;
         len++;
     }
 }
@@ -170,28 +252,32 @@ static void dl_send_resp(uint8_t op, uint32_t value,
         (uint8_t)(total_size & 0xFFu),
         (uint8_t)((total_size >> 8) & 0xFFu),
         (uint8_t)(value & 0xFFu),
-        (uint8_t)((value >>  8) & 0xFFu),
+        (uint8_t)((value >> 8) & 0xFFu),
         (uint8_t)((value >> 16) & 0xFFu),
         (uint8_t)((value >> 24) & 0xFFu),
     };
     uint8_t status_bytes[4] = {status, error, 0u, 0u};
 
     dl_uart_putc(SLIP_END);
-    for (int i = 0; i < 8; i++) dl_slip_putc(hdr[i]);
-    for (uint16_t i = 0; i < payload_len; i++) dl_slip_putc(payload[i]);
-    for (int i = 0; i < 4; i++) dl_slip_putc(status_bytes[i]);
+    for (int i = 0; i < 8; i++)
+        dl_slip_putc(hdr[i]);
+    for (uint16_t i = 0; i < payload_len; i++)
+        dl_slip_putc(payload[i]);
+    for (int i = 0; i < 4; i++)
+        dl_slip_putc(status_bytes[i]);
     dl_uart_putc(SLIP_END);
 }
 
-#define DL_OK(op, val)   dl_send_resp((op), (val), NULL, 0u, 0u, 0u)
-#define DL_ERR(op, err)  dl_send_resp((op), 0u,    NULL, 0u, 1u, (err))
+#define DL_OK(op, val) dl_send_resp((op), (val), NULL, 0u, 0u, 0u)
+#define DL_ERR(op, err) dl_send_resp((op), 0u, NULL, 0u, 1u, (err))
 
 /* ---- Checksum (XOR over data bytes, seed 0xEF) ---- */
 
 static uint8_t dl_checksum(const uint8_t *data, uint32_t len)
 {
     uint8_t s = CHKSUM_SEED;
-    for (uint32_t i = 0; i < len; i++) s ^= data[i];
+    for (uint32_t i = 0; i < len; i++)
+        s ^= data[i];
     return s;
 }
 
@@ -199,10 +285,7 @@ static uint8_t dl_checksum(const uint8_t *data, uint32_t len)
 
 static inline uint32_t le32(const uint8_t *p)
 {
-    return  (uint32_t)p[0]
-          | ((uint32_t)p[1] <<  8)
-          | ((uint32_t)p[2] << 16)
-          | ((uint32_t)p[3] << 24);
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 /* ---- Protocol main loop ---- */
@@ -216,53 +299,69 @@ static inline uint32_t le32(const uint8_t *p)
  */
 static uint32_t dl_run_protocol(void)
 {
-    for (;;) {
+    for (;;)
+    {
         int pkt_len = dl_slip_recv(s_dl_recv_buf, (int)sizeof(s_dl_recv_buf));
 
         /* Discard packets that are too short or overflowed our buffer */
-        if (pkt_len < 8 || pkt_len > (int)sizeof(s_dl_recv_buf)) continue;
+        if (pkt_len < 8 || pkt_len > (int)sizeof(s_dl_recv_buf))
+            continue;
 
-        uint8_t  dir  = s_dl_recv_buf[0];
-        uint8_t  op   = s_dl_recv_buf[1];
-        uint16_t size = (uint16_t)s_dl_recv_buf[2]
-                      | ((uint16_t)s_dl_recv_buf[3] << 8);
-        uint32_t chk  = le32(&s_dl_recv_buf[4]);
+        uint8_t dir = s_dl_recv_buf[0];
+        uint8_t op = s_dl_recv_buf[1];
+        uint16_t size = (uint16_t)s_dl_recv_buf[2] | ((uint16_t)s_dl_recv_buf[3] << 8);
+        uint32_t chk = le32(&s_dl_recv_buf[4]);
         uint8_t *data = &s_dl_recv_buf[8];
 
-        if (dir != (uint8_t)DIR_REQ) continue;       /* ignore non-requests    */
-        if ((int)(8u + size) > pkt_len)   continue;  /* truncated packet       */
+        if (dir != (uint8_t)DIR_REQ)
+            continue; /* ignore non-requests    */
+        if ((int)(8u + size) > pkt_len)
+            continue; /* truncated packet       */
 
-        switch (op) {
+        switch (op)
+        {
 
         /* ---- SYNC (0x08) ---------------------------------------------- */
-        case CMD_SYNC: {
+        case CMD_SYNC:
+        {
             /*
              * esptool sends one SYNC command and reads back 8 responses.
              * The Value field must be non-zero so esptool knows it is
              * talking to a ROM-like loader (not an already-running stub).
              */
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < 8; i++)
+            {
                 DL_OK(CMD_SYNC, 0x20120707u);
             }
             break;
         }
 
         /* ---- READ_REG (0x0A) ------------------------------------------ */
-        case CMD_READ_REG: {
-            if (size < 4u) { DL_ERR(op, ROM_ERR_INVALID_FORMAT); break; }
+        case CMD_READ_REG:
+        {
+            if (size < 4u)
+            {
+                DL_ERR(op, ROM_ERR_INVALID_FORMAT);
+                break;
+            }
             uint32_t addr = le32(data);
-            uint32_t val  = *(volatile uint32_t *)(uintptr_t)addr;
+            uint32_t val = *(volatile uint32_t *)(uintptr_t)addr;
             DL_OK(CMD_READ_REG, val);
             break;
         }
 
         /* ---- WRITE_REG (0x09) ----------------------------------------- */
-        case CMD_WRITE_REG: {
+        case CMD_WRITE_REG:
+        {
             /* address(4), value(4), mask(4), delay_us(4) */
-            if (size < 16u) { DL_ERR(op, ROM_ERR_INVALID_FORMAT); break; }
-            uint32_t addr  = le32(data);
+            if (size < 16u)
+            {
+                DL_ERR(op, ROM_ERR_INVALID_FORMAT);
+                break;
+            }
+            uint32_t addr = le32(data);
             uint32_t value = le32(data + 4);
-            uint32_t mask  = le32(data + 8);
+            uint32_t mask = le32(data + 8);
             /* delay_us at data+12 – not implemented in bootloader context */
             volatile uint32_t *reg = (volatile uint32_t *)(uintptr_t)addr;
             *reg = (*reg & ~mask) | (value & mask);
@@ -271,17 +370,23 @@ static uint32_t dl_run_protocol(void)
         }
 
         /* ---- MEM_BEGIN (0x05) ----------------------------------------- */
-        case CMD_MEM_BEGIN: {
+        case CMD_MEM_BEGIN:
+        {
             /* total_size(4), num_blocks(4), block_size(4), offset(4) */
-            if (size < 16u) { DL_ERR(op, ROM_ERR_INVALID_FORMAT); break; }
+            if (size < 16u)
+            {
+                DL_ERR(op, ROM_ERR_INVALID_FORMAT);
+                break;
+            }
             s_mem_blksz = le32(data + 8);
-            s_mem_base  = le32(data + 12);
+            s_mem_base = le32(data + 12);
             DL_OK(CMD_MEM_BEGIN, 0u);
             break;
         }
 
         /* ---- MEM_DATA (0x07) ------------------------------------------ */
-        case CMD_MEM_DATA: {
+        case CMD_MEM_DATA:
+        {
             /*
              * Data payload layout (per spec):
              *   [0-3]   length of "data to write"
@@ -291,12 +396,17 @@ static uint32_t dl_run_protocol(void)
              *
              * Checksum covers only the "data to write" bytes.
              */
-            if (size < 16u) { DL_ERR(op, ROM_ERR_INVALID_FORMAT); break; }
-            uint32_t dlen    = le32(data);
-            uint32_t seq     = le32(data + 4);
+            if (size < 16u)
+            {
+                DL_ERR(op, ROM_ERR_INVALID_FORMAT);
+                break;
+            }
+            uint32_t dlen = le32(data);
+            uint32_t seq = le32(data + 4);
             uint8_t *payload = data + 16;
 
-            if (dl_checksum(payload, dlen) != (uint8_t)(chk & 0xFFu)) {
+            if (dl_checksum(payload, dlen) != (uint8_t)(chk & 0xFFu))
+            {
                 DL_ERR(op, ROM_ERR_CHECKSUM);
                 break;
             }
@@ -308,20 +418,26 @@ static uint32_t dl_run_protocol(void)
         }
 
         /* ---- MEM_END (0x06) ------------------------------------------- */
-        case CMD_MEM_END: {
+        case CMD_MEM_END:
+        {
             /*
              * esptool packs: struct.pack("<II", int(entry == 0), entry)
              *   execute == 0  →  jump to entry_point (run stub)
              *   execute == 1  →  do not execute (stay in loader / reboot)
              */
-            if (size < 8u) { DL_ERR(op, ROM_ERR_INVALID_FORMAT); break; }
+            if (size < 8u)
+            {
+                DL_ERR(op, ROM_ERR_INVALID_FORMAT);
+                break;
+            }
             uint32_t execute = le32(data);
-            uint32_t entry   = le32(data + 4);
+            uint32_t entry = le32(data + 4);
 
             DL_OK(CMD_MEM_END, 0u);
             uart_tx_wait_idle(0); /* flush TX FIFO before handing off */
 
-            if (execute == 0u && entry != 0u) {
+            if (execute == 0u && entry != 0u)
+            {
                 return entry; /* caller jumps to stub entry point */
             }
             break;
@@ -358,7 +474,8 @@ void __attribute__((noreturn)) call_start_cpu0(void)
          */
         uint32_t stub_entry = dl_run_protocol();
 
-        if (stub_entry != 0u) {
+        if (stub_entry != 0u)
+        {
             /* Jump to stub; the stub signals readiness by sending "OHAI" */
             void (*stub_fn)(void) = (void (*)(void))(uintptr_t)stub_entry;
             stub_fn();
@@ -373,6 +490,9 @@ void __attribute__((noreturn)) call_start_cpu0(void)
     {
         bootloader_reset();
     }
+
+    // Init board GPIOs, must be done to prevent back powering peripherals
+    bootloader_user_gpio_init();
 
 #ifdef CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP
     // If this boot is a wake up from the deep sleep then go to the short way,

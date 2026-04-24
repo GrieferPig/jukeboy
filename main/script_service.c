@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -21,7 +22,9 @@
 #include "esp_timer.h"
 
 #include "cartridge_service.h"
+#include "hid_service.h"
 #include "player_service.h"
+#include "power_mgmt_service.h"
 #include "ramdisk_service.h"
 #include "runtime_env.h"
 #include "script_socket_env.h"
@@ -1106,6 +1109,133 @@ static int64_t get_uptime_ms_wrapper(wasm_exec_env_t exec_env)
     return (int64_t)(esp_timer_get_time() / 1000);
 }
 
+static bool power_rail_from_i32(int rail_value, power_mgmt_rail_t *rail_out)
+{
+    if (!rail_out || rail_value < 0 || rail_value >= POWER_MGMT_RAIL_COUNT)
+    {
+        return false;
+    }
+
+    *rail_out = (power_mgmt_rail_t)rail_value;
+    return true;
+}
+
+static bool power_override_from_i32(int override_value, power_mgmt_rail_override_t *override_out)
+{
+    if (!override_out ||
+        override_value < POWER_MGMT_OVERRIDE_AUTO ||
+        override_value > POWER_MGMT_OVERRIDE_FORCE_OFF)
+    {
+        return false;
+    }
+
+    *override_out = (power_mgmt_rail_override_t)override_value;
+    return true;
+}
+
+static int power_rail_is_enabled_wrapper(wasm_exec_env_t exec_env, int rail_value)
+{
+    (void)exec_env;
+
+    power_mgmt_rail_t rail;
+    bool enabled = false;
+    if (!power_rail_from_i32(rail_value, &rail))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = power_mgmt_service_rail_is_enabled(rail, &enabled);
+    return err == ESP_OK ? (enabled ? 1 : 0) : err;
+}
+
+static int power_rail_get_refcount_wrapper(wasm_exec_env_t exec_env, int rail_value)
+{
+    (void)exec_env;
+
+    power_mgmt_rail_t rail;
+    size_t refcount = 0;
+    if (!power_rail_from_i32(rail_value, &rail))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = power_mgmt_service_rail_get_refcount(rail, &refcount);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    return refcount > INT_MAX ? INT_MAX : (int)refcount;
+}
+
+static int power_rail_get_override_wrapper(wasm_exec_env_t exec_env, int rail_value)
+{
+    (void)exec_env;
+
+    power_mgmt_rail_t rail;
+    power_mgmt_rail_override_t override_mode = POWER_MGMT_OVERRIDE_AUTO;
+    if (!power_rail_from_i32(rail_value, &rail))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = power_mgmt_service_rail_get_override(rail, &override_mode);
+    return err == ESP_OK ? (int)override_mode : err;
+}
+
+static int power_rail_set_override_wrapper(wasm_exec_env_t exec_env, int rail_value, int override_value)
+{
+    (void)exec_env;
+
+    power_mgmt_rail_t rail;
+    power_mgmt_rail_override_t override_mode;
+    if (!power_rail_from_i32(rail_value, &rail) || !power_override_from_i32(override_value, &override_mode))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return power_mgmt_service_rail_set_override(rail, override_mode);
+}
+
+static int hid_get_buttons_wrapper(wasm_exec_env_t exec_env)
+{
+    (void)exec_env;
+
+    uint32_t button_state = 0;
+    esp_err_t err = hid_service_get_button_state(&button_state);
+    return err == ESP_OK ? (int)button_state : err;
+}
+
+static int hid_led_set_rgb_wrapper(wasm_exec_env_t exec_env, int red, int green, int blue)
+{
+    (void)exec_env;
+
+    if (red < 0 || red > 255 || green < 0 || green > 255 || blue < 0 || blue > 255)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return hid_service_led_set_rgb((uint8_t)red, (uint8_t)green, (uint8_t)blue);
+}
+
+static int hid_led_set_brightness_wrapper(wasm_exec_env_t exec_env, int percent)
+{
+    (void)exec_env;
+
+    if (percent < 0 || percent > 100)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return hid_service_led_set_brightness((uint8_t)percent);
+}
+
+static int hid_led_off_wrapper(wasm_exec_env_t exec_env)
+{
+    (void)exec_env;
+    return hid_service_led_off();
+}
+
 static NativeSymbol s_jukeboy_symbols[] = {
     {"log", log_wrapper, "($)i", NULL},
     {"next_track", next_track_wrapper, "()i", NULL},
@@ -1126,6 +1256,14 @@ static NativeSymbol s_jukeboy_symbols[] = {
     {"wifi_is_connected", wifi_is_connected_wrapper, "()i", NULL},
     {"get_free_heap", get_free_heap_wrapper, "()i", NULL},
     {"get_uptime_ms", get_uptime_ms_wrapper, "()I", NULL},
+    {"power_rail_is_enabled", power_rail_is_enabled_wrapper, "(i)i", NULL},
+    {"power_rail_get_refcount", power_rail_get_refcount_wrapper, "(i)i", NULL},
+    {"power_rail_get_override", power_rail_get_override_wrapper, "(i)i", NULL},
+    {"power_rail_set_override", power_rail_set_override_wrapper, "(ii)i", NULL},
+    {"hid_get_buttons", hid_get_buttons_wrapper, "()i", NULL},
+    {"hid_led_set_rgb", hid_led_set_rgb_wrapper, "(iii)i", NULL},
+    {"hid_led_set_brightness", hid_led_set_brightness_wrapper, "(i)i", NULL},
+    {"hid_led_off", hid_led_off_wrapper, "()i", NULL},
 };
 
 static esp_err_t script_prepare_builtin_argv(script_run_context_t *context,

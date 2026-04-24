@@ -21,6 +21,7 @@
 #include "bluetooth_service.h"
 #include "cartridge_service.h"
 #include "console_service.h"
+#include "hid_service.h"
 #include "i2s_service.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
@@ -83,8 +84,10 @@ static esp_err_t app_init_secure_nvs(void)
     return err;
 }
 
+#include "driver/gpio.h"
+
 void app_main(void)
-{    // const esp_flash_dispatcher_config_t flash_dispatcher_cfg = ESP_FLASH_DISPATCHER_DEFAULT_CONFIG;
+{
     const esp_vfs_littlefs_conf_t littlefs_cfg = {
         .base_path = APP_LITTLEFS_MOUNT_PATH,
         .partition_label = APP_LITTLEFS_PARTITION_LABEL,
@@ -185,6 +188,7 @@ void app_main(void)
     ESP_ERROR_CHECK(bluetooth_service_init());
     ESP_ERROR_CHECK(wifi_service_init());
     ESP_ERROR_CHECK(i2s_service_init());
+    ESP_ERROR_CHECK(hid_service_init());
     ESP_ERROR_CHECK(audio_output_switch_init());
 
     ESP_ERROR_CHECK(bluetooth_service_register_48k_sbc_endpoint());

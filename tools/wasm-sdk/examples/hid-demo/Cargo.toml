@@ -1,0 +1,9 @@
+[package]
+name = "hid-demo"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+jukeboy = { path = "../../jukeboy" }
+ufmt = { workspace = true }

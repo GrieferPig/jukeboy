@@ -7,6 +7,7 @@ members = [
     "examples/google-get",
     "examples/player-control",
     "examples/net-echo",
+    "examples/hid-demo",
 ]
 resolver = "2"
 

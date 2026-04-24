@@ -28,6 +28,15 @@ impl HostError {
             Err(Self::Status(status))
         }
     }
+
+    fn from_nonnegative(value: i32) -> Result<i32> {
+        if value < 0 {
+            Err(Self::Status(value))
+        }
+        else {
+            Ok(value)
+        }
+    }
 }
 
 impl ufmt::uDisplay for HostError {
@@ -64,6 +73,71 @@ impl TryFrom<i32> for PlaybackMode {
             other => Err(other),
         }
     }
+}
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ufmt::derive::uDebug)]
+pub enum Rail {
+    Dac = 0,
+    Led = 1,
+}
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ufmt::derive::uDebug)]
+pub enum Override {
+    Auto = 0,
+    On = 1,
+    Off = 2,
+}
+
+impl TryFrom<i32> for Override {
+    type Error = i32;
+
+    fn try_from(value: i32) -> core::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Auto),
+            1 => Ok(Self::On),
+            2 => Ok(Self::Off),
+            other => Err(other),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Button {
+    Main1 = 0,
+    Main2 = 1,
+    Main3 = 2,
+    Misc1 = 3,
+    Misc2 = 4,
+    Misc3 = 5,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ButtonSet(u32);
+
+impl ButtonSet {
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub fn is_pressed(self, button: Button) -> bool {
+        (self.0 & (1_u32 << button as u32)) != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RailStatus {
+    pub enabled: bool,
+    pub refcount: usize,
+    pub override_mode: Override,
 }
 
 fn c_string(value: &str) -> Result<CString> {
@@ -167,4 +241,38 @@ pub fn free_heap() -> usize {
 
 pub fn uptime_ms() -> i64 {
     unsafe { sys::get_uptime_ms() }
+}
+
+pub fn rail_status(rail: Rail) -> Result<RailStatus> {
+    let enabled = HostError::from_nonnegative(unsafe { sys::power_rail_is_enabled(rail as i32) })? != 0;
+    let refcount = HostError::from_nonnegative(unsafe { sys::power_rail_get_refcount(rail as i32) })? as usize;
+    let override_mode = HostError::from_nonnegative(unsafe { sys::power_rail_get_override(rail as i32) })?;
+    let override_mode = Override::try_from(override_mode).map_err(HostError::Status)?;
+
+    Ok(RailStatus {
+        enabled,
+        refcount,
+        override_mode,
+    })
+}
+
+pub fn rail_set_override(rail: Rail, override_mode: Override) -> Result<()> {
+    HostError::from_status(unsafe { sys::power_rail_set_override(rail as i32, override_mode as i32) })
+}
+
+pub fn buttons() -> Result<ButtonSet> {
+    let bits = HostError::from_nonnegative(unsafe { sys::hid_get_buttons() })? as u32;
+    Ok(ButtonSet(bits))
+}
+
+pub fn led_set(rgb: Rgb) -> Result<()> {
+    HostError::from_status(unsafe { sys::hid_led_set_rgb(rgb.r as i32, rgb.g as i32, rgb.b as i32) })
+}
+
+pub fn led_set_brightness(percent: u8) -> Result<()> {
+    HostError::from_status(unsafe { sys::hid_led_set_brightness(percent.min(100) as i32) })
+}
+
+pub fn led_off() -> Result<()> {
+    HostError::from_status(unsafe { sys::hid_led_off() })
 }

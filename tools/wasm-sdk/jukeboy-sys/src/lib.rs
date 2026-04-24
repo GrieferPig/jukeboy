@@ -29,4 +29,14 @@ unsafe extern "C" {
     pub fn wifi_is_connected() -> i32;
     pub fn get_free_heap() -> i32;
     pub fn get_uptime_ms() -> i64;
+
+    pub fn power_rail_is_enabled(rail: i32) -> i32;
+    pub fn power_rail_get_refcount(rail: i32) -> i32;
+    pub fn power_rail_get_override(rail: i32) -> i32;
+    pub fn power_rail_set_override(rail: i32, override_mode: i32) -> i32;
+
+    pub fn hid_get_buttons() -> i32;
+    pub fn hid_led_set_rgb(red: i32, green: i32, blue: i32) -> i32;
+    pub fn hid_led_set_brightness(percent: i32) -> i32;
+    pub fn hid_led_off() -> i32;
 }

@@ -1,4 +1,14 @@
 dependencies:
+  espressif/led_strip:
+    component_hash: 28621486f77229aaf81c71f5e15d6fbf36c2949cf11094e07090593e659e7639
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 3.0.3
   espressif/wasm-micro-runtime:
     dependencies: []
     source:
@@ -20,9 +30,10 @@ dependencies:
       type: service
     version: 1.20.4
 direct_dependencies:
+- espressif/led_strip
 - espressif/wasm-micro-runtime
 - idf
 - joltwallet/littlefs
-manifest_hash: 054233240ae4f6bec000853f0abffe2ed04d7a6601aea62789161283c5d14a4c
+manifest_hash: a7cacc3ccd90cec34997caf7e36545b76dfc5b0fac1565cb0b0523d72cfad637
 target: esp32
 version: 2.0.0
