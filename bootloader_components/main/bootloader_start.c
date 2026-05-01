@@ -60,22 +60,22 @@ static void bootloader_gpio_make_output_low(int gpio_num)
 void bootloader_user_gpio_init(void)
 {
     /* Disable input and output */
-    bootloader_gpio_make_disabled(25);
-    bootloader_gpio_make_disabled(26);
-    bootloader_gpio_make_disabled(27);
-    bootloader_gpio_make_disabled(14);
-    bootloader_gpio_make_disabled(13);
-    bootloader_gpio_make_disabled(22);
-    bootloader_gpio_make_disabled(21);
-    bootloader_gpio_make_disabled(18);
-    bootloader_gpio_make_disabled(2);
-    bootloader_gpio_make_disabled(15);
+    bootloader_gpio_make_input_nopull(25);
+    bootloader_gpio_make_input_nopull(26);
+    bootloader_gpio_make_input_nopull(27);
+    // bootloader_gpio_make_input_nopull(14);
+    bootloader_gpio_make_input_nopull(13);
+    bootloader_gpio_make_input_nopull(22);
+    bootloader_gpio_make_input_nopull(18);
+    // bootloader_gpio_make_input_nopull(2);
+    // bootloader_gpio_make_input_nopull(15);
 
     /* Enable input, no pull-up */
     bootloader_gpio_make_input_nopull(34);
     bootloader_gpio_make_input_nopull(35);
 
     /* Enable output low */
+    bootloader_gpio_make_output_low(21);
     bootloader_gpio_make_output_low(32);
     bootloader_gpio_make_output_low(33);
     bootloader_gpio_make_output_low(23);
