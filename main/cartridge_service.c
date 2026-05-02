@@ -377,7 +377,7 @@ esp_err_t cartridge_service_init(const cartridge_service_config_t *config)
                                                  NULL,
                                                  CARTRIDGE_READER_TASK_PRIORITY,
                                                  &s_reader_task,
-                                                 tskNO_AFFINITY);
+                                                 0);
         if (ret != pdPASS)
         {
             return ESP_ERR_NO_MEM;

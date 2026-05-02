@@ -32,10 +32,52 @@
 #include "script_service.h"
 #include "storage_paths.h"
 #include "wifi_service.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <soc/soc.h>
 
 static const char *TAG = "main";
 static const bool QEMU_PCM_SERVICE_ENABLED = true;
+static const uint32_t APP_SUPER_LOOP_IDLE_MS = 1;
+
+typedef void (*app_super_loop_service_fn_t)(void);
+
+static TickType_t app_super_loop_idle_ticks(void)
+{
+    TickType_t idle_ticks = pdMS_TO_TICKS(APP_SUPER_LOOP_IDLE_MS);
+    return idle_ticks == 0 ? 1 : idle_ticks;
+}
+
+static void app_run_super_loop(bool running_in_qemu)
+{
+    app_super_loop_service_fn_t services[4] = {
+        power_mgmt_service_process_once,
+        console_service_process_once,
+    };
+    size_t service_count = 2;
+
+    if (running_in_qemu)
+    {
+        services[service_count++] = qemu_openeth_service_process_once;
+    }
+    else
+    {
+        services[service_count++] = wifi_service_process_once;
+        services[service_count++] = bluetooth_service_process_once;
+    }
+
+    TickType_t idle_ticks = app_super_loop_idle_ticks();
+
+    for (;;)
+    {
+        for (size_t index = 0; index < service_count; index++)
+        {
+            services[index]();
+        }
+
+        vTaskDelay(idle_ticks);
+    }
+}
 
 static esp_err_t app_init_secure_nvs(void)
 {
@@ -109,6 +151,22 @@ void app_main(void)
         };
         ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
     }
+    else
+    {
+        esp_pm_config_t pm_config = {
+            .max_freq_mhz = 240,
+            .min_freq_mhz = 80,
+#if CONFIG_FREERTOS_USE_TICKLESS_IDLE
+            .light_sleep_enable = true,
+#else
+            .light_sleep_enable = false,
+#endif
+        };
+#if !CONFIG_FREERTOS_USE_TICKLESS_IDLE
+        ESP_LOGW(TAG, "tickless idle is disabled; leaving light sleep off in power management config");
+#endif
+        ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+    }
 
     ESP_ERROR_CHECK(power_mgmt_service_init());
 
@@ -116,87 +174,68 @@ void app_main(void)
     ESP_ERROR_CHECK(ramdisk_service_init());
     ESP_ERROR_CHECK(esp_vfs_littlefs_register(&littlefs_cfg));
 
+    cartridge_service_config_t cart_cfg = CARTRIDGE_SERVICE_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(cartridge_service_init(&cart_cfg));
+
     if (running_in_qemu)
     {
-        cartridge_service_config_t cart_cfg = CARTRIDGE_SERVICE_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(cartridge_service_init(&cart_cfg));
-
         esp_err_t eth_err = qemu_openeth_service_init();
         if (eth_err != ESP_OK)
         {
             ESP_LOGW(TAG, "QEMU OpenETH init failed: %s", esp_err_to_name(eth_err));
         }
+    }
+    else
+    {
+        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
+        ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
+
+        ESP_ERROR_CHECK(esp_bluedroid_init());
+        ESP_ERROR_CHECK(esp_bluedroid_enable());
+
+        esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
+        esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_IO;
+        esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
+
+        ESP_ERROR_CHECK(bluetooth_service_init());
+        ESP_ERROR_CHECK(wifi_service_init());
+        ESP_ERROR_CHECK(i2s_service_init());
+        ESP_ERROR_CHECK(hid_service_init());
+        ESP_ERROR_CHECK(audio_output_switch_init());
+
+        ESP_ERROR_CHECK(bluetooth_service_register_48k_sbc_endpoint());
+
+        ESP_ERROR_CHECK(audio_output_switch_set_provider(player_service_pcm_provider, NULL));
+        ESP_ERROR_CHECK(audio_output_switch_select(AUDIO_OUTPUT_TARGET_I2S));
+    }
+
+    ESP_ERROR_CHECK(player_service_init());
+
+    if (running_in_qemu && QEMU_PCM_SERVICE_ENABLED)
+    {
+        esp_err_t pcm_err = qemu_pcm_service_init();
+        if (pcm_err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "QEMU PCM unavailable: %s", esp_err_to_name(pcm_err));
+        }
         else
         {
-            eth_err = qemu_openeth_service_wait_for_ip(15000);
-            if (eth_err != ESP_OK)
-            {
-                ESP_LOGW(TAG, "QEMU OpenETH did not obtain an IPv4 lease within the startup window");
-            }
-        }
-
-        ESP_ERROR_CHECK(player_service_init());
-
-        if (QEMU_PCM_SERVICE_ENABLED)
-        {
-            esp_err_t pcm_err = qemu_pcm_service_init();
+            pcm_err = qemu_pcm_service_register_pcm_provider(player_service_qemu_pcm_provider, NULL);
             if (pcm_err != ESP_OK)
             {
-                ESP_LOGW(TAG, "QEMU PCM unavailable: %s", esp_err_to_name(pcm_err));
+                ESP_LOGW(TAG, "failed to register QEMU PCM provider: %s", esp_err_to_name(pcm_err));
             }
             else
             {
-                pcm_err = qemu_pcm_service_register_pcm_provider(player_service_qemu_pcm_provider, NULL);
+                pcm_err = qemu_pcm_service_start_audio();
                 if (pcm_err != ESP_OK)
                 {
-                    ESP_LOGW(TAG, "failed to register QEMU PCM provider: %s", esp_err_to_name(pcm_err));
-                }
-                else
-                {
-                    pcm_err = qemu_pcm_service_start_audio();
-                    if (pcm_err != ESP_OK)
-                    {
-                        ESP_LOGW(TAG, "failed to start QEMU PCM audio: %s", esp_err_to_name(pcm_err));
-                    }
+                    ESP_LOGW(TAG, "failed to start QEMU PCM audio: %s", esp_err_to_name(pcm_err));
                 }
             }
         }
-
-        if (script_service_init() != ESP_OK)
-        {
-            ESP_LOGW(TAG, "script service init failed; continuing without WASM console support");
-        }
-
-        ESP_ERROR_CHECK(console_service_init());
-        return;
     }
-
-    cartridge_service_config_t cart_cfg = CARTRIDGE_SERVICE_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(cartridge_service_init(&cart_cfg));
-
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
-    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
-
-    ESP_ERROR_CHECK(esp_bluedroid_init());
-    ESP_ERROR_CHECK(esp_bluedroid_enable());
-
-    esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_IO;
-    esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
-
-    ESP_ERROR_CHECK(bluetooth_service_init());
-    ESP_ERROR_CHECK(wifi_service_init());
-    ESP_ERROR_CHECK(i2s_service_init());
-    ESP_ERROR_CHECK(hid_service_init());
-    ESP_ERROR_CHECK(audio_output_switch_init());
-
-    ESP_ERROR_CHECK(bluetooth_service_register_48k_sbc_endpoint());
-
-    ESP_ERROR_CHECK(audio_output_switch_set_provider(player_service_pcm_provider, NULL));
-    ESP_ERROR_CHECK(audio_output_switch_select(AUDIO_OUTPUT_TARGET_I2S));
-
-    ESP_ERROR_CHECK(player_service_init());
 
     if (script_service_init() != ESP_OK)
     {
@@ -204,4 +243,5 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(console_service_init());
+    app_run_super_loop(running_in_qemu);
 }

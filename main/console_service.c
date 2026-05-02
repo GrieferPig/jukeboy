@@ -34,9 +34,9 @@
 static const char *TAG = "console_svc";
 
 #define TELEMETRY_INTERVAL_MS 5000
-#define TELEMETRY_TASK_STACK_SIZE 2048
 #define TELEMETRY_MAX_TASKS 32
-#define CONSOLE_REPL_TASK_STACK_SIZE (4 * 1024)
+#define CONSOLE_REPL_TASK_STACK_SIZE 4096
+#define CONSOLE_PSRAM_ALLOC_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 static void script_print_output(const char *output);
 static const char *auth_mode_str(wifi_auth_mode_t mode);
@@ -51,6 +51,7 @@ typedef struct
 
 static volatile bool s_memory_telemetry_enabled = false;
 static volatile bool s_hid_log_enabled = false;
+static volatile uint32_t s_next_telemetry_due_ms;
 static UBaseType_t s_prev_snapshot_count;
 static configRUN_TIME_COUNTER_TYPE s_prev_total_runtime;
 static uint8_t s_snapshot_idx;
@@ -61,9 +62,6 @@ static esp_event_handler_instance_t s_wifi_scan_done_handler;
 
 EXT_RAM_BSS_ATTR static TaskStatus_t s_task_state_buf[TELEMETRY_MAX_TASKS];
 EXT_RAM_BSS_ATTR static telemetry_task_snapshot_t s_snapshot_bufs[2][TELEMETRY_MAX_TASKS];
-
-static StaticTask_t s_telemetry_task_tcb;
-EXT_RAM_BSS_ATTR static StackType_t s_telemetry_task_stack[TELEMETRY_TASK_STACK_SIZE];
 
 static telemetry_task_snapshot_t *find_previous_snapshot(TaskHandle_t handle)
 {
@@ -279,20 +277,6 @@ static void console_hid_event_handler(void *handler_arg,
 
     hid_button_t button = *(const hid_button_t *)event_data;
     printf("HID button pressed: %s\n", hid_button_name(button));
-}
-
-static void telemetry_task(void *param)
-{
-    capture_runtime_snapshot();
-
-    for (;;)
-    {
-        if (s_memory_telemetry_enabled)
-        {
-            print_memory_stats();
-        }
-        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_INTERVAL_MS));
-    }
 }
 
 /* ════════════════════════════════════════════════════════════════════ *
@@ -1554,10 +1538,12 @@ static int cmd_telemetry(int argc, char **argv)
     {
         s_memory_telemetry_enabled = true;
         capture_runtime_snapshot();
+        s_next_telemetry_due_ms = (uint32_t)(esp_timer_get_time() / 1000) + TELEMETRY_INTERVAL_MS;
     }
     else if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0)
     {
         s_memory_telemetry_enabled = false;
+        s_next_telemetry_due_ms = 0;
     }
     else
     {
@@ -1582,6 +1568,34 @@ static void register_telemetry(void)
         .argtable = &s_telemetry_args,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
+void console_service_process_once(void)
+{
+    uint32_t now_ms;
+    uint32_t next_due_ms;
+
+    if (!s_memory_telemetry_enabled)
+    {
+        s_next_telemetry_due_ms = 0;
+        return;
+    }
+
+    now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    next_due_ms = s_next_telemetry_due_ms;
+    if (next_due_ms == 0)
+    {
+        s_next_telemetry_due_ms = now_ms + TELEMETRY_INTERVAL_MS;
+        return;
+    }
+
+    if ((int32_t)(now_ms - next_due_ms) < 0)
+    {
+        return;
+    }
+
+    print_memory_stats();
+    s_next_telemetry_due_ms = now_ms + TELEMETRY_INTERVAL_MS;
 }
 
 /* ════════════════════════════════════════════════════════════════════ *
@@ -1873,12 +1887,25 @@ static int script_list_directory(const char *path)
 
 static void script_print_status(void)
 {
-    script_service_status_snapshot_t snapshot = {0};
+    script_service_status_snapshot_t *snapshot = heap_caps_calloc(1, sizeof(*snapshot), CONSOLE_PSRAM_ALLOC_CAPS);
     int64_t now_ms = esp_timer_get_time() / 1000;
+    esp_err_t err;
 
-    script_service_get_status_snapshot(&snapshot);
+    if (!snapshot)
+    {
+        printf("Script status unavailable: out of memory\n");
+        return;
+    }
 
-    printf("Script service: %s\n", script_service_status_name(snapshot.status));
+    err = script_service_get_status_snapshot(snapshot);
+    if (err != ESP_OK)
+    {
+        printf("Script status unavailable: %s\n", esp_err_to_name(err));
+        heap_caps_free(snapshot);
+        return;
+    }
+
+    printf("Script service: %s\n", script_service_status_name(snapshot->status));
     printf("Host module:    %s\n", SCRIPT_SERVICE_HOST_MODULE_NAME);
     printf("Run mode:       .wasm/.cwasm => %s\n",
            script_service_run_mode_name(SCRIPT_SERVICE_RUN_MODE_LIBC_BUILTIN));
@@ -1886,53 +1913,55 @@ static void script_print_status(void)
     printf("Lookup:         <name> -> %s/<name>/<name>.wasm|.cwasm\n",
            script_service_get_root_path());
 
-    printf("Running:        %s\n", snapshot.has_active_run ? "yes" : "no");
-    if (snapshot.has_active_run)
+    printf("Running:        %s\n", snapshot->has_active_run ? "yes" : "no");
+    if (snapshot->has_active_run)
     {
         long elapsed_ms = 0;
 
-        if (snapshot.active_run_started_ms > 0 && now_ms >= snapshot.active_run_started_ms)
+        if (snapshot->active_run_started_ms > 0 && now_ms >= snapshot->active_run_started_ms)
         {
-            int64_t elapsed_ms64 = now_ms - snapshot.active_run_started_ms;
+            int64_t elapsed_ms64 = now_ms - snapshot->active_run_started_ms;
 
             elapsed_ms = elapsed_ms64 > LONG_MAX ? LONG_MAX : (long)elapsed_ms64;
         }
 
-        printf("Active run ID:  %u\n", (unsigned)snapshot.active_run.run_id);
-        printf("Active script:  %s\n", snapshot.active_run.resolved_path);
-        printf("Active mode:    %s\n", script_service_run_mode_name(snapshot.active_run.mode));
-        printf("Active size:    %u bytes\n", (unsigned)snapshot.active_run.script_size_bytes);
+        printf("Active run ID:  %u\n", (unsigned)snapshot->active_run.run_id);
+        printf("Active script:  %s\n", snapshot->active_run.resolved_path);
+        printf("Active mode:    %s\n", script_service_run_mode_name(snapshot->active_run.mode));
+        printf("Active size:    %u bytes\n", (unsigned)snapshot->active_run.script_size_bytes);
         printf("Active for:     %ld ms\n", elapsed_ms);
-        if (snapshot.active_run.message[0] != '\0')
+        if (snapshot->active_run.message[0] != '\0')
         {
-            printf("Active note:    %s\n", snapshot.active_run.message);
+            printf("Active note:    %s\n", snapshot->active_run.message);
         }
     }
 
-    if (snapshot.has_last_run)
+    if (snapshot->has_last_run)
     {
         long finished_ago_ms = 0;
 
-        if (snapshot.last_run_finished_ms > 0 && now_ms >= snapshot.last_run_finished_ms)
+        if (snapshot->last_run_finished_ms > 0 && now_ms >= snapshot->last_run_finished_ms)
         {
-            int64_t finished_ago_ms64 = now_ms - snapshot.last_run_finished_ms;
+            int64_t finished_ago_ms64 = now_ms - snapshot->last_run_finished_ms;
 
             finished_ago_ms = finished_ago_ms64 > LONG_MAX ? LONG_MAX : (long)finished_ago_ms64;
         }
 
-        printf("Last run ID:    %u\n", (unsigned)snapshot.last_run.run_id);
-        printf("Last script:    %s\n", snapshot.last_run.resolved_path);
-        printf("Last mode:      %s\n", script_service_run_mode_name(snapshot.last_run.mode));
-        printf("Last size:      %u bytes\n", (unsigned)snapshot.last_run.script_size_bytes);
-        printf("Last exit code: %ld\n", (long)snapshot.last_run.exit_code);
-        printf("Last state:     %s\n", snapshot.last_run_err == ESP_OK ? "ok" : "error");
-        if (snapshot.last_run.message[0] != '\0')
+        printf("Last run ID:    %u\n", (unsigned)snapshot->last_run.run_id);
+        printf("Last script:    %s\n", snapshot->last_run.resolved_path);
+        printf("Last mode:      %s\n", script_service_run_mode_name(snapshot->last_run.mode));
+        printf("Last size:      %u bytes\n", (unsigned)snapshot->last_run.script_size_bytes);
+        printf("Last exit code: %ld\n", (long)snapshot->last_run.exit_code);
+        printf("Last state:     %s\n", snapshot->last_run_err == ESP_OK ? "ok" : "error");
+        if (snapshot->last_run.message[0] != '\0')
         {
-            printf("Last message:   %s\n", snapshot.last_run.message);
+            printf("Last message:   %s\n", snapshot->last_run.message);
         }
         printf("Last finished:  %ld ms ago\n", finished_ago_ms);
-        script_print_output(snapshot.last_run.output);
+        script_print_output(snapshot->last_run.output);
     }
+
+    heap_caps_free(snapshot);
 }
 
 static void script_print_output(const char *output)
@@ -2057,7 +2086,7 @@ static int cmd_script(int argc, char **argv)
             script_argv = (const char *const *)&argv[3];
         }
 
-        result = calloc(1, sizeof(*result));
+        result = heap_caps_calloc(1, sizeof(*result), CONSOLE_PSRAM_ALLOC_CAPS);
         if (!result)
         {
             printf("Error: out of memory\n");
@@ -2075,7 +2104,7 @@ static int cmd_script(int argc, char **argv)
             script_print_output(result->output);
             printf("Error: %s\n",
                    result->message[0] != '\0' ? result->message : esp_err_to_name(err));
-            free(result);
+            heap_caps_free(result);
             return 1;
         }
 
@@ -2084,7 +2113,7 @@ static int cmd_script(int argc, char **argv)
         printf("Mode:      %s\n", script_service_run_mode_name(result->mode));
         printf("Size:      %u bytes\n", (unsigned)result->script_size_bytes);
         printf("Status:    running in background; use 'script status' to monitor completion\n");
-        free(result);
+        heap_caps_free(result);
         return 0;
     }
 
@@ -2246,7 +2275,7 @@ esp_err_t console_service_init(void)
 
     const esp_console_cmd_t script_cmd = {
         .command = "script",
-        .help = "WASM scripts: script <status|roots|ls|resolve|run> [args]",
+        .help = "WASM scripts: script <status|ls|log|run> [args]",
         .hint = NULL,
         .func = cmd_script,
     };
@@ -2292,18 +2321,6 @@ esp_err_t console_service_init(void)
     if (event_err != ESP_OK && event_err != ESP_ERR_INVALID_STATE)
     {
         return event_err;
-    }
-
-    if (!xTaskCreateStaticPinnedToCore(telemetry_task,
-                                       "ConsoleTelemetry",
-                                       TELEMETRY_TASK_STACK_SIZE,
-                                       NULL,
-                                       4,
-                                       s_telemetry_task_stack,
-                                       &s_telemetry_task_tcb,
-                                       0))
-    {
-        return ESP_ERR_NO_MEM;
     }
 
     /* Start UART REPL */

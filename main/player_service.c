@@ -173,6 +173,10 @@ static EventGroupHandle_t s_pipeline_event_group;
 static TaskHandle_t s_reader_task;
 static TaskHandle_t s_decoder_task;
 static TaskHandle_t s_service_task;
+static StackType_t *s_reader_task_stack;
+static StaticTask_t s_reader_task_tcb;
+static StackType_t *s_decoder_task_stack;
+static StaticTask_t s_decoder_task_tcb;
 static bool s_initialised;
 static bool s_playing;
 static bool s_paused;
@@ -1963,25 +1967,55 @@ esp_err_t player_service_init(void)
     /* Mark both pipeline tasks as idle before creating them. */
     xEventGroupSetBits(s_pipeline_event_group, PLAYER_SVC_PIPELINE_IDLE_BITS);
 
-    if (xTaskCreatePinnedToCore(player_service_reader_task,
-                                "player_reader",
-                                PLAYER_SVC_READER_TASK_STACK,
-                                NULL,
-                                PLAYER_SVC_READER_TASK_PRIORITY,
-                                &s_reader_task,
-                                1) != pdPASS)
+    if (s_reader_task_stack == NULL)
     {
+        s_reader_task_stack = heap_caps_calloc(PLAYER_SVC_READER_TASK_STACK,
+                                               sizeof(StackType_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_reader_task_stack == NULL)
+        {
+            ESP_LOGE(TAG, "failed to allocate player reader stack in PSRAM");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    s_reader_task = xTaskCreateStaticPinnedToCore(player_service_reader_task,
+                                                  "player_reader",
+                                                  PLAYER_SVC_READER_TASK_STACK,
+                                                  NULL,
+                                                  PLAYER_SVC_READER_TASK_PRIORITY,
+                                                  s_reader_task_stack,
+                                                  &s_reader_task_tcb,
+                                                  1);
+    if (s_reader_task == NULL)
+    {
+        ESP_LOGE(TAG, "failed to create player reader task with PSRAM stack");
         return ESP_ERR_NO_MEM;
     }
 
-    if (xTaskCreatePinnedToCore(player_service_decoder_task,
-                                "player_decoder",
-                                PLAYER_SVC_DECODER_TASK_STACK,
-                                NULL,
-                                PLAYER_SVC_DECODER_TASK_PRIORITY,
-                                &s_decoder_task,
-                                1) != pdPASS)
+    if (s_decoder_task_stack == NULL)
     {
+        s_decoder_task_stack = heap_caps_calloc(PLAYER_SVC_DECODER_TASK_STACK,
+                                                sizeof(StackType_t),
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_decoder_task_stack == NULL)
+        {
+            ESP_LOGE(TAG, "failed to allocate player decoder stack in PSRAM");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    s_decoder_task = xTaskCreateStaticPinnedToCore(player_service_decoder_task,
+                                                   "player_decoder",
+                                                   PLAYER_SVC_DECODER_TASK_STACK,
+                                                   NULL,
+                                                   PLAYER_SVC_DECODER_TASK_PRIORITY,
+                                                   s_decoder_task_stack,
+                                                   &s_decoder_task_tcb,
+                                                   1);
+    if (s_decoder_task == NULL)
+    {
+        ESP_LOGE(TAG, "failed to create player decoder task with PSRAM stack");
         return ESP_ERR_NO_MEM;
     }
 

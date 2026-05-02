@@ -4,6 +4,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 
 #include "esp_check.h"
 #include "esp_eth.h"
@@ -19,6 +20,7 @@ static const char *TAG = "qemu_openeth";
 
 #define QEMU_OPENETH_LINK_UP_BIT BIT0
 #define QEMU_OPENETH_GOT_IP_BIT BIT1
+#define QEMU_OPENETH_STARTUP_LEASE_TIMEOUT_MS 15000
 
 static esp_eth_handle_t s_eth_handle;
 static esp_eth_netif_glue_handle_t s_eth_glue;
@@ -27,9 +29,22 @@ static EventGroupHandle_t s_events;
 static esp_event_handler_instance_t s_eth_event_handler;
 static esp_event_handler_instance_t s_ip_event_handler;
 static esp_netif_ip_info_t s_ip_info;
+static TickType_t s_ip_wait_deadline;
 static bool s_initialized;
 static bool s_started;
 static bool s_have_ip;
+static bool s_ip_wait_active;
+
+static TickType_t qemu_openeth_service_wait_timeout_ticks(void)
+{
+    TickType_t wait_ticks = pdMS_TO_TICKS(QEMU_OPENETH_STARTUP_LEASE_TIMEOUT_MS);
+    return wait_ticks == 0 ? 1 : wait_ticks;
+}
+
+static bool qemu_openeth_service_deadline_reached(TickType_t now, TickType_t deadline)
+{
+    return (int32_t)(now - deadline) >= 0;
+}
 
 static void qemu_openeth_service_reset_state(void)
 {
@@ -40,6 +55,8 @@ static void qemu_openeth_service_reset_state(void)
     s_ip_event_handler = NULL;
     s_started = false;
     s_have_ip = false;
+    s_ip_wait_active = false;
+    s_ip_wait_deadline = 0;
     memset(&s_ip_info, 0, sizeof(s_ip_info));
 }
 
@@ -211,6 +228,7 @@ static void qemu_openeth_ip_event_handler(void *arg,
 
     s_ip_info = event->ip_info;
     s_have_ip = true;
+    s_ip_wait_active = false;
     ESP_LOGI(TAG,
              "QEMU OpenETH got IPv4 address: ip=" IPSTR " gw=" IPSTR " mask=" IPSTR,
              IP2STR(&event->ip_info.ip),
@@ -332,32 +350,34 @@ esp_err_t qemu_openeth_service_init(void)
 
     s_started = true;
     s_initialized = true;
+    s_ip_wait_active = true;
+    s_ip_wait_deadline = xTaskGetTickCount() + qemu_openeth_service_wait_timeout_ticks();
     ESP_LOGI(TAG, "QEMU OpenETH driver initialized");
     return ESP_OK;
 #endif
 }
 
-esp_err_t qemu_openeth_service_wait_for_ip(uint32_t timeout_ms)
+void qemu_openeth_service_process_once(void)
 {
-    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "OpenETH service is not initialized");
+    if (!s_initialized || !s_started || !s_ip_wait_active)
+    {
+        return;
+    }
 
     if (s_have_ip)
     {
-        return ESP_OK;
+        s_ip_wait_active = false;
+        return;
     }
 
-    TickType_t wait_ticks = pdMS_TO_TICKS(timeout_ms);
-    if (timeout_ms > 0 && wait_ticks == 0)
+    TickType_t now = xTaskGetTickCount();
+    if (!qemu_openeth_service_deadline_reached(now, s_ip_wait_deadline))
     {
-        wait_ticks = 1;
+        return;
     }
 
-    EventBits_t bits = xEventGroupWaitBits(s_events,
-                                           QEMU_OPENETH_GOT_IP_BIT,
-                                           pdFALSE,
-                                           pdFALSE,
-                                           wait_ticks);
-    return (bits & QEMU_OPENETH_GOT_IP_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
+    ESP_LOGW(TAG, "QEMU OpenETH did not obtain an IPv4 lease within the startup window");
+    s_ip_wait_active = false;
 }
 
 bool qemu_openeth_service_has_ip(void)

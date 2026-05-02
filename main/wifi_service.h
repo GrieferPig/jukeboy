@@ -51,11 +51,14 @@ extern "C"
     /* ── Public API ─────────────────────────────────────────────────────── */
 
     /**
-     * Initialise the WiFi service: creates the service task, command queue,
+     * Initialise the WiFi service: creates the internal command queue,
      * default netif, WiFi driver in STA mode, and posts WIFI_SVC_EVENT_STARTED.
-        * Must be called after the application's secure NVS initialization step.
+     * Must be called after the application's secure NVS initialization step.
      */
     esp_err_t wifi_service_init(void);
+
+    /** Run one bounded slice of deferred Wi-Fi work from the main super-loop. */
+    void wifi_service_process_once(void);
 
     /** Enqueue a connect command (SSID/password saved to NVS). */
     esp_err_t wifi_service_connect(const char *ssid, const char *password);
@@ -88,7 +91,7 @@ extern "C"
     /** Copy current IP info (only valid when state == CONNECTED). */
     esp_err_t wifi_service_get_ip_info(esp_netif_ip_info_t *out);
 
-    /** Stop Wi-Fi, tear down its task/timer/netif state, and deinitialize the network driver stack. */
+    /** Stop Wi-Fi, tear down its queue/timer/netif state, and deinitialize the network driver stack. */
     esp_err_t wifi_service_shutdown(void);
 
 #ifdef __cplusplus

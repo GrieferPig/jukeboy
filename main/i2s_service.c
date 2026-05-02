@@ -52,6 +52,7 @@ static i2s_service_pcm_provider_t s_pcm_provider;
 static void *s_pcm_provider_ctx;
 static bool s_running;
 static bool s_dac_rail_requested;
+static bool s_write_timeout_logged;
 static uint8_t s_pcm_buf[I2S_SVC_PCM_BUF_BYTES];
 
 static esp_err_t i2s_service_prepare_dac_power_off(void *user_ctx)
@@ -117,6 +118,7 @@ static esp_err_t i2s_service_enable_output(void)
     }
 
     s_running = true;
+    s_write_timeout_logged = false;
     ESP_LOGI(TAG, "I2S TX enabled");
     return ESP_OK;
 }
@@ -151,6 +153,7 @@ static void i2s_service_disable_output(void)
     }
 
     s_running = false;
+    s_write_timeout_logged = false;
     ESP_LOGI(TAG, "I2S TX disabled");
 }
 
@@ -229,7 +232,36 @@ static void i2s_service_task(void *param)
         }
 
         size_t bytes_written = 0;
-        i2s_channel_write(s_tx_channel, s_pcm_buf, (size_t)filled, &bytes_written, portMAX_DELAY);
+        esp_err_t err = i2s_channel_write(s_tx_channel,
+                                          s_pcm_buf,
+                                          (size_t)filled,
+                                          &bytes_written,
+                                          pdMS_TO_TICKS(I2S_SVC_CMD_POLL_MS));
+        if (err == ESP_OK)
+        {
+            s_write_timeout_logged = false;
+            continue;
+        }
+
+        if (err == ESP_ERR_TIMEOUT)
+        {
+            if (!s_write_timeout_logged)
+            {
+                ESP_LOGW(TAG, "I2S TX write timed out; retrying");
+                s_write_timeout_logged = true;
+            }
+            continue;
+        }
+
+        s_write_timeout_logged = false;
+        if (err == ESP_ERR_INVALID_STATE)
+        {
+            s_running = false;
+            ESP_LOGI(TAG, "I2S TX write stopped after channel disable");
+            continue;
+        }
+
+        ESP_LOGW(TAG, "I2S TX write failed: %s", esp_err_to_name(err));
     }
 }
 

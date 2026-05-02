@@ -53,6 +53,7 @@ extern "C"
     } bluetooth_service_pairing_confirm_t;
 
     esp_err_t bluetooth_service_init(void);
+    void bluetooth_service_process_once(void);
     esp_err_t bluetooth_service_pair_best_a2dp_sink(void);
     esp_err_t bluetooth_service_connect_last_bonded_a2dp_device(void);
     esp_err_t bluetooth_service_get_pending_pairing_confirm(bluetooth_service_pairing_confirm_t *confirm);

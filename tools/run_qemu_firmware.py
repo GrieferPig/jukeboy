@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-
 DEFAULT_QEMU_DIR = "qemu-official-9.0.0"
 DEFAULT_BUILD_DIR = "build"
 
@@ -100,8 +99,8 @@ def merge_flash(build_dir: Path, dry_run: bool) -> None:
         "esptool",
         "--chip",
         "esp32",
-        "merge_bin",
-        "--fill-flash-size",
+        "merge-bin",
+        "--pad-to-size",
         "8MB",
         "-o",
         "qemu_flash.bin",

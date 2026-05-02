@@ -20,7 +20,7 @@
 #include "soc/gpio_sig_map.h"
 
 #define CUSTOM_DOWNLOAD_MAGIC_WORD 0xDEADBEEF
-#define CUSTOM_FLAG_ADDR ((volatile uint32_t *)0x3FF81FFC)
+#define CUSTOM_DOWNLOAD_MAGIC_REG RTC_CNTL_STORE0_REG
 
 static const char *TAG = "boot";
 
@@ -458,10 +458,10 @@ static uint32_t dl_run_protocol(void)
 void __attribute__((noreturn)) call_start_cpu0(void)
 {
 
-    if ((*CUSTOM_FLAG_ADDR) == CUSTOM_DOWNLOAD_MAGIC_WORD)
+    if (REG_READ(CUSTOM_DOWNLOAD_MAGIC_REG) == CUSTOM_DOWNLOAD_MAGIC_WORD)
     {
         ESP_LOGW(TAG, "magic set; entering dl");
-        (*CUSTOM_FLAG_ADDR) = 0; // Clear the magic word
+        REG_WRITE(CUSTOM_DOWNLOAD_MAGIC_REG, 0);
 
         /* Disable RTC watchdog so it cannot interrupt the download session */
         REG_WRITE(RTC_CNTL_WDTWPROTECT_REG, 0x50D83AA1);

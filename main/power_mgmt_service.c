@@ -10,12 +10,14 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include <soc/soc.h>
+#include <soc/rtc_cntl_reg.h>
 
 ESP_EVENT_DEFINE_BASE(POWER_MGMT_SERVICE_EVENT);
 
 #define POWER_MGMT_EVENT_POST_TIMEOUT_MS 1000
 #define POWER_MGMT_MAX_SHUTDOWN_CALLBACKS 8
 #define POWER_MGMT_DAC_MUTE_SETTLE_MS 1
+#define POWER_MGMT_REBOOT_SETTLE_MS 100
 
 static const char *TAG = "power_mgmt_svc";
 
@@ -32,6 +34,13 @@ typedef struct
     int priority;
 } power_mgmt_service_shutdown_entry_t;
 
+typedef enum
+{
+    POWER_MGMT_PENDING_ACTION_NONE = 0,
+    POWER_MGMT_PENDING_ACTION_REBOOT,
+    POWER_MGMT_PENDING_ACTION_DOWNLOAD,
+} power_mgmt_pending_action_t;
+
 static SemaphoreHandle_t s_service_lock;
 static power_mgmt_service_shutdown_entry_t s_shutdown_callbacks[POWER_MGMT_MAX_SHUTDOWN_CALLBACKS];
 static size_t s_shutdown_callback_count;
@@ -43,6 +52,8 @@ static power_mgmt_service_dac_prepare_off_callback_t s_dac_prepare_off_callback;
 static void *s_dac_prepare_off_user_ctx;
 static bool s_dac_muted = true;
 static bool s_initialized;
+static power_mgmt_pending_action_t s_pending_action;
+static TickType_t s_pending_action_deadline;
 
 static const power_mgmt_rail_config_t s_rail_configs[POWER_MGMT_RAIL_COUNT] = {
     [POWER_MGMT_RAIL_DAC] = {
@@ -82,11 +93,39 @@ static const i2s_std_gpio_config_t s_dac_i2s_gpio_disconnected = {
 };
 
 #define CUSTOM_DOWNLOAD_MAGIC_WORD 0xDEADBEEF
-#define CUSTOM_FLAG_ADDR ((volatile uint32_t *)0x3FF81FFC)
+#define CUSTOM_DOWNLOAD_MAGIC_REG RTC_CNTL_STORE0_REG
 
 static bool power_mgmt_service_is_valid_rail(power_mgmt_rail_t rail)
 {
     return rail >= 0 && rail < POWER_MGMT_RAIL_COUNT;
+}
+
+static bool power_mgmt_service_deadline_reached(TickType_t now, TickType_t deadline)
+{
+    return (int32_t)(now - deadline) >= 0;
+}
+
+static TickType_t power_mgmt_service_reboot_settle_ticks(void)
+{
+    TickType_t settle_ticks = pdMS_TO_TICKS(POWER_MGMT_REBOOT_SETTLE_MS);
+    return settle_ticks == 0 ? 1 : settle_ticks;
+}
+
+static esp_err_t power_mgmt_service_schedule_pending_action(power_mgmt_pending_action_t action)
+{
+    ESP_RETURN_ON_FALSE(action != POWER_MGMT_PENDING_ACTION_NONE, ESP_ERR_INVALID_ARG, TAG, "invalid pending action");
+
+    xSemaphoreTake(s_service_lock, portMAX_DELAY);
+    if (s_pending_action != POWER_MGMT_PENDING_ACTION_NONE)
+    {
+        xSemaphoreGive(s_service_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_pending_action = action;
+    s_pending_action_deadline = xTaskGetTickCount() + power_mgmt_service_reboot_settle_ticks();
+    xSemaphoreGive(s_service_lock);
+    return ESP_OK;
 }
 
 static bool power_mgmt_service_effective_enabled(power_mgmt_rail_t rail)
@@ -419,6 +458,42 @@ esp_err_t power_mgmt_service_init(void)
     return ESP_OK;
 }
 
+void power_mgmt_service_process_once(void)
+{
+    if (!s_initialized)
+    {
+        return;
+    }
+
+    power_mgmt_pending_action_t action = POWER_MGMT_PENDING_ACTION_NONE;
+
+    xSemaphoreTake(s_service_lock, portMAX_DELAY);
+    if (s_pending_action != POWER_MGMT_PENDING_ACTION_NONE &&
+        power_mgmt_service_deadline_reached(xTaskGetTickCount(), s_pending_action_deadline))
+    {
+        action = s_pending_action;
+        s_pending_action = POWER_MGMT_PENDING_ACTION_NONE;
+    }
+    xSemaphoreGive(s_service_lock);
+
+    if (action == POWER_MGMT_PENDING_ACTION_NONE)
+    {
+        return;
+    }
+
+    if (action == POWER_MGMT_PENDING_ACTION_DOWNLOAD)
+    {
+        ESP_LOGI(TAG, "shutdown callbacks complete, entering download mode");
+        REG_WRITE(CUSTOM_DOWNLOAD_MAGIC_REG, CUSTOM_DOWNLOAD_MAGIC_WORD);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "shutdown callbacks complete, restarting");
+    }
+
+    esp_restart();
+}
+
 esp_err_t power_mgmt_service_register_shutdown_callback(power_mgmt_service_shutdown_callback_t callback,
                                                         void *user_ctx,
                                                         int priority)
@@ -607,16 +682,6 @@ static esp_err_t power_mgmt_service_run_shutdown_callbacks(void)
     return ESP_OK;
 }
 
-static void power_mgmt_service_reboot_to_download_task(void *param)
-{
-    (void)param;
-
-    ESP_LOGI(TAG, "shutdown callbacks complete, entering download mode");
-    (*CUSTOM_FLAG_ADDR) = CUSTOM_DOWNLOAD_MAGIC_WORD;
-    vTaskDelay(pdMS_TO_TICKS(100));
-    esp_restart();
-}
-
 esp_err_t power_mgmt_service_reboot(void)
 {
     ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "power management service is not initialized");
@@ -631,10 +696,7 @@ esp_err_t power_mgmt_service_reboot(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "shutdown callbacks complete, restarting");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    esp_restart();
-    return ESP_OK;
+    return power_mgmt_service_schedule_pending_action(POWER_MGMT_PENDING_ACTION_REBOOT);
 }
 
 esp_err_t power_mgmt_service_reboot_to_download(void)
@@ -651,17 +713,5 @@ esp_err_t power_mgmt_service_reboot_to_download(void)
         return err;
     }
 
-    BaseType_t task_created = xTaskCreatePinnedToCore(power_mgmt_service_reboot_to_download_task,
-                                                      "rdl",
-                                                      2048,
-                                                      NULL,
-                                                      configMAX_PRIORITIES - 1,
-                                                      NULL,
-                                                      0);
-    if (task_created != pdPASS)
-    {
-        return ESP_ERR_NO_MEM;
-    }
-
-    return ESP_OK;
+    return power_mgmt_service_schedule_pending_action(POWER_MGMT_PENDING_ACTION_DOWNLOAD);
 }

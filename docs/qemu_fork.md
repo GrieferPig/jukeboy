@@ -215,7 +215,7 @@ Before running, regenerate the merged flash image after any firmware rebuild:
 
 ```sh
 # From the ESP-IDF build directory (bttest/build/)
-esptool.py --chip esp32 merge_bin --fill-flash-size 8MB -o qemu_flash.bin @flash_args
+esptool.py --chip esp32 merge-bin --pad-to-size 8MB -o qemu_flash.bin @flash_args
 ```
 
 Then launch:

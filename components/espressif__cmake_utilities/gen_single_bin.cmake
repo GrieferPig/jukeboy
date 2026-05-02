@@ -5,7 +5,7 @@ if (NOT TARGET gen_single_bin)
     add_custom_target(
         gen_single_bin
         COMMAND ${CMAKE_COMMAND} -E echo "Merge bin files to ${CMAKE_PROJECT_NAME}_merged.bin"
-        COMMAND ${ESPTOOLPY} --chip ${IDF_TARGET} merge_bin -o ${CMAKE_PROJECT_NAME}_merged.bin @flash_args
+        COMMAND ${ESPTOOLPY} --chip ${IDF_TARGET} merge-bin -o ${CMAKE_PROJECT_NAME}_merged.bin @flash_args
         COMMAND ${CMAKE_COMMAND} -E echo "Merge bin done"
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         DEPENDS gen_project_binary bootloader

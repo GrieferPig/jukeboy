@@ -43,6 +43,7 @@ extern "C"
 #define POWER_MGMT_SERVICE_SHUTDOWN_PRIORITY_FLASH 1000
 
     esp_err_t power_mgmt_service_init(void);
+    void power_mgmt_service_process_once(void);
     esp_err_t power_mgmt_service_bind_dac_i2s_channel(i2s_chan_handle_t tx_channel,
                                                       power_mgmt_service_dac_prepare_off_callback_t prepare_off_callback,
                                                       void *prepare_off_user_ctx);

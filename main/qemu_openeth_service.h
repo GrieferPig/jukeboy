@@ -11,7 +11,7 @@ extern "C"
 #endif
 
     esp_err_t qemu_openeth_service_init(void);
-    esp_err_t qemu_openeth_service_wait_for_ip(uint32_t timeout_ms);
+    void qemu_openeth_service_process_once(void);
     bool qemu_openeth_service_has_ip(void);
 
 #ifdef __cplusplus
