@@ -27,6 +27,7 @@
 #include "audio_output_switch.h"
 #include "hid_service.h"
 #include "pin_defs.h"
+#include "play_history_service.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
 #include "script_service.h"
@@ -757,6 +758,173 @@ static int cmd_media(int argc, char **argv)
 
     printf("Media control queued: %s\n", media_control_name(control));
     return 0;
+}
+
+static bool parse_u32_arg(const char *value, uint32_t *out_value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!value || !out_value)
+    {
+        return false;
+    }
+
+    parsed = strtoul(value, &end, 0);
+    if (end == value || *end != '\0' || parsed > UINT32_MAX)
+    {
+        return false;
+    }
+
+    *out_value = (uint32_t)parsed;
+    return true;
+}
+
+static uint32_t history_album_total_plays(uint32_t checksum)
+{
+    uint32_t total_plays = 0;
+    size_t track_count = play_history_service_get_album_track_count(checksum);
+
+    for (size_t index = 0; index < track_count; index++)
+    {
+        play_history_track_record_t track_record;
+        if (!play_history_service_get_album_track_record(checksum, index, &track_record))
+        {
+            continue;
+        }
+        total_plays += track_record.play_count;
+    }
+
+    return total_plays;
+}
+
+static int cmd_history(int argc, char **argv)
+{
+    static const char *usage =
+        "Usage: history [status|albums|tracks <checksum>|clear|rebuild|commit]\n"
+        "  status            Show cache summary and dirty state\n"
+        "  albums            List stored album records\n"
+        "  tracks <checksum> List stored track records for one album\n"
+        "  clear             Clear the in-memory cache\n"
+        "  rebuild           Clear and repopulate from the current cartridge\n"
+        "  commit            Commit the current cache image to LittleFS now\n";
+
+    if (argc < 2 || strcmp(argv[1], "status") == 0)
+    {
+        printf("Dirty:  %s\n", play_history_service_is_dirty() ? "yes" : "no");
+        printf("Commit: %s\n", play_history_service_is_commit_in_progress() ? "running" : "idle");
+        printf("Albums: %u\n", (unsigned)play_history_service_get_album_count());
+        printf("Tracks: %u\n", (unsigned)play_history_service_get_track_count());
+        return 0;
+    }
+
+    if (strcmp(argv[1], "albums") == 0)
+    {
+        size_t album_count = play_history_service_get_album_count();
+
+        if (album_count == 0)
+        {
+            printf("No albums in history.\n");
+            return 0;
+        }
+
+        printf("%-4s %-10s %-6s %-6s %s\n", "#", "Checksum", "Tracks", "Plays", "Album");
+        for (size_t index = 0; index < album_count; index++)
+        {
+            play_history_album_record_t album_record;
+            if (!play_history_service_get_album_record(index, &album_record))
+            {
+                continue;
+            }
+
+            printf("%-4u 0x%08lx %-6lu %-6lu %s\n",
+                   (unsigned)(index + 1),
+                   (unsigned long)album_record.checksum,
+                   (unsigned long)album_record.track_count,
+                   (unsigned long)history_album_total_plays(album_record.checksum),
+                   album_record.metadata.album_name[0] ? album_record.metadata.album_name : "<unnamed>");
+        }
+        return 0;
+    }
+
+    if (strcmp(argv[1], "tracks") == 0)
+    {
+        uint32_t checksum;
+        play_history_album_record_t album_record;
+        size_t track_count;
+
+        if (argc < 3 || !parse_u32_arg(argv[2], &checksum))
+        {
+            printf("Usage: history tracks <checksum>\n");
+            return 1;
+        }
+
+        if (!play_history_service_get_album_record_by_checksum(checksum, &album_record))
+        {
+            printf("Album 0x%08lx not found.\n", (unsigned long)checksum);
+            return 1;
+        }
+
+        track_count = play_history_service_get_album_track_count(checksum);
+        printf("Album: %s\n", album_record.metadata.album_name[0] ? album_record.metadata.album_name : "<unnamed>");
+        printf("Tracks stored: %u\n", (unsigned)track_count);
+        printf("%-4s %-5s %-6s %-8s %s\n", "#", "Idx", "File", "Plays", "Track");
+        for (size_t index = 0; index < track_count; index++)
+        {
+            play_history_track_record_t track_record;
+            if (!play_history_service_get_album_track_record(checksum, index, &track_record))
+            {
+                continue;
+            }
+
+            printf("%-4u %-5lu %-6lu %-8lu %s\n",
+                   (unsigned)(index + 1),
+                   (unsigned long)track_record.track_index,
+                   (unsigned long)track_record.track_file_num,
+                   (unsigned long)track_record.play_count,
+                   track_record.metadata.track_name[0] ? track_record.metadata.track_name : "<unnamed>");
+        }
+        return 0;
+    }
+
+    if (strcmp(argv[1], "clear") == 0)
+    {
+        esp_err_t err = play_history_service_request_clear();
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("History clear queued.\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "rebuild") == 0)
+    {
+        esp_err_t err = play_history_service_request_rebuild();
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("History rebuild queued.\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "commit") == 0)
+    {
+        esp_err_t err = play_history_service_commit();
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("History commit complete.\n");
+        return 0;
+    }
+
+    printf("Unknown subcommand '%s'.\n%s", argv[1], usage);
+    return 1;
 }
 
 static int cmd_bt(int argc, char **argv)
@@ -2272,6 +2440,14 @@ esp_err_t console_service_init(void)
         .argtable = &s_media_args,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&media_cmd));
+
+    const esp_console_cmd_t history_cmd = {
+        .command = "history",
+        .help = "Play history: history [status|albums|tracks <checksum>|clear|rebuild|commit]",
+        .hint = NULL,
+        .func = cmd_history,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&history_cmd));
 
     const esp_console_cmd_t script_cmd = {
         .command = "script",

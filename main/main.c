@@ -23,6 +23,7 @@
 #include "console_service.h"
 #include "hid_service.h"
 #include "i2s_service.h"
+#include "play_history_service.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
 #include "qemu_openeth_service.h"
@@ -50,11 +51,12 @@ static TickType_t app_super_loop_idle_ticks(void)
 
 static void app_run_super_loop(bool running_in_qemu)
 {
-    app_super_loop_service_fn_t services[4] = {
+    app_super_loop_service_fn_t services[5] = {
         power_mgmt_service_process_once,
         console_service_process_once,
+        play_history_service_process_once,
     };
-    size_t service_count = 2;
+    size_t service_count = 3;
 
     if (running_in_qemu)
     {
@@ -211,6 +213,7 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(player_service_init());
+    ESP_ERROR_CHECK(play_history_service_init());
 
     if (running_in_qemu && QEMU_PCM_SERVICE_ENABLED)
     {

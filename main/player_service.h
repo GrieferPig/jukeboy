@@ -13,13 +13,24 @@ extern "C"
 
     ESP_EVENT_DECLARE_BASE(PLAYER_SERVICE_EVENT);
 
+#define PLAYER_SVC_TRACK_FILENAME_MAX_LEN 16
+
     typedef enum
     {
         PLAYER_SVC_EVENT_STARTED,
         PLAYER_SVC_EVENT_PLAYLIST_READY,
         PLAYER_SVC_EVENT_TRACK_STARTED,
         PLAYER_SVC_EVENT_TRACK_FINISHED,
+        PLAYER_SVC_EVENT_TRACK_BECAME_COUNTABLE,
     } player_service_event_id_t;
+
+    typedef struct
+    {
+        uint32_t cartridge_checksum;
+        uint32_t track_index;
+        uint32_t track_file_num;
+        char filename[PLAYER_SVC_TRACK_FILENAME_MAX_LEN];
+    } player_service_track_event_t;
 
     /**
      * @brief Playback sequence mode.

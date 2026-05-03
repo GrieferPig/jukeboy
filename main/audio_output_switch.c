@@ -184,6 +184,11 @@ esp_err_t audio_output_switch_select(audio_output_target_t target)
     esp_err_t err;
     audio_output_target_t previous_target = s_target;
 
+    if (target == previous_target)
+    {
+        return ESP_OK;
+    }
+
     if (target == AUDIO_OUTPUT_TARGET_BLUETOOTH &&
         (!bluetooth_service_is_initialised() || !bluetooth_service_is_a2dp_connected()))
     {

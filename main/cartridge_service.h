@@ -53,7 +53,7 @@ extern "C"
         .mount_point = "/sdcard",          \
     }
 
-#define CARTRIDGE_SERVICE_READ_BUF_SIZE (128 * 1024)
+#define CARTRIDGE_SERVICE_READ_BUF_SIZE (64 * 1024)
 
     /**
      * Initialise the cartridge service: stores the hardware configuration so
@@ -134,12 +134,12 @@ extern "C"
     uint32_t cartridge_service_get_track_file_num(size_t index);
 
     /**
-     * Start an asynchronous 128KB read from the given file at the specified
+    * Start an asynchronous 64KB read from the given file at the specified
      * byte offset. The service manages file
      * open/close internally: if filename differs from the currently open file,
      * the old file is closed and the new one opened.
      *
-     * Data is read into one of two 128KB PSRAM double-buffers. When the read
+    * Data is read into one of two 64KB PSRAM double-buffers. When the read
      * completes, the task identified by notify_task receives a task
      * notification (xTaskNotifyGive). Call cartridge_service_get_read_result()
      * after the notification to obtain the data pointer and length.
