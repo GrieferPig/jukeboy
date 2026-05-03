@@ -29,6 +29,8 @@ extern "C"
         uint32_t cartridge_checksum;
         uint32_t track_index;
         uint32_t track_file_num;
+        uint32_t started_at_unix;
+        uint32_t playback_position_sec;
         char filename[PLAYER_SVC_TRACK_FILENAME_MAX_LEN];
     } player_service_track_event_t;
 

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -194,6 +195,7 @@ static player_service_playback_mode_t s_playback_mode = PLAYER_SVC_MODE_SEQUENTI
 static size_t *s_shuffle_order = NULL; /* PSRAM array; length == s_playlist_count */
 static size_t s_shuffle_position = 0;  /* position of current track in s_shuffle_order; SIZE_MAX = not started */
 static bool s_countable_play_emitted;
+static uint32_t s_track_started_unix;
 EXT_RAM_BSS_ATTR static size_t s_shuffle_order_storage[JUKEBOY_MAX_TRACK_FILES];
 
 static bool player_service_format_track_filename(char *buffer, size_t buffer_len, uint32_t file_num);
@@ -437,14 +439,14 @@ static esp_err_t player_service_load_lookup_window(player_service_track_info_t *
                                                    size_t start_chunk,
                                                    uint32_t generation)
 {
-    const uint8_t *buf = NULL;
-    size_t buf_len = 0;
+    FILE *track_file = NULL;
+    char full_path[PLAYER_SVC_FULL_PATH_LEN];
     size_t entry_count;
     size_t lookup_byte_offset;
     size_t lookup_bytes;
     size_t total_data_bytes;
     size_t chunk_count;
-    esp_err_t err;
+    size_t bytes_read;
 
     if (!info || start_chunk >= info->lookup_table_len)
     {
@@ -466,28 +468,45 @@ static esp_err_t player_service_load_lookup_window(player_service_track_info_t *
         return ESP_ERR_INVALID_SIZE;
     }
 
-    err = cartridge_service_read_chunk_async(info->filename,
-                                             lookup_byte_offset,
-                                             xTaskGetCurrentTaskHandle());
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    if (!player_service_wait_for_notification(generation))
+    if (player_service_should_stop(generation))
     {
         player_service_invalidate_lookup_window(info);
         return ESP_ERR_INVALID_STATE;
     }
 
-    err = cartridge_service_get_read_result(&buf, &buf_len);
-    if (err != ESP_OK || buf_len < lookup_bytes)
+    snprintf(full_path, sizeof(full_path), "%s/%s",
+             cartridge_service_get_mount_point(),
+             info->filename);
+    track_file = fopen(full_path, "rb");
+    if (!track_file)
     {
+        ESP_LOGE(TAG, "failed to open %s for lookup window", full_path);
         player_service_invalidate_lookup_window(info);
-        return err == ESP_OK ? ESP_FAIL : err;
+        return ESP_ERR_NOT_FOUND;
     }
 
-    memcpy(info->lookup_window, buf, lookup_bytes);
+    if (fseek(track_file, (long)lookup_byte_offset, SEEK_SET) != 0)
+    {
+        fclose(track_file);
+        player_service_invalidate_lookup_window(info);
+        return ESP_FAIL;
+    }
+
+    bytes_read = fread(info->lookup_window, 1, lookup_bytes, track_file);
+    fclose(track_file);
+
+    if (player_service_should_stop(generation))
+    {
+        player_service_invalidate_lookup_window(info);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (bytes_read != lookup_bytes)
+    {
+        player_service_invalidate_lookup_window(info);
+        return ESP_FAIL;
+    }
+
     info->lookup_window_start = start_chunk;
     info->lookup_window_entry_count = entry_count;
 
@@ -591,6 +610,35 @@ static size_t player_service_current_second(void)
                     : player_service_clamp_chunk_index(s_current_chunk);
 }
 
+static uint32_t player_service_current_unix_time_or_zero(void)
+{
+    time_t now = time(NULL);
+
+    if (now <= 0 || (uint64_t)now > UINT32_MAX)
+    {
+        return 0;
+    }
+
+    return (uint32_t)now;
+}
+
+static uint32_t player_service_resolve_track_started_unix(size_t start_chunk)
+{
+    uint32_t now = player_service_current_unix_time_or_zero();
+
+    if (now == 0)
+    {
+        return 0;
+    }
+
+    if (start_chunk >= now)
+    {
+        return now;
+    }
+
+    return now - (uint32_t)start_chunk;
+}
+
 static bool player_service_should_restart_current_track(void)
 {
     if (s_track_info.lookup_table_len <= PLAYER_SVC_PREVIOUS_RESTART_SECONDS)
@@ -625,6 +673,8 @@ static void player_service_post_countable_track_event(void)
     event_data.cartridge_checksum = metadata->checksum;
     event_data.track_index = (uint32_t)metadata_index;
     event_data.track_file_num = track->file_num;
+    event_data.started_at_unix = s_track_started_unix;
+    event_data.playback_position_sec = (uint32_t)player_service_current_second();
     if (player_service_playlist_filename(s_playlist_index, filename, sizeof(filename)))
     {
         strncpy(event_data.filename, filename, sizeof(event_data.filename) - 1);
@@ -1655,6 +1705,7 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
     s_stop_requested = false;
     s_resume_chunk = start_chunk;
     s_current_chunk = start_chunk;
+    s_track_started_unix = player_service_resolve_track_started_unix(start_chunk);
 
     player_service_reset_pipeline();
 
@@ -1671,6 +1722,7 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
     if (xQueueSend(s_decoder_cmd_queue, &dec_cmd, 0) != pdPASS)
     {
         s_playing = false;
+        s_track_started_unix = 0;
         ESP_LOGE(TAG, "failed to send start command to decoder");
         return ESP_ERR_NO_MEM;
     }
@@ -1680,6 +1732,7 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
         s_cancelled_generation = s_active_generation;
         s_stop_requested = true;
         s_playing = false;
+        s_track_started_unix = 0;
         player_service_send_eof_message(s_active_generation);
         player_service_wait_for_playback_stop();
         ESP_LOGE(TAG, "failed to send start command to reader");
@@ -1704,6 +1757,7 @@ static void player_service_handle_cartridge_inserted(void)
     player_service_free_track_info();
     s_paused = false;
     s_playing = false;
+    s_track_started_unix = 0;
     s_current_track[0] = '\0';
 
     cartridge_status = cartridge_service_get_status();

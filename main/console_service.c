@@ -26,6 +26,7 @@
 #include "cartridge_service.h"
 #include "audio_output_switch.h"
 #include "hid_service.h"
+#include "lastfm_service.h"
 #include "pin_defs.h"
 #include "play_history_service.h"
 #include "player_service.h"
@@ -1980,6 +1981,138 @@ static int sd_meta_handler(int argc, char **argv)
     return 1;
 }
 
+static int cmd_lastfm(int argc, char **argv)
+{
+    static const char *usage =
+        "Usage: lastfm [status|url <proxy_url>|token|auth [proxy_url] <username> <password>|logout]\n"
+        "  status                           Show Last.fm service status\n"
+        "  url <proxy_url>                  Save the Last.fm proxy base URL\n"
+        "  token                            Request a fresh Last.fm auth token\n"
+        "  auth <username> <password>       Authenticate using the saved proxy URL\n"
+        "  auth <proxy_url> <user> <pass>   Save a proxy URL, then authenticate\n"
+        "  logout                           Clear the saved session and token\n";
+    esp_err_t err;
+
+    if (argc < 2)
+    {
+        printf("%s", usage);
+        return 1;
+    }
+
+    if (strcmp(argv[1], "status") == 0)
+    {
+        lastfm_service_status_t status = {0};
+
+        lastfm_service_get_status(&status);
+        printf("Last.fm status\n");
+        printf("  Base URL configured: %s\n", status.has_auth_url ? "yes" : "no");
+        printf("  Base URL:            %s\n", status.auth_url[0] != '\0' ? status.auth_url : "(not set)");
+        printf("  Username:            %s\n", status.username[0] != '\0' ? status.username : "(not set)");
+        printf("  Token present:       %s\n", status.has_token ? "yes" : "no");
+        printf("  Session present:     %s\n", status.has_session ? "yes" : "no");
+        printf("  Busy:                %s\n", status.busy ? "yes" : "no");
+        printf("  Command queue:       %s\n", status.command_queue_ready ? "ready" : "not ready");
+        printf("  Pending commands:    %lu/%lu\n",
+               (unsigned long)status.pending_commands,
+               (unsigned long)status.command_queue_capacity);
+        printf("  Scrobble queue:      %s\n", status.scrobble_queue_ready ? "ready" : "not ready");
+        printf("  Pending scrobbles:   %lu/%lu\n",
+               (unsigned long)status.pending_scrobbles,
+               (unsigned long)status.scrobble_queue_capacity);
+        printf("  Successful scrobbles:%lu\n", (unsigned long)status.successful_scrobbles);
+        printf("  Failed scrobbles:    %lu\n", (unsigned long)status.failed_scrobbles);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "url") == 0)
+    {
+        if (argc < 3)
+        {
+            printf("Usage: lastfm url <proxy_url>\n");
+            return 1;
+        }
+
+        err = lastfm_service_set_auth_url(argv[2]);
+        if (err != ESP_OK)
+        {
+            printf("Failed to save Last.fm proxy URL: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        printf("Saved Last.fm proxy URL.\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "token") == 0)
+    {
+        err = lastfm_service_request_token();
+        if (err != ESP_OK)
+        {
+            printf("Failed to request Last.fm token: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        printf("Requested Last.fm token.\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "auth") == 0)
+    {
+        const char *username;
+        const char *password;
+
+        if (argc == 5)
+        {
+            err = lastfm_service_set_auth_url(argv[2]);
+            if (err != ESP_OK)
+            {
+                printf("Failed to save Last.fm proxy URL: %s\n", esp_err_to_name(err));
+                return 1;
+            }
+
+            username = argv[3];
+            password = argv[4];
+        }
+        else if (argc == 4)
+        {
+            username = argv[2];
+            password = argv[3];
+        }
+        else
+        {
+            printf("Usage: lastfm auth [proxy_url] <username> <password>\n");
+            return 1;
+        }
+
+        printf("Authenticating with Last.fm...\n");
+        err = lastfm_service_request_auth(username, password);
+        if (err != ESP_OK)
+        {
+            printf("Last.fm authentication failed: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        printf("Last.fm authentication completed.\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "logout") == 0)
+    {
+        err = lastfm_service_logout();
+        if (err != ESP_OK)
+        {
+            printf("Failed to clear Last.fm session: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        printf("Last.fm session cleared.\n");
+        return 0;
+    }
+
+    printf("%s", usage);
+    return 1;
+}
+
 static int cmd_sd(int argc, char **argv)
 {
     static const char *usage =
@@ -2448,6 +2581,14 @@ esp_err_t console_service_init(void)
         .func = cmd_history,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&history_cmd));
+
+    const esp_console_cmd_t lastfm_cmd = {
+        .command = "lastfm",
+        .help = "Last.fm commands: lastfm <status|url <proxy_url>|token|auth [proxy_url] <username> <password>|logout>",
+        .hint = NULL,
+        .func = cmd_lastfm,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&lastfm_cmd));
 
     const esp_console_cmd_t script_cmd = {
         .command = "script",

@@ -23,6 +23,7 @@
 #include "console_service.h"
 #include "hid_service.h"
 #include "i2s_service.h"
+#include "lastfm_service.h"
 #include "play_history_service.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
@@ -191,7 +192,7 @@ void app_main(void)
     {
         esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
-        ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
+        ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BTDM));
 
         ESP_ERROR_CHECK(esp_bluedroid_init());
         ESP_ERROR_CHECK(esp_bluedroid_enable());
@@ -214,6 +215,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(player_service_init());
     ESP_ERROR_CHECK(play_history_service_init());
+    ESP_ERROR_CHECK(lastfm_service_init());
 
     if (running_in_qemu && QEMU_PCM_SERVICE_ENABLED)
     {

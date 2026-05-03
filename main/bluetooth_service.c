@@ -16,8 +16,10 @@
 #include "esp_bt_defs.h"
 #include "esp_event.h"
 #include "esp_gap_bt_api.h"
+#include "esp_gap_ble_api.h"
+#include "esp_gatt_common_api.h"
+#include "esp_gatts_api.h"
 #include "esp_log.h"
-#include "esp_spp_api.h"
 
 #include "bluetooth_service.h"
 #include "player_service.h"
@@ -31,9 +33,180 @@
 #define BT_SVC_MAX_DISCOVERED_DEVICES 16
 #define BT_SVC_DISCOVERY_LENGTH 10
 #define BT_SVC_NAME_CLASSIC "bttest-a2dp"
-#define BT_SVC_SPP_SERVER_NAME "SPP_SERVER"
+#define BT_SVC_NAME_BLE_SPP "ESP_SPP_SERVER"
+#define BT_SVC_BLE_SPP_APP_ID 0x56
+#define BT_SVC_BLE_SPP_SERVICE_UUID 0xABF0
+#define BT_SVC_BLE_SPP_DATA_RECEIVE_UUID 0xABF1
+#define BT_SVC_BLE_SPP_DATA_NOTIFY_UUID 0xABF2
+#define BT_SVC_BLE_SPP_COMMAND_RECEIVE_UUID 0xABF3
+#define BT_SVC_BLE_SPP_COMMAND_NOTIFY_UUID 0xABF4
+#define BT_SVC_BLE_SPP_DATA_MAX_LEN 512
+#define BT_SVC_BLE_SPP_COMMAND_MAX_LEN 20
+#define BT_SVC_BLE_SPP_STATUS_MAX_LEN 20
+#define BT_SVC_BLE_SPP_MTU_SIZE 512
 
 static const char *TAG = "bt_svc";
+
+typedef enum
+{
+    BT_SVC_BLE_SPP_IDX_SVC = 0,
+    BT_SVC_BLE_SPP_IDX_DATA_RECV_CHAR,
+    BT_SVC_BLE_SPP_IDX_DATA_RECV_VAL,
+    BT_SVC_BLE_SPP_IDX_DATA_NOTIFY_CHAR,
+    BT_SVC_BLE_SPP_IDX_DATA_NOTIFY_VAL,
+    BT_SVC_BLE_SPP_IDX_DATA_NOTIFY_CFG,
+    BT_SVC_BLE_SPP_IDX_COMMAND_CHAR,
+    BT_SVC_BLE_SPP_IDX_COMMAND_VAL,
+    BT_SVC_BLE_SPP_IDX_STATUS_CHAR,
+    BT_SVC_BLE_SPP_IDX_STATUS_VAL,
+    BT_SVC_BLE_SPP_IDX_STATUS_CFG,
+    BT_SVC_BLE_SPP_IDX_NB,
+} bt_svc_ble_spp_attr_index_t;
+
+static const uint8_t s_ble_spp_adv_data[] = {
+    0x02,
+    ESP_BLE_AD_TYPE_FLAG,
+    0x02,
+    0x03,
+    ESP_BLE_AD_TYPE_16SRV_CMPL,
+    0xF0,
+    0xAB,
+    0x0F,
+    ESP_BLE_AD_TYPE_NAME_CMPL,
+    'E',
+    'S',
+    'P',
+    '_',
+    'S',
+    'P',
+    'P',
+    '_',
+    'S',
+    'E',
+    'R',
+    'V',
+    'E',
+    'R',
+};
+
+static esp_ble_adv_params_t s_ble_spp_adv_params = {
+    .adv_int_min = 0x20,
+    .adv_int_max = 0x40,
+    .adv_type = ADV_TYPE_IND,
+    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .channel_map = ADV_CHNL_ALL,
+    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+};
+
+static const uint16_t s_ble_spp_primary_service_uuid = ESP_GATT_UUID_PRI_SERVICE;
+static const uint16_t s_ble_spp_character_declaration_uuid = ESP_GATT_UUID_CHAR_DECLARE;
+static const uint16_t s_ble_spp_character_client_config_uuid = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+static const uint8_t s_ble_spp_char_prop_read_write =
+    ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE_NR;
+static const uint8_t s_ble_spp_char_prop_read_notify =
+    ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY | ESP_GATT_CHAR_PROP_BIT_INDICATE;
+static const uint16_t s_ble_spp_service_uuid = BT_SVC_BLE_SPP_SERVICE_UUID;
+static const uint16_t s_ble_spp_data_receive_uuid = BT_SVC_BLE_SPP_DATA_RECEIVE_UUID;
+static const uint16_t s_ble_spp_data_notify_uuid = BT_SVC_BLE_SPP_DATA_NOTIFY_UUID;
+static const uint16_t s_ble_spp_command_uuid = BT_SVC_BLE_SPP_COMMAND_RECEIVE_UUID;
+static const uint16_t s_ble_spp_status_uuid = BT_SVC_BLE_SPP_COMMAND_NOTIFY_UUID;
+static uint8_t s_ble_spp_data_receive_val[20] = {0};
+static uint8_t s_ble_spp_data_notify_val[20] = {0};
+static uint8_t s_ble_spp_data_notify_ccc[2] = {0x00, 0x00};
+static uint8_t s_ble_spp_command_val[BT_SVC_BLE_SPP_COMMAND_MAX_LEN] = {0};
+static uint8_t s_ble_spp_status_val[BT_SVC_BLE_SPP_STATUS_MAX_LEN] = {0};
+static uint8_t s_ble_spp_status_ccc[2] = {0x00, 0x00};
+
+static const esp_gatts_attr_db_t s_ble_spp_gatt_db[BT_SVC_BLE_SPP_IDX_NB] = {
+    [BT_SVC_BLE_SPP_IDX_SVC] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_primary_service_uuid,
+          ESP_GATT_PERM_READ,
+          sizeof(s_ble_spp_service_uuid),
+          sizeof(s_ble_spp_service_uuid),
+          (uint8_t *)&s_ble_spp_service_uuid}},
+    [BT_SVC_BLE_SPP_IDX_DATA_RECV_CHAR] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_character_declaration_uuid,
+          ESP_GATT_PERM_READ,
+          sizeof(uint8_t),
+          sizeof(uint8_t),
+          (uint8_t *)&s_ble_spp_char_prop_read_write}},
+    [BT_SVC_BLE_SPP_IDX_DATA_RECV_VAL] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_data_receive_uuid,
+          ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+          BT_SVC_BLE_SPP_DATA_MAX_LEN,
+          sizeof(s_ble_spp_data_receive_val),
+          s_ble_spp_data_receive_val}},
+    [BT_SVC_BLE_SPP_IDX_DATA_NOTIFY_CHAR] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_character_declaration_uuid,
+          ESP_GATT_PERM_READ,
+          sizeof(uint8_t),
+          sizeof(uint8_t),
+          (uint8_t *)&s_ble_spp_char_prop_read_notify}},
+    [BT_SVC_BLE_SPP_IDX_DATA_NOTIFY_VAL] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_data_notify_uuid,
+          ESP_GATT_PERM_READ,
+          BT_SVC_BLE_SPP_DATA_MAX_LEN,
+          sizeof(s_ble_spp_data_notify_val),
+          s_ble_spp_data_notify_val}},
+    [BT_SVC_BLE_SPP_IDX_DATA_NOTIFY_CFG] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_character_client_config_uuid,
+          ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+          sizeof(uint16_t),
+          sizeof(s_ble_spp_data_notify_ccc),
+          s_ble_spp_data_notify_ccc}},
+    [BT_SVC_BLE_SPP_IDX_COMMAND_CHAR] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_character_declaration_uuid,
+          ESP_GATT_PERM_READ,
+          sizeof(uint8_t),
+          sizeof(uint8_t),
+          (uint8_t *)&s_ble_spp_char_prop_read_write}},
+    [BT_SVC_BLE_SPP_IDX_COMMAND_VAL] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_command_uuid,
+          ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+          BT_SVC_BLE_SPP_COMMAND_MAX_LEN,
+          sizeof(s_ble_spp_command_val),
+          s_ble_spp_command_val}},
+    [BT_SVC_BLE_SPP_IDX_STATUS_CHAR] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_character_declaration_uuid,
+          ESP_GATT_PERM_READ,
+          sizeof(uint8_t),
+          sizeof(uint8_t),
+          (uint8_t *)&s_ble_spp_char_prop_read_notify}},
+    [BT_SVC_BLE_SPP_IDX_STATUS_VAL] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_status_uuid,
+          ESP_GATT_PERM_READ,
+          BT_SVC_BLE_SPP_STATUS_MAX_LEN,
+          sizeof(s_ble_spp_status_val),
+          s_ble_spp_status_val}},
+    [BT_SVC_BLE_SPP_IDX_STATUS_CFG] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16,
+          (uint8_t *)&s_ble_spp_character_client_config_uuid,
+          ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+          sizeof(uint16_t),
+          sizeof(s_ble_spp_status_ccc),
+          s_ble_spp_status_ccc}},
+};
 
 ESP_EVENT_DEFINE_BASE(BLUETOOTH_SERVICE_EVENT);
 
@@ -142,7 +315,14 @@ static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t s_avrc_tl;
 static bool s_avrc_rn_vol_registered;
 static bool s_avrc_ct_vol_registered;
-static uint32_t s_spp_handle;
+static bool s_spp_connected;
+static bool s_spp_data_notifications_enabled;
+static bool s_spp_data_indications_enabled;
+static bool s_spp_status_notifications_enabled;
+static uint16_t s_spp_conn_id = 0xFFFF;
+static uint16_t s_spp_mtu = 23;
+static esp_gatt_if_t s_spp_gatts_if = ESP_GATT_IF_NONE;
+static uint16_t s_spp_handle_table[BT_SVC_BLE_SPP_IDX_NB];
 static esp_bd_addr_t s_spp_remote_bda;
 EXT_RAM_BSS_ATTR static bluetooth_service_discovery_result_t s_discovered[BT_SVC_MAX_DISCOVERED_DEVICES];
 static size_t s_discovered_count;
@@ -176,6 +356,105 @@ static TickType_t bt_svc_shutdown_poll_ticks(void)
 {
     TickType_t poll_ticks = pdMS_TO_TICKS(BT_SVC_SHUTDOWN_POLL_MS);
     return poll_ticks == 0 ? 1 : poll_ticks;
+}
+
+static uint8_t bt_svc_spp_find_attr_index(uint16_t handle)
+{
+    for (size_t index = 0; index < BT_SVC_BLE_SPP_IDX_NB; index++)
+    {
+        if (s_spp_handle_table[index] == handle)
+        {
+            return (uint8_t)index;
+        }
+    }
+
+    return UINT8_MAX;
+}
+
+static void bt_svc_spp_reset_link_state(void)
+{
+    s_spp_connected = false;
+    s_spp_data_notifications_enabled = false;
+    s_spp_data_indications_enabled = false;
+    s_spp_status_notifications_enabled = false;
+    s_spp_conn_id = 0xFFFF;
+    s_spp_mtu = 23;
+    memset(s_spp_remote_bda, 0, sizeof(s_spp_remote_bda));
+}
+
+static esp_err_t bt_svc_spp_send_value(uint16_t handle,
+                                       const uint8_t *value,
+                                       size_t value_len,
+                                       bool need_confirm)
+{
+    size_t max_payload;
+
+    if (!value || value_len == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_spp_connected || s_spp_gatts_if == ESP_GATT_IF_NONE || s_spp_conn_id == 0xFFFF || handle == 0)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    max_payload = s_spp_mtu > 3 ? (size_t)(s_spp_mtu - 3) : 0;
+    if (max_payload == 0)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (value_len > max_payload)
+    {
+        value_len = max_payload;
+    }
+
+    return esp_ble_gatts_send_indicate(s_spp_gatts_if,
+                                       s_spp_conn_id,
+                                       handle,
+                                       (uint16_t)value_len,
+                                       (uint8_t *)value,
+                                       need_confirm);
+}
+
+static esp_err_t bt_svc_spp_send_data(const uint8_t *value, size_t value_len)
+{
+    if (!s_spp_data_notifications_enabled)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return bt_svc_spp_send_value(s_spp_handle_table[BT_SVC_BLE_SPP_IDX_DATA_NOTIFY_VAL],
+                                 value,
+                                 value_len,
+                                 s_spp_data_indications_enabled);
+}
+
+static esp_err_t bt_svc_spp_send_status(const char *status)
+{
+    size_t status_len;
+
+    if (!status || !s_spp_status_notifications_enabled)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    status_len = strlen(status);
+    if (status_len == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (status_len > BT_SVC_BLE_SPP_STATUS_MAX_LEN)
+    {
+        status_len = BT_SVC_BLE_SPP_STATUS_MAX_LEN;
+    }
+
+    return bt_svc_spp_send_value(s_spp_handle_table[BT_SVC_BLE_SPP_IDX_STATUS_VAL],
+                                 (const uint8_t *)status,
+                                 status_len,
+                                 false);
 }
 
 static void bt_svc_set_pending_pairing_confirm(const esp_bd_addr_t bda, uint32_t numeric_value)
@@ -663,51 +942,209 @@ static void bt_svc_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param
     }
 }
 
-static void bt_svc_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+static void bt_svc_gap_ble_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
-    bluetooth_service_msg_t msg = {0};
+    esp_err_t err;
 
     switch (event)
     {
-    case ESP_SPP_INIT_EVT:
-        if (param->init.status == ESP_SPP_SUCCESS)
+    case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+        err = esp_ble_gap_start_advertising(&s_ble_spp_adv_params);
+        if (err != ESP_OK)
         {
-            esp_spp_start_srv(ESP_SPP_SEC_AUTHENTICATE, ESP_SPP_ROLE_SLAVE, 0, BT_SVC_SPP_SERVER_NAME);
-        }
-        else
-        {
-            ESP_LOGW(TAG, "SPP init failed: %d", param->init.status);
+            ESP_LOGW(TAG, "BLE SPP advertising start failed: %s", esp_err_to_name(err));
         }
         break;
-    case ESP_SPP_START_EVT:
-        if (param->start.status == ESP_SPP_SUCCESS)
+    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS)
+        {
+            ESP_LOGW(TAG, "BLE SPP advertising did not start: status=%d", param->adv_start_cmpl.status);
+        }
+        break;
+    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+        if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS)
+        {
+            ESP_LOGW(TAG, "BLE SPP advertising did not stop cleanly: status=%d", param->adv_stop_cmpl.status);
+        }
+        break;
+    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+        ESP_LOGI(TAG,
+                 "BLE conn params update status=%d interval=%d latency=%d timeout=%d",
+                 param->update_conn_params.status,
+                 param->update_conn_params.conn_int,
+                 param->update_conn_params.latency,
+                 param->update_conn_params.timeout);
+        break;
+    default:
+        break;
+    }
+}
+
+static void bt_svc_spp_gatts_cb(esp_gatts_cb_event_t event,
+                                esp_gatt_if_t gatts_if,
+                                esp_ble_gatts_cb_param_t *param)
+{
+    bluetooth_service_msg_t msg = {0};
+    esp_err_t err;
+
+    switch (event)
+    {
+    case ESP_GATTS_REG_EVT:
+        if (param->reg.status != ESP_GATT_OK)
+        {
+            ESP_LOGW(TAG, "BLE SPP GATT app register failed: status=%d", param->reg.status);
+            break;
+        }
+
+        s_spp_gatts_if = gatts_if;
+        err = esp_ble_gap_set_device_name(BT_SVC_NAME_BLE_SPP);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "BLE SPP device name set failed: %s", esp_err_to_name(err));
+        }
+
+        err = esp_ble_gap_config_adv_data_raw((uint8_t *)s_ble_spp_adv_data, sizeof(s_ble_spp_adv_data));
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "BLE SPP adv data config failed: %s", esp_err_to_name(err));
+        }
+
+        err = esp_ble_gatts_create_attr_tab(s_ble_spp_gatt_db,
+                                            gatts_if,
+                                            BT_SVC_BLE_SPP_IDX_NB,
+                                            0);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "BLE SPP attribute table create failed: %s", esp_err_to_name(err));
+        }
+        break;
+    case ESP_GATTS_WRITE_EVT:
+        if (!param->write.is_prep)
+        {
+            uint8_t attr_index = bt_svc_spp_find_attr_index(param->write.handle);
+
+            switch (attr_index)
+            {
+            case BT_SVC_BLE_SPP_IDX_DATA_NOTIFY_CFG:
+                if (param->write.len == 2)
+                {
+                    const uint8_t *value = param->write.value;
+
+                    if (value[0] == 0x01 && value[1] == 0x00)
+                    {
+                        s_spp_data_notifications_enabled = true;
+                        s_spp_data_indications_enabled = false;
+                    }
+                    else if (value[0] == 0x02 && value[1] == 0x00)
+                    {
+                        s_spp_data_notifications_enabled = true;
+                        s_spp_data_indications_enabled = true;
+                    }
+                    else if (value[0] == 0x00 && value[1] == 0x00)
+                    {
+                        s_spp_data_notifications_enabled = false;
+                        s_spp_data_indications_enabled = false;
+                    }
+                }
+                break;
+            case BT_SVC_BLE_SPP_IDX_STATUS_CFG:
+                if (param->write.len == 2)
+                {
+                    const uint8_t *value = param->write.value;
+                    s_spp_status_notifications_enabled =
+                        ((value[0] == 0x01 || value[0] == 0x02) && value[1] == 0x00);
+                }
+                break;
+            case BT_SVC_BLE_SPP_IDX_COMMAND_VAL:
+                if (param->write.len > 0)
+                {
+                    err = bt_svc_spp_send_status("OK");
+                    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+                    {
+                        ESP_LOGW(TAG, "BLE SPP status notify failed: %s", esp_err_to_name(err));
+                    }
+                }
+                break;
+            case BT_SVC_BLE_SPP_IDX_DATA_RECV_VAL:
+                if (param->write.len > 0)
+                {
+                    err = bt_svc_spp_send_data(param->write.value, param->write.len);
+                    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+                    {
+                        ESP_LOGW(TAG, "BLE SPP echo notify failed: %s", esp_err_to_name(err));
+                    }
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        break;
+    case ESP_GATTS_MTU_EVT:
+        s_spp_mtu = param->mtu.mtu;
+        break;
+    case ESP_GATTS_CONF_EVT:
+        if (param->conf.status != ESP_GATT_OK)
+        {
+            ESP_LOGW(TAG,
+                     "BLE SPP indication confirm failed: status=%d handle=%u",
+                     param->conf.status,
+                     (unsigned)param->conf.handle);
+        }
+        break;
+    case ESP_GATTS_START_EVT:
+        if (param->start.status == ESP_GATT_OK)
         {
             bt_svc_post_event(BLUETOOTH_SVC_EVENT_SPP_READY, NULL, 0);
         }
         else
         {
-            ESP_LOGW(TAG, "SPP server start failed: %d", param->start.status);
+            ESP_LOGW(TAG, "BLE SPP service start failed: status=%d", param->start.status);
         }
         break;
-    case ESP_SPP_SRV_OPEN_EVT:
-        s_spp_handle = param->srv_open.handle;
-        memcpy(s_spp_remote_bda, param->srv_open.rem_bda, ESP_BD_ADDR_LEN);
+    case ESP_GATTS_CONNECT_EVT:
+        s_spp_connected = true;
+        s_spp_conn_id = param->connect.conn_id;
+        s_spp_gatts_if = gatts_if;
+        memcpy(s_spp_remote_bda, param->connect.remote_bda, ESP_BD_ADDR_LEN);
         msg.cmd = BT_SVC_CMD_SPP_CONNECTED;
-        memcpy(msg.data.spp_remote.remote_bda, param->srv_open.rem_bda, ESP_BD_ADDR_LEN);
+        memcpy(msg.data.spp_remote.remote_bda, param->connect.remote_bda, ESP_BD_ADDR_LEN);
         bt_svc_queue_send(&msg);
         break;
-    case ESP_SPP_DATA_IND_EVT:
-        esp_spp_write(param->data_ind.handle, param->data_ind.len, param->data_ind.data);
-        break;
-    case ESP_SPP_CLOSE_EVT:
+    case ESP_GATTS_DISCONNECT_EVT:
         msg.cmd = BT_SVC_CMD_SPP_DISCONNECTED;
-        memcpy(msg.data.spp_remote.remote_bda, s_spp_remote_bda, ESP_BD_ADDR_LEN);
-        if (s_spp_handle == param->close.handle)
-        {
-            s_spp_handle = 0;
-            memset(s_spp_remote_bda, 0, sizeof(s_spp_remote_bda));
-        }
+        memcpy(msg.data.spp_remote.remote_bda, param->disconnect.remote_bda, ESP_BD_ADDR_LEN);
+        bt_svc_spp_reset_link_state();
         bt_svc_queue_send(&msg);
+        err = esp_ble_gap_start_advertising(&s_ble_spp_adv_params);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "BLE SPP advertising restart failed: %s", esp_err_to_name(err));
+        }
+        break;
+    case ESP_GATTS_CREAT_ATTR_TAB_EVT:
+        if (param->add_attr_tab.status != ESP_GATT_OK)
+        {
+            ESP_LOGW(TAG, "BLE SPP attr table create failed: status=0x%x", param->add_attr_tab.status);
+        }
+        else if (param->add_attr_tab.num_handle != BT_SVC_BLE_SPP_IDX_NB)
+        {
+            ESP_LOGW(TAG,
+                     "BLE SPP attr table handle mismatch: got=%u expected=%u",
+                     (unsigned)param->add_attr_tab.num_handle,
+                     (unsigned)BT_SVC_BLE_SPP_IDX_NB);
+        }
+        else
+        {
+            memcpy(s_spp_handle_table,
+                   param->add_attr_tab.handles,
+                   sizeof(s_spp_handle_table));
+            err = esp_ble_gatts_start_service(s_spp_handle_table[BT_SVC_BLE_SPP_IDX_SVC]);
+            if (err != ESP_OK)
+            {
+                ESP_LOGW(TAG, "BLE SPP start service failed: %s", esp_err_to_name(err));
+            }
+        }
         break;
     default:
         break;
@@ -725,24 +1162,6 @@ static esp_err_t bt_svc_wait_for_disconnect_state(bool *flag, bool target_value,
     TickType_t poll_ticks = bt_svc_shutdown_poll_ticks();
 
     while (*flag != target_value)
-    {
-        bluetooth_service_process_once();
-        if ((xTaskGetTickCount() - start_ticks) >= timeout_ticks)
-        {
-            return ESP_ERR_TIMEOUT;
-        }
-        vTaskDelay(poll_ticks);
-    }
-
-    return ESP_OK;
-}
-
-static esp_err_t bt_svc_wait_for_spp_close(TickType_t timeout_ticks)
-{
-    TickType_t start_ticks = xTaskGetTickCount();
-    TickType_t poll_ticks = bt_svc_shutdown_poll_ticks();
-
-    while (s_spp_handle != 0)
     {
         bluetooth_service_process_once();
         if ((xTaskGetTickCount() - start_ticks) >= timeout_ticks)
@@ -1060,7 +1479,8 @@ esp_err_t bluetooth_service_init(void)
     }
 
     ESP_ERROR_CHECK(esp_bt_gap_register_callback(bt_svc_gap_bt_cb));
-    ESP_ERROR_CHECK(esp_spp_register_callback(bt_svc_spp_cb));
+    ESP_ERROR_CHECK(esp_ble_gap_register_callback(bt_svc_gap_ble_cb));
+    ESP_ERROR_CHECK(esp_ble_gatts_register_callback(bt_svc_spp_gatts_cb));
 
     ESP_ERROR_CHECK(esp_bt_gap_set_device_name(BT_SVC_NAME_CLASSIC));
     ESP_ERROR_CHECK(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE));
@@ -1089,12 +1509,8 @@ esp_err_t bluetooth_service_init(void)
     esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evt_mask, ESP_AVRC_RN_VOLUME_CHANGE);
     ESP_ERROR_CHECK(esp_avrc_tg_set_rn_evt_cap(&evt_mask));
 
-    static const esp_spp_cfg_t spp_cfg = {
-        .mode = ESP_SPP_MODE_CB,
-        .enable_l2cap_ertm = true,
-        .tx_buffer_size = 0,
-    };
-    ESP_ERROR_CHECK(esp_spp_enhanced_init(&spp_cfg));
+    ESP_ERROR_CHECK(esp_ble_gatts_app_register(BT_SVC_BLE_SPP_APP_ID));
+    ESP_ERROR_CHECK(esp_ble_gatt_set_local_mtu(BT_SVC_BLE_SPP_MTU_SIZE));
 
     s_initialised = true;
     ESP_ERROR_CHECK(power_mgmt_service_register_shutdown_callback(bluetooth_service_shutdown_callback,
@@ -1298,22 +1714,22 @@ esp_err_t bluetooth_service_shutdown(void)
         }
     }
 
-    if (s_spp_handle != 0)
+    if (s_spp_connected)
     {
-        esp_err_t err = bt_svc_ignore_invalid_state(esp_spp_disconnect(s_spp_handle));
+        esp_err_t err = bt_svc_ignore_invalid_state(esp_ble_gap_disconnect(s_spp_remote_bda));
         if (err != ESP_OK)
         {
             return err;
         }
 
-        err = bt_svc_wait_for_spp_close(pdMS_TO_TICKS(2000));
+        err = bt_svc_wait_for_disconnect_state(&s_spp_connected, false, pdMS_TO_TICKS(2000));
         if (err != ESP_OK)
         {
             return err;
         }
     }
 
-    esp_err_t err = bt_svc_ignore_invalid_state(esp_spp_stop_srv());
+    esp_err_t err = bt_svc_ignore_invalid_state(esp_ble_gap_stop_advertising());
     if (err != ESP_OK)
     {
         return err;
@@ -1321,10 +1737,13 @@ esp_err_t bluetooth_service_shutdown(void)
 
     vTaskDelay(bt_svc_shutdown_poll_ticks());
 
-    err = bt_svc_ignore_invalid_state(esp_spp_deinit());
-    if (err != ESP_OK)
+    if (s_spp_gatts_if != ESP_GATT_IF_NONE)
     {
-        return err;
+        err = bt_svc_ignore_invalid_state(esp_ble_gatts_app_unregister(s_spp_gatts_if));
+        if (err != ESP_OK)
+        {
+            return err;
+        }
     }
 
     err = bt_svc_ignore_invalid_state(esp_avrc_ct_deinit());
@@ -1395,8 +1814,9 @@ esp_err_t bluetooth_service_shutdown(void)
     s_avrc_tl = 0;
     s_avrc_rn_vol_registered = false;
     s_avrc_ct_vol_registered = false;
-    s_spp_handle = 0;
-    memset(s_spp_remote_bda, 0, sizeof(s_spp_remote_bda));
+    bt_svc_spp_reset_link_state();
+    s_spp_gatts_if = ESP_GATT_IF_NONE;
+    memset(s_spp_handle_table, 0, sizeof(s_spp_handle_table));
     memset(s_discovered, 0, sizeof(s_discovered));
     s_discovered_count = 0;
 

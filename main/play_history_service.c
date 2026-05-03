@@ -132,6 +132,8 @@ static bool s_commit_in_progress;
 static bool s_commit_requested;
 static esp_err_t s_commit_result;
 static TaskHandle_t s_process_task_handle;
+static play_history_service_listen_count_callback_t s_listen_count_callback;
+static void *s_listen_count_callback_ctx;
 
 static EXT_RAM_BSS_ATTR uint8_t s_serialized_buf[PLAY_HISTORY_MAX_SERIALIZED_BYTES];
 static EXT_RAM_BSS_ATTR uint8_t s_commit_actual_buf[PLAY_HISTORY_SERIAL_IO_BYTES];
@@ -139,6 +141,14 @@ static EXT_RAM_BSS_ATTR uint8_t s_commit_actual_buf[PLAY_HISTORY_SERIAL_IO_BYTES
 static void play_history_reset_cache_locked(void);
 static int play_history_find_free_album_slot_locked(void);
 static int play_history_find_free_track_slot_locked(void);
+
+static void play_history_invoke_listen_count_callback(const play_history_listen_count_event_t *event)
+{
+    if (s_listen_count_callback)
+    {
+        s_listen_count_callback(event, s_listen_count_callback_ctx);
+    }
+}
 
 static esp_err_t play_history_allocate_cache(void)
 {
@@ -648,7 +658,8 @@ static esp_err_t play_history_sync_current_cartridge_locked(void)
     return ESP_OK;
 }
 
-static esp_err_t play_history_apply_countable_play_locked(const player_service_track_event_t *track_event)
+static esp_err_t play_history_apply_countable_play_locked(const player_service_track_event_t *track_event,
+                                                          play_history_listen_count_event_t *listen_event)
 {
     int track_slot;
     int album_slot;
@@ -685,6 +696,14 @@ static esp_err_t play_history_apply_countable_play_locked(const player_service_t
     s_cache.tracks[track_slot].play_count++;
     s_cache.tracks[track_slot].track_file_num = track_event->track_file_num;
     s_cache.tracks[track_slot].last_seen_sequence = sequence;
+
+    if (listen_event)
+    {
+        listen_event->cartridge_checksum = track_event->cartridge_checksum;
+        listen_event->track_index = track_event->track_index;
+        listen_event->track_file_num = track_event->track_file_num;
+        listen_event->play_count = s_cache.tracks[track_slot].play_count;
+    }
 
     album_slot = play_history_find_album_slot_locked(track_event->cartridge_checksum);
     if (album_slot >= 0)
@@ -1031,6 +1050,13 @@ static void play_history_finish_commit(esp_err_t err)
     taskEXIT_CRITICAL(&s_commit_state_lock);
 }
 
+void play_history_service_register_listen_count_callback(play_history_service_listen_count_callback_t callback,
+                                                         void *user_ctx)
+{
+    s_listen_count_callback = callback;
+    s_listen_count_callback_ctx = user_ctx;
+}
+
 esp_err_t play_history_service_init(void)
 {
     esp_err_t err;
@@ -1128,6 +1154,9 @@ void play_history_service_process_once(void)
 
     for (size_t index = 0; index < PLAY_HISTORY_EVENTS_PER_PASS; index++)
     {
+        play_history_listen_count_event_t listen_event = {0};
+        bool invoke_listen_count_callback = false;
+
         err = ESP_OK;
 
         if (!play_history_dequeue_event(&event))
@@ -1142,7 +1171,9 @@ void play_history_service_process_once(void)
             err = play_history_sync_current_cartridge_locked();
             break;
         case PLAY_HISTORY_EVENT_COUNTABLE_PLAY:
-            err = play_history_apply_countable_play_locked(&event.data.track_event);
+            err = play_history_apply_countable_play_locked(&event.data.track_event,
+                                                           &listen_event);
+            invoke_listen_count_callback = (err == ESP_OK);
             break;
         case PLAY_HISTORY_EVENT_CLEAR:
             play_history_reset_cache_locked();
@@ -1158,6 +1189,11 @@ void play_history_service_process_once(void)
             break;
         }
         xSemaphoreGive(s_cache_mutex);
+
+        if (invoke_listen_count_callback)
+        {
+            play_history_invoke_listen_count_callback(&listen_event);
+        }
 
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_NOT_FOUND)
         {
