@@ -335,6 +335,8 @@ static bluetooth_service_connection_cb_t s_connection_cb;
 static void *s_connection_cb_ctx;
 static bluetooth_service_media_key_cb_t s_media_key_cb;
 static void *s_media_key_cb_ctx;
+static bluetooth_service_spp_rx_cb_t s_spp_rx_cb;
+static void *s_spp_rx_cb_ctx;
 
 static void bt_svc_post_event(bluetooth_service_event_id_t event_id, const void *data, size_t len)
 {
@@ -1068,10 +1070,17 @@ static void bt_svc_spp_gatts_cb(esp_gatts_cb_event_t event,
             case BT_SVC_BLE_SPP_IDX_DATA_RECV_VAL:
                 if (param->write.len > 0)
                 {
-                    err = bt_svc_spp_send_data(param->write.value, param->write.len);
-                    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+                    if (s_spp_rx_cb)
                     {
-                        ESP_LOGW(TAG, "BLE SPP echo notify failed: %s", esp_err_to_name(err));
+                        s_spp_rx_cb(param->write.value, param->write.len, s_spp_rx_cb_ctx);
+                    }
+                    else
+                    {
+                        err = bt_svc_spp_send_data(param->write.value, param->write.len);
+                        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+                        {
+                            ESP_LOGW(TAG, "BLE SPP echo notify failed: %s", esp_err_to_name(err));
+                        }
                     }
                 }
                 break;
@@ -1642,6 +1651,23 @@ void bluetooth_service_register_media_key_callback(bluetooth_service_media_key_c
     s_media_key_cb_ctx = user_ctx;
 }
 
+esp_err_t bluetooth_service_register_spp_rx_callback(bluetooth_service_spp_rx_cb_t callback, void *user_ctx)
+{
+    if (!s_initialised)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_spp_rx_cb = callback;
+    s_spp_rx_cb_ctx = user_ctx;
+    return ESP_OK;
+}
+
+esp_err_t bluetooth_service_spp_send_data(const uint8_t *data, size_t len)
+{
+    return bt_svc_spp_send_data(data, len);
+}
+
 bool bluetooth_service_is_initialised(void)
 {
     return s_initialised;
@@ -1650,6 +1676,26 @@ bool bluetooth_service_is_initialised(void)
 bool bluetooth_service_is_a2dp_connected(void)
 {
     return s_a2dp_connected;
+}
+
+bool bluetooth_service_is_spp_connected(void)
+{
+    return s_spp_connected;
+}
+
+bool bluetooth_service_spp_notifications_enabled(void)
+{
+    return s_spp_data_notifications_enabled;
+}
+
+size_t bluetooth_service_spp_get_mtu(void)
+{
+    return s_spp_mtu;
+}
+
+size_t bluetooth_service_spp_get_max_payload(void)
+{
+    return s_spp_mtu > 3 ? (size_t)(s_spp_mtu - 3) : 0;
 }
 
 size_t bluetooth_service_get_bonded_device_count(void)

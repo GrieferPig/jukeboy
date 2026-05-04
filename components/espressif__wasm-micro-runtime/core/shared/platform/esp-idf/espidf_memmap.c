@@ -17,21 +17,42 @@
 static portMUX_TYPE s_spinlock = portMUX_INITIALIZER_UNLOCKED;
 #endif
 
+static void *
+os_mmap_alloc(size_t size, bool prot_exec)
+{
+    size_t alloc_size = size + 4 + sizeof(uintptr_t);
+
+    if (prot_exec) {
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
+        return heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM);
+#else
+        return heap_caps_malloc(alloc_size, MALLOC_CAP_EXEC);
+#endif
+    }
+
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
+    return heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM);
+#elif defined(CONFIG_SPIRAM)
+    {
+        void *buf_origin =
+            heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (buf_origin) {
+            return buf_origin;
+        }
+    }
+#endif
+
+    return heap_caps_malloc(alloc_size, MALLOC_CAP_8BIT);
+}
+
 void *
 os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 {
     if (prot & MMAP_PROT_EXEC) {
-#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-        uint32_t mem_caps = MALLOC_CAP_SPIRAM;
-#else
-        uint32_t mem_caps = MALLOC_CAP_EXEC;
-#endif
-
         // Memory allocation with MALLOC_CAP_EXEC will return 4-byte aligned
         // Reserve extra 4 byte to fixup alignment and size for the pointer to
         // the originally allocated address
-        void *buf_origin =
-            heap_caps_malloc(size + 4 + sizeof(uintptr_t), mem_caps);
+        void *buf_origin = os_mmap_alloc(size, true);
         if (!buf_origin) {
             return NULL;
         }
@@ -51,13 +72,7 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 #endif
     }
     else {
-#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-        uint32_t mem_caps = MALLOC_CAP_SPIRAM;
-#else
-        uint32_t mem_caps = MALLOC_CAP_8BIT;
-#endif
-        void *buf_origin =
-            heap_caps_malloc(size + 4 + sizeof(uintptr_t), mem_caps);
+        void *buf_origin = os_mmap_alloc(size, false);
         if (!buf_origin) {
             return NULL;
         }
@@ -127,7 +142,8 @@ void
 
 void
 os_icache_flush(void *start, size_t len)
-{}
+{
+}
 
 #if (WASM_MEM_DUAL_BUS_MIRROR != 0)
 void *

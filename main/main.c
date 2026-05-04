@@ -20,6 +20,7 @@
 #include "audio_output_switch.h"
 #include "bluetooth_service.h"
 #include "cartridge_service.h"
+#include "companion_api_service.h"
 #include "console_service.h"
 #include "hid_service.h"
 #include "i2s_service.h"
@@ -159,15 +160,8 @@ void app_main(void)
         esp_pm_config_t pm_config = {
             .max_freq_mhz = 240,
             .min_freq_mhz = 80,
-#if CONFIG_FREERTOS_USE_TICKLESS_IDLE
-            .light_sleep_enable = true,
-#else
             .light_sleep_enable = false,
-#endif
         };
-#if !CONFIG_FREERTOS_USE_TICKLESS_IDLE
-        ESP_LOGW(TAG, "tickless idle is disabled; leaving light sleep off in power management config");
-#endif
         ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
     }
 
@@ -216,6 +210,10 @@ void app_main(void)
     ESP_ERROR_CHECK(player_service_init());
     ESP_ERROR_CHECK(play_history_service_init());
     ESP_ERROR_CHECK(lastfm_service_init());
+    if (!running_in_qemu)
+    {
+        ESP_ERROR_CHECK(companion_api_service_init());
+    }
 
     if (running_in_qemu && QEMU_PCM_SERVICE_ENABLED)
     {

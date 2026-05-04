@@ -22,6 +22,7 @@ bttest/
 │   ├── main.c                  Entry point — app_main()
 │   ├── player_service.c/.h     Audio decode/playback state machine
 │   ├── bluetooth_service.c/.h  Classic BT: A2DP source, AVRCP, GAP, SPP
+│   ├── companion_api_service.c/.h BLE companion API over the SPP transport
 │   ├── wifi_service.c/.h       Wi-Fi STA: connect, scan, NVS creds, SNTP
 │   ├── cartridge_service.c/.h  SD card mount/unmount, metadata, async reader
 │   ├── i2s_service.c/.h        I2S output (currently a no-op stub)
@@ -75,6 +76,7 @@ All services follow the same pattern:
 | `player_svc`      | 0    | 4096          | Internal   | Service coordinator                         |
 | `player_reader`   | 1    | 4096          | Internal   | SD card → chunk queue                       |
 | `player_decoder`  | 1    | 12288         | Internal   | Opus decode → PCM stream                    |
+| `companion_api`   | 1    | 8192          | PSRAM      | BLE companion API framing, auth, dispatch   |
 | `cart_reader`     | any  | 4096          | Internal   | Async 128 KB block reads from SD            |
 | `bt_svc`          | any  | 2048          | Internal   | BT command dispatch (must stay internal)    |
 | `wifi_svc`        | 0    | 4096          | Internal   | NVS/flash APIs require internal stack       |
@@ -177,6 +179,13 @@ service listens for to immediately stop playback and free resources.
 ## Bluetooth Service
 
 Implements an A2DP **source** (the ESP32 streams audio to a BT speaker/headset):
+
+The BLE SPP-style GATT service (`0xABF0`) is also used as the transport for the
+companion API. Incoming writes on the data characteristic are routed through a
+registered RX callback when `companion_api_service` is initialized; otherwise the
+legacy echo behavior remains available. The companion API task owns frame
+reassembly, HMAC auth, button-sequence pairing, heartbeat generation, and command
+dispatch to player, Wi-Fi, Last.fm, history, cartridge, and Bluetooth helpers.
 
 - **GAP** — device discovery, pairing, bonded device management.
 - **A2DP** — connection state, audio state, SBC endpoint registration.

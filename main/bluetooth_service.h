@@ -44,6 +44,9 @@ extern "C"
                                                      uint8_t key_state,
                                                      esp_avrc_rsp_t rsp_code,
                                                      void *user_ctx);
+    typedef void (*bluetooth_service_spp_rx_cb_t)(const uint8_t *data,
+                                                  size_t len,
+                                                  void *user_ctx);
 
     typedef struct
     {
@@ -65,8 +68,14 @@ extern "C"
     esp_err_t bluetooth_service_register_pcm_provider(bluetooth_service_pcm_provider_t provider, void *user_ctx);
     void bluetooth_service_register_connection_callback(bluetooth_service_connection_cb_t callback, void *user_ctx);
     void bluetooth_service_register_media_key_callback(bluetooth_service_media_key_cb_t callback, void *user_ctx);
+    esp_err_t bluetooth_service_register_spp_rx_callback(bluetooth_service_spp_rx_cb_t callback, void *user_ctx);
+    esp_err_t bluetooth_service_spp_send_data(const uint8_t *data, size_t len);
     bool bluetooth_service_is_initialised(void);
     bool bluetooth_service_is_a2dp_connected(void);
+    bool bluetooth_service_is_spp_connected(void);
+    bool bluetooth_service_spp_notifications_enabled(void);
+    size_t bluetooth_service_spp_get_mtu(void);
+    size_t bluetooth_service_spp_get_max_payload(void);
     size_t bluetooth_service_get_bonded_device_count(void);
     esp_err_t bluetooth_service_get_bonded_devices(size_t *count, esp_bd_addr_t *devices);
 

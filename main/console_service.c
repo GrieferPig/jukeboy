@@ -22,6 +22,7 @@
 
 #include "bluetooth_service.h"
 #include "wifi_service.h"
+#include "companion_api_service.h"
 #include "console_service.h"
 #include "cartridge_service.h"
 #include "audio_output_switch.h"
@@ -43,6 +44,7 @@ static const char *TAG = "console_svc";
 static void script_print_output(const char *output);
 static const char *auth_mode_str(wifi_auth_mode_t mode);
 static const char *hid_button_name(hid_button_t button);
+static bool console_parse_hid_button(const char *value, hid_button_t *button_out);
 static bool console_parse_uint_in_range(const char *value, unsigned max_value, unsigned *parsed_out);
 
 typedef struct
@@ -265,6 +267,56 @@ static const char *hid_button_name(hid_button_t button)
     }
 }
 
+static bool console_parse_hid_button(const char *value, hid_button_t *button_out)
+{
+    if (!value || !button_out)
+    {
+        return false;
+    }
+
+    for (hid_button_t button = HID_BUTTON_MAIN_1; button < HID_BUTTON_COUNT; button++)
+    {
+        if (strcmp(value, hid_button_name(button)) == 0)
+        {
+            *button_out = button;
+            return true;
+        }
+    }
+
+    if (strcmp(value, "main_1") == 0)
+    {
+        *button_out = HID_BUTTON_MAIN_1;
+        return true;
+    }
+    if (strcmp(value, "main_2") == 0)
+    {
+        *button_out = HID_BUTTON_MAIN_2;
+        return true;
+    }
+    if (strcmp(value, "main_3") == 0)
+    {
+        *button_out = HID_BUTTON_MAIN_3;
+        return true;
+    }
+    if (strcmp(value, "misc_1") == 0)
+    {
+        *button_out = HID_BUTTON_MISC_1;
+        return true;
+    }
+    if (strcmp(value, "misc_2") == 0)
+    {
+        *button_out = HID_BUTTON_MISC_2;
+        return true;
+    }
+    if (strcmp(value, "misc_3") == 0)
+    {
+        *button_out = HID_BUTTON_MISC_3;
+        return true;
+    }
+
+    return false;
+}
+
 static void console_hid_event_handler(void *handler_arg,
                                       esp_event_base_t event_base,
                                       int32_t event_id,
@@ -280,6 +332,155 @@ static void console_hid_event_handler(void *handler_arg,
 
     hid_button_t button = *(const hid_button_t *)event_data;
     printf("HID button pressed: %s\n", hid_button_name(button));
+}
+
+/* ════════════════════════════════════════════════════════════════════ *
+ *  Companion API commands                                             *
+ * ════════════════════════════════════════════════════════════════════ */
+
+static void companion_print_status(void)
+{
+    companion_api_status_t status;
+    companion_api_service_get_status(&status);
+
+    printf("Companion API: %s\n", status.initialised ? "started" : "stopped");
+    printf("SPP:           %s, notifications %s\n",
+           status.spp_connected ? "connected" : "disconnected",
+           status.spp_notifications_enabled ? "enabled" : "disabled");
+    printf("Auth:          %s", status.authenticated ? "authenticated" : "not authenticated");
+    if (status.active_client_id[0] != '\0')
+    {
+        printf(" (%s)", status.active_client_id);
+    }
+    printf("\n");
+    printf("Trusted apps:  %u\n", (unsigned)status.trusted_client_count);
+    printf("Generation:    %lu\n", (unsigned long)status.event_generation);
+    printf("Frames:        rx=%lu tx=%lu errors=%lu dropped_rx=%lu\n",
+           (unsigned long)status.rx_frames,
+           (unsigned long)status.tx_frames,
+           (unsigned long)status.rx_errors,
+           (unsigned long)status.dropped_rx_chunks);
+
+    if (status.pairing_pending)
+    {
+        printf("Pairing:       pending for %s (%s), progress %u/%u\n",
+               status.pending_app_name[0] ? status.pending_app_name : "unknown app",
+               status.pending_client_id,
+               (unsigned)status.pairing_progress,
+               (unsigned)status.pairing_required_count);
+        printf("Sequence:      ");
+        for (uint8_t index = 0; index < status.pairing_required_count && index < 4; index++)
+        {
+            printf("%s%s", index == 0 ? "" : " ", hid_button_name(status.pending_sequence[index]));
+        }
+        printf("\n");
+    }
+    else
+    {
+        printf("Pairing:       idle\n");
+    }
+}
+
+static void companion_print_clients(void)
+{
+    size_t count = companion_api_service_get_trusted_client_count();
+    printf("Trusted companion apps: %u\n", (unsigned)count);
+    for (size_t index = 0; index < count; index++)
+    {
+        companion_api_trusted_client_info_t client;
+        if (companion_api_service_get_trusted_client(index, &client) == ESP_OK)
+        {
+            printf("%u: %s  app='%s' created=%lu\n",
+                   (unsigned)index,
+                   client.client_id,
+                   client.app_name,
+                   (unsigned long)client.created_at_unix);
+        }
+    }
+}
+
+static int cmd_companion(int argc, char **argv)
+{
+    esp_err_t err;
+
+    if (argc < 2 || strcmp(argv[1], "status") == 0)
+    {
+        companion_print_status();
+        return 0;
+    }
+
+    if (strcmp(argv[1], "clients") == 0)
+    {
+        companion_print_clients();
+        return 0;
+    }
+
+    if (strcmp(argv[1], "pair") == 0)
+    {
+        if (argc < 3 || strcmp(argv[2], "status") == 0)
+        {
+            companion_print_status();
+            return 0;
+        }
+        if (strcmp(argv[2], "confirm") == 0)
+        {
+            err = companion_api_service_console_confirm_pairing();
+        }
+        else if (strcmp(argv[2], "cancel") == 0)
+        {
+            err = companion_api_service_console_cancel_pairing();
+        }
+        else if (strcmp(argv[2], "input") == 0 && argc >= 4)
+        {
+            hid_button_t button;
+            if (!console_parse_hid_button(argv[3], &button))
+            {
+                printf("Unknown button '%s'. Use main1/main2/main3/misc1/misc2/misc3.\n", argv[3]);
+                return 1;
+            }
+            err = companion_api_service_console_input_button(button);
+        }
+        else
+        {
+            printf("Usage: companion pair [status|confirm|cancel|input <button>]\n");
+            return 1;
+        }
+
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("Pairing command accepted.\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "revoke") == 0)
+    {
+        if (argc < 3)
+        {
+            printf("Usage: companion revoke <client_id|all>\n");
+            return 1;
+        }
+        if (strcmp(argv[2], "all") == 0)
+        {
+            err = companion_api_service_revoke_all_clients();
+        }
+        else
+        {
+            err = companion_api_service_revoke_client(argv[2]);
+        }
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("Trusted companion app record revoked.\n");
+        return 0;
+    }
+
+    printf("Usage: companion [status|clients|pair|revoke]\n");
+    return 1;
 }
 
 /* ════════════════════════════════════════════════════════════════════ *
@@ -2751,6 +2952,14 @@ esp_err_t console_service_init(void)
         .argtable = &s_media_args,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&media_cmd));
+
+    const esp_console_cmd_t companion_cmd = {
+        .command = "companion",
+        .help = "Companion API: companion [status|clients|pair|revoke]",
+        .hint = NULL,
+        .func = cmd_companion,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&companion_cmd));
 
     const esp_console_cmd_t history_cmd = {
         .command = "history",

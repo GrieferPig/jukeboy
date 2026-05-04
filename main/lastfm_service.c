@@ -86,9 +86,16 @@ typedef struct
     uint32_t track_index;
 } lastfm_track_ref_t;
 
+typedef struct
+{
+    play_history_track_record_t track_record;
+    play_history_album_record_t album_record;
+} lastfm_metadata_work_buffer_t;
+
 static lastfm_track_ref_t lastfm_now_playing_track = {0};
 static bool lastfm_now_playing_track_valid = false;
 static bool lastfm_now_playing_active = false;
+EXT_RAM_BSS_ATTR static lastfm_metadata_work_buffer_t lastfm_metadata_work_buffer;
 
 static void lastfm_service_log_error_from_err(const char *prefix, esp_err_t err)
 {
@@ -793,18 +800,21 @@ static bool lastfm_service_lookup_scrobble_track(uint32_t album_checksum,
 }
 
 static esp_err_t lastfm_service_resolve_track_metadata(const lastfm_track_ref_t *track_ref,
-                                                       play_history_track_record_t *track_record,
-                                                       play_history_album_record_t *album_record,
                                                        const char **artist_out,
                                                        const char **track_name_out)
 {
+    play_history_track_record_t *track_record;
+    play_history_album_record_t *album_record;
     const char *artist;
     const char *track_name;
 
-    if (!track_ref || !track_record || !album_record || !artist_out || !track_name_out)
+    if (!track_ref || !artist_out || !track_name_out)
     {
         return ESP_ERR_INVALID_ARG;
     }
+
+    track_record = &lastfm_metadata_work_buffer.track_record;
+    album_record = &lastfm_metadata_work_buffer.album_record;
 
     if (!lastfm_service_lookup_scrobble_track(track_ref->album_checksum,
                                               track_ref->track_index,
@@ -1010,8 +1020,6 @@ static esp_err_t lastfm_update_now_playing(const char *artist, const char *track
 
 static esp_err_t lastfm_service_process_now_playing_track(const lastfm_track_ref_t *track_ref)
 {
-    play_history_track_record_t track_record;
-    play_history_album_record_t album_record;
     const char *artist;
     const char *track_name;
     esp_err_t err;
@@ -1047,11 +1055,7 @@ static esp_err_t lastfm_service_process_now_playing_track(const lastfm_track_ref
         return ESP_OK;
     }
 
-    err = lastfm_service_resolve_track_metadata(track_ref,
-                                                &track_record,
-                                                &album_record,
-                                                &artist,
-                                                &track_name);
+    err = lastfm_service_resolve_track_metadata(track_ref, &artist, &track_name);
     if (err != ESP_OK)
     {
         return err;
@@ -1585,8 +1589,6 @@ esp_err_t lastfm_service_request_auth(const char *username, const char *password
 
 static esp_err_t lastfm_service_process_scrobble_payload(const lastfm_cmd_scrobble_payload_t *payload)
 {
-    play_history_track_record_t track_record;
-    play_history_album_record_t album_record;
     const char *artist;
     const char *track_name;
     esp_err_t err;
@@ -1605,29 +1607,10 @@ static esp_err_t lastfm_service_process_scrobble_payload(const lastfm_cmd_scrobb
         return ESP_OK;
     }
 
-    if (!lastfm_service_lookup_scrobble_track(payload->scrobble.album_checksum,
-                                              payload->scrobble.track_index,
-                                              &track_record,
-                                              &album_record))
+    err = lastfm_service_resolve_track_metadata(&payload->scrobble, &artist, &track_name);
+    if (err != ESP_OK)
     {
-        ESP_LOGW(TAG,
-                 "failed to resolve scrobble metadata for checksum=0x%08lx track=%lu",
-                 (unsigned long)payload->scrobble.album_checksum,
-                 (unsigned long)payload->scrobble.track_index);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    track_name = track_record.metadata.track_name;
-    artist = track_record.metadata.artists[0] != '\0'
-                 ? track_record.metadata.artists
-                 : album_record.metadata.artist;
-    if (track_name[0] == '\0' || artist[0] == '\0')
-    {
-        ESP_LOGW(TAG,
-                 "scrobble metadata missing artist or track for checksum=0x%08lx track=%lu",
-                 (unsigned long)payload->scrobble.album_checksum,
-                 (unsigned long)payload->scrobble.track_index);
-        return ESP_ERR_INVALID_RESPONSE;
+        return err;
     }
 
     err = lastfm_service_require_internet_connection("scrobble to Last.fm");

@@ -5,6 +5,7 @@
 
 #include "esp_err.h"
 #include "esp_event.h"
+#include "jukeboy_formats.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -14,6 +15,7 @@ extern "C"
     ESP_EVENT_DECLARE_BASE(PLAYER_SERVICE_EVENT);
 
 #define PLAYER_SVC_TRACK_FILENAME_MAX_LEN 16
+#define PLAYER_SVC_TRACK_TITLE_MAX_LEN JUKEBOY_JBM_TRACK_NAME_BYTES
 
     typedef enum
     {
@@ -48,6 +50,22 @@ extern "C"
         PLAYER_SVC_MODE_SHUFFLE,       /**< Pick the next track at random (different from the current one). */
     } player_service_playback_mode_t;
 
+    typedef struct
+    {
+        bool is_playing;
+        bool is_paused;
+        uint32_t cartridge_checksum;
+        uint32_t track_index;
+        uint32_t track_count;
+        uint32_t playback_position_sec;
+        uint32_t track_started_unix;
+        uint32_t track_duration_sec;
+        uint8_t volume_percent;
+        player_service_playback_mode_t playback_mode;
+        char track_title[PLAYER_SVC_TRACK_TITLE_MAX_LEN];
+        char filename[PLAYER_SVC_TRACK_FILENAME_MAX_LEN];
+    } player_service_snapshot_t;
+
     typedef enum
     {
         PLAYER_SVC_CONTROL_NEXT,
@@ -61,6 +79,9 @@ extern "C"
 
     esp_err_t player_service_init(void);
     esp_err_t player_service_request_control(player_service_control_t control);
+    esp_err_t player_service_play_track_by_index(uint32_t track_index);
+    esp_err_t player_service_seek_to_seconds(uint32_t seconds);
+    esp_err_t player_service_get_snapshot(player_service_snapshot_t *snapshot);
     bool player_service_is_paused(void);
     uint8_t player_service_get_volume_percent(void);
     void player_service_set_volume_absolute(uint8_t avrc_vol);

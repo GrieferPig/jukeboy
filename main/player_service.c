@@ -102,6 +102,8 @@ typedef enum
     PLAYER_SVC_CMD_CARTRIDGE_REMOVED,
     PLAYER_SVC_CMD_TRACK_COMPLETE,
     PLAYER_SVC_CMD_CONTROL,
+    PLAYER_SVC_CMD_PLAY_INDEX,
+    PLAYER_SVC_CMD_SEEK_ABSOLUTE,
     PLAYER_SVC_CMD_PERSIST_FOR_SHUTDOWN,
 } player_service_cmd_t;
 
@@ -109,6 +111,8 @@ typedef struct
 {
     player_service_cmd_t cmd;
     player_service_control_t control;
+    uint32_t track_index;
+    uint32_t seek_seconds;
     uint32_t generation;
     SemaphoreHandle_t completion_semaphore;
     esp_err_t *result_out;
@@ -216,6 +220,24 @@ static bool player_service_queue_control(player_service_control_t control)
     player_service_msg_t msg = {
         .cmd = PLAYER_SVC_CMD_CONTROL,
         .control = control,
+    };
+    return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
+}
+
+static bool player_service_queue_play_index(uint32_t track_index)
+{
+    player_service_msg_t msg = {
+        .cmd = PLAYER_SVC_CMD_PLAY_INDEX,
+        .track_index = track_index,
+    };
+    return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
+}
+
+static bool player_service_queue_seek_absolute(uint32_t seconds)
+{
+    player_service_msg_t msg = {
+        .cmd = PLAYER_SVC_CMD_SEEK_ABSOLUTE,
+        .seek_seconds = seconds,
     };
     return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
 }
@@ -2063,6 +2085,50 @@ static void player_service_handle_control(player_service_control_t control)
     }
 }
 
+static void player_service_handle_play_index(uint32_t track_index)
+{
+    if (s_playlist_count == 0 || track_index >= s_playlist_count)
+    {
+        return;
+    }
+
+    s_paused = false;
+    player_service_stop_playback(true);
+    if (player_service_start_track((size_t)track_index, 0) != ESP_OK)
+    {
+        s_playing = false;
+    }
+}
+
+static void player_service_handle_seek_absolute(uint32_t seconds)
+{
+    size_t target_chunk;
+    size_t current_chunk;
+
+    if (!s_playing || s_track_info.lookup_table_len == 0)
+    {
+        return;
+    }
+
+    target_chunk = player_service_clamp_chunk_index((size_t)seconds);
+    current_chunk = s_paused ? s_resume_chunk : player_service_clamp_chunk_index(s_current_chunk);
+    if (target_chunk == current_chunk)
+    {
+        return;
+    }
+
+    s_resume_chunk = target_chunk;
+    player_service_invalidate_lookup_window(&s_track_info);
+    if (!s_paused)
+    {
+        player_service_stop_playback(true);
+        if (player_service_start_track(s_playlist_index, s_resume_chunk) != ESP_OK)
+        {
+            s_playing = false;
+        }
+    }
+}
+
 static void player_service_handle_cartridge_removed(void)
 {
     player_service_stop_playback(true);
@@ -2099,6 +2165,12 @@ static void player_service_task(void *param)
             break;
         case PLAYER_SVC_CMD_CONTROL:
             player_service_handle_control(msg.control);
+            break;
+        case PLAYER_SVC_CMD_PLAY_INDEX:
+            player_service_handle_play_index(msg.track_index);
+            break;
+        case PLAYER_SVC_CMD_SEEK_ABSOLUTE:
+            player_service_handle_seek_absolute(msg.seek_seconds);
             break;
         case PLAYER_SVC_CMD_PERSIST_FOR_SHUTDOWN:
         {
@@ -2272,6 +2344,94 @@ esp_err_t player_service_request_control(player_service_control_t control)
     if (!player_service_queue_control(control))
     {
         return ESP_ERR_TIMEOUT;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t player_service_play_track_by_index(uint32_t track_index)
+{
+    if (!s_initialised)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_playlist_count == 0 || track_index >= s_playlist_count)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!player_service_queue_play_index(track_index))
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t player_service_seek_to_seconds(uint32_t seconds)
+{
+    if (!s_initialised)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!s_playing)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!player_service_queue_seek_absolute(seconds))
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t player_service_get_snapshot(player_service_snapshot_t *snapshot)
+{
+    const jukeboy_jbm_header_t *metadata;
+
+    if (!snapshot)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (!s_initialised)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    metadata = cartridge_service_get_metadata_header();
+    snapshot->is_playing = s_playing;
+    snapshot->is_paused = s_paused;
+    snapshot->cartridge_checksum = metadata ? metadata->checksum : 0;
+    snapshot->track_index = s_playlist_count > 0 ? (uint32_t)s_playlist_index : UINT32_MAX;
+    snapshot->track_count = (uint32_t)s_playlist_count;
+    snapshot->playback_position_sec = (uint32_t)player_service_current_second();
+    snapshot->track_started_unix = s_track_started_unix;
+    snapshot->track_duration_sec = s_playlist_count > 0 ? cartridge_service_get_track_duration_sec(s_playlist_index) : 0;
+    snapshot->volume_percent = player_service_get_volume_percent();
+    snapshot->playback_mode = s_playback_mode;
+
+    if (s_current_track[0] != '\0')
+    {
+        strncpy(snapshot->track_title, s_current_track, sizeof(snapshot->track_title) - 1);
+    }
+    else if (s_playlist_count > 0)
+    {
+        const char *title = player_service_playlist_title(s_playlist_index);
+        if (title)
+        {
+            strncpy(snapshot->track_title, title, sizeof(snapshot->track_title) - 1);
+        }
+    }
+
+    if (s_playlist_count > 0)
+    {
+        player_service_playlist_filename(s_playlist_index, snapshot->filename, sizeof(snapshot->filename));
     }
 
     return ESP_OK;
