@@ -1305,15 +1305,16 @@ static void bt_svc_process_msg(const bluetooth_service_msg_t *msg)
         {
             s_a2dp_connected = true;
             memcpy(s_connected_bda, msg->data.a2dp_connection.remote_bda, ESP_BD_ADDR_LEN);
+            // Todo: make this an option
             // disable wifi autoreconnect to avoid audio glitches
-            wifi_service_set_autoreconnect(false);
+            // wifi_service_set_autoreconnect(false);
         }
         else if (msg->data.a2dp_connection.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED)
         {
             s_a2dp_connected = false;
             memset(s_connected_bda, 0, sizeof(s_connected_bda));
             // re-enable wifi autoreconnect
-            wifi_service_set_autoreconnect(true);
+            // wifi_service_set_autoreconnect(true);
         }
         bt_svc_post_event(BLUETOOTH_SVC_EVENT_A2DP_CONNECTION_STATE,
                           &msg->data.a2dp_connection.state,

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -41,12 +43,21 @@ extern "C"
     /* ── Scan results ───────────────────────────────────────────────────── */
 
 #define WIFI_SVC_MAX_SCAN_RESULTS 20
+#define WIFI_SVC_SLOT_COUNT 3
 
     typedef struct
     {
         wifi_ap_record_t records[WIFI_SVC_MAX_SCAN_RESULTS];
         uint16_t count;
     } wifi_svc_scan_result_t;
+
+    typedef struct
+    {
+        bool configured;
+        bool preferred;
+        bool active;
+        char ssid[33];
+    } wifi_svc_slot_info_t;
 
     /* ── Public API ─────────────────────────────────────────────────────── */
 
@@ -63,13 +74,19 @@ extern "C"
     /** Enqueue a connect command (SSID/password saved to NVS). */
     esp_err_t wifi_service_connect(const char *ssid, const char *password);
 
+    /** Save or replace a Wi-Fi slot (0-based slot index). */
+    esp_err_t wifi_service_save_slot(uint8_t slot_index, const char *ssid, const char *password);
+
+    /** Enqueue a connect command using a saved Wi-Fi slot (0-based slot index). */
+    esp_err_t wifi_service_connect_slot(uint8_t slot_index);
+
     /** Enqueue a disconnect command (stops auto-reconnect timer). */
     esp_err_t wifi_service_disconnect(void);
 
     /** Enqueue an async scan command. Listen for WIFI_SVC_EVENT_SCAN_DONE. */
     esp_err_t wifi_service_scan(void);
 
-    /** Enable or disable 30 s periodic auto-reconnect using saved credentials. */
+    /** Enable or disable persistent 30 s periodic auto-reconnect using saved credentials. */
     esp_err_t wifi_service_set_autoreconnect(bool enable);
 
     /**
@@ -79,11 +96,23 @@ extern "C"
      */
     esp_err_t wifi_service_reconnect(void);
 
-    /** Thread-safe polling: current auto-reconnect status. */
+    /** Thread-safe polling: current persisted auto-reconnect status. */
     bool wifi_service_get_autoreconnect(void);
 
     /** Thread-safe polling: current service state. */
     wifi_svc_state_t wifi_service_get_state(void);
+
+    /** Thread-safe polling: true once the connectivity test has passed for the current Wi-Fi link. */
+    bool wifi_service_has_internet(void);
+
+    /** Read all saved Wi-Fi slots into the caller-provided array. */
+    esp_err_t wifi_service_get_saved_slots(wifi_svc_slot_info_t *out_slots, size_t slot_count);
+
+    /** Return the preferred slot index for auto-reconnect, or -1 when unset. */
+    int wifi_service_get_preferred_slot(void);
+
+    /** Return the current active or connecting slot index, or -1 when unset. */
+    int wifi_service_get_active_slot(void);
 
     /** Copy latest scan results into caller-provided buffer under mutex. */
     esp_err_t wifi_service_get_scan_results(wifi_svc_scan_result_t *out);

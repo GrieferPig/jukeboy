@@ -650,34 +650,50 @@ static bool player_service_should_restart_current_track(void)
            PLAYER_SVC_PREVIOUS_RESTART_SECONDS;
 }
 
-static void player_service_post_countable_track_event(void)
+static bool player_service_fill_current_track_event(player_service_track_event_t *event_data)
 {
     const jukeboy_jbm_header_t *metadata = cartridge_service_get_metadata_header();
     size_t metadata_index = player_service_playlist_metadata_index(s_playlist_index);
     const jukeboy_jbm_track_t *track;
-    player_service_track_event_t event_data;
     char filename[PLAYER_SVC_TRACK_FILENAME_MAX_LEN] = {0};
 
-    if (s_countable_play_emitted || !metadata || metadata_index == SIZE_MAX)
+    if (!event_data || !metadata || metadata_index == SIZE_MAX)
     {
-        return;
+        return false;
     }
 
     track = cartridge_service_get_metadata_track(metadata_index);
     if (!track)
     {
+        return false;
+    }
+
+    memset(event_data, 0, sizeof(*event_data));
+    event_data->cartridge_checksum = metadata->checksum;
+    event_data->track_index = (uint32_t)metadata_index;
+    event_data->track_file_num = track->file_num;
+    event_data->started_at_unix = s_track_started_unix;
+    event_data->playback_position_sec = (uint32_t)player_service_current_second();
+    if (player_service_playlist_filename(s_playlist_index, filename, sizeof(filename)))
+    {
+        strncpy(event_data->filename, filename, sizeof(event_data->filename) - 1);
+    }
+
+    return true;
+}
+
+static void player_service_post_countable_track_event(void)
+{
+    player_service_track_event_t event_data;
+
+    if (s_countable_play_emitted)
+    {
         return;
     }
 
-    memset(&event_data, 0, sizeof(event_data));
-    event_data.cartridge_checksum = metadata->checksum;
-    event_data.track_index = (uint32_t)metadata_index;
-    event_data.track_file_num = track->file_num;
-    event_data.started_at_unix = s_track_started_unix;
-    event_data.playback_position_sec = (uint32_t)player_service_current_second();
-    if (player_service_playlist_filename(s_playlist_index, filename, sizeof(filename)))
+    if (!player_service_fill_current_track_event(&event_data))
     {
-        strncpy(event_data.filename, filename, sizeof(event_data.filename) - 1);
+        return;
     }
 
     s_countable_play_emitted = true;
@@ -1743,7 +1759,14 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
              (unsigned)(index + 1),
              (unsigned)s_playlist_count,
              s_current_track);
-    player_service_post_event(PLAYER_SVC_EVENT_TRACK_STARTED, s_current_track, strlen(s_current_track) + 1);
+    {
+        player_service_track_event_t event_data;
+        bool have_event_data = player_service_fill_current_track_event(&event_data);
+
+        player_service_post_event(PLAYER_SVC_EVENT_TRACK_STARTED,
+                                  have_event_data ? &event_data : NULL,
+                                  have_event_data ? sizeof(event_data) : 0);
+    }
     return ESP_OK;
 }
 
@@ -1895,6 +1918,8 @@ static size_t player_service_prev_index(void)
 static void player_service_handle_track_complete(uint32_t generation)
 {
     size_t next_index;
+    player_service_track_event_t event_data;
+    bool have_event_data;
 
     if (generation == s_cancelled_generation)
     {
@@ -1906,9 +1931,13 @@ static void player_service_handle_track_complete(uint32_t generation)
         return;
     }
 
+    have_event_data = player_service_fill_current_track_event(&event_data);
+
     if (s_playing)
     {
-        player_service_post_event(PLAYER_SVC_EVENT_TRACK_FINISHED, s_current_track, strlen(s_current_track) + 1);
+        player_service_post_event(PLAYER_SVC_EVENT_TRACK_FINISHED,
+                                  have_event_data ? &event_data : NULL,
+                                  have_event_data ? sizeof(event_data) : 0);
     }
 
     if (s_playlist_count == 0)
@@ -2017,9 +2046,16 @@ static void player_service_handle_control(player_service_control_t control)
         }
         else
         {
+            player_service_track_event_t event_data;
+            bool have_event_data;
+
             s_resume_chunk = player_service_clamp_chunk_index(s_current_chunk);
+            have_event_data = player_service_fill_current_track_event(&event_data);
             player_service_stop_playback(true);
             s_paused = true;
+            player_service_post_event(PLAYER_SVC_EVENT_TRACK_PAUSED,
+                                      have_event_data ? &event_data : NULL,
+                                      have_event_data ? sizeof(event_data) : 0);
         }
         break;
     default:

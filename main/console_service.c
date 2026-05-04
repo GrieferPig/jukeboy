@@ -37,12 +37,13 @@ static const char *TAG = "console_svc";
 
 #define TELEMETRY_INTERVAL_MS 5000
 #define TELEMETRY_MAX_TASKS 32
-#define CONSOLE_REPL_TASK_STACK_SIZE 4096
+#define CONSOLE_REPL_TASK_STACK_SIZE 6144
 #define CONSOLE_PSRAM_ALLOC_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 static void script_print_output(const char *output);
 static const char *auth_mode_str(wifi_auth_mode_t mode);
 static const char *hid_button_name(hid_button_t button);
+static bool console_parse_uint_in_range(const char *value, unsigned max_value, unsigned *parsed_out);
 
 typedef struct
 {
@@ -970,28 +971,61 @@ static int cmd_bt(int argc, char **argv)
  *  WiFi commands                                                      *
  * ════════════════════════════════════════════════════════════════════ */
 
-static struct
+static bool wifi_parse_slot_arg(const char *value, uint8_t *slot_index_out)
 {
-    struct arg_str *ssid;
-    struct arg_str *password;
-    struct arg_end *end;
-} s_connect_args;
+    unsigned parsed_slot;
+
+    if (!slot_index_out ||
+        !console_parse_uint_in_range(value, WIFI_SVC_SLOT_COUNT, &parsed_slot) ||
+        parsed_slot == 0)
+    {
+        return false;
+    }
+
+    *slot_index_out = (uint8_t)(parsed_slot - 1);
+    return true;
+}
+
+static int wifi_save_handler(int argc, char **argv)
+{
+    uint8_t slot_index;
+    const char *ssid;
+    const char *password;
+    esp_err_t err;
+
+    if (argc < 3 || argc > 4 || !wifi_parse_slot_arg(argv[1], &slot_index))
+    {
+        printf("Usage: wifi save <slot 1-3> <ssid> [password]\n");
+        return 1;
+    }
+
+    ssid = argv[2];
+    password = argc >= 4 ? argv[3] : "";
+
+    err = wifi_service_save_slot(slot_index, ssid, password);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Saved WiFi slot %u for '%s'.\n", (unsigned)(slot_index + 1), ssid);
+    return 0;
+}
 
 static int wifi_connect_handler(int argc, char **argv)
 {
-    int nerrors = arg_parse(argc, argv, (void **)&s_connect_args);
-    if (nerrors)
+    uint8_t slot_index;
+    esp_err_t err;
+
+    if (argc != 2 || !wifi_parse_slot_arg(argv[1], &slot_index))
     {
-        arg_print_errors(stderr, s_connect_args.end, argv[0]);
+        printf("Usage: wifi connect <slot 1-3>\n");
         return 1;
     }
-    const char *ssid = s_connect_args.ssid->sval[0];
-    const char *pass = s_connect_args.password->count > 0
-                           ? s_connect_args.password->sval[0]
-                           : "";
 
-    printf("Connecting to '%s'...\n", ssid);
-    esp_err_t err = wifi_service_connect(ssid, pass);
+    printf("Connecting using WiFi slot %u...\n", (unsigned)(slot_index + 1));
+    err = wifi_service_connect_slot(slot_index);
     if (err != ESP_OK)
     {
         printf("Error: %s\n", esp_err_to_name(err));
@@ -1075,12 +1109,66 @@ static const char *state_str(wifi_svc_state_t st)
     }
 }
 
+static int wifi_list_handler(int argc, char **argv)
+{
+    wifi_svc_slot_info_t slots[WIFI_SVC_SLOT_COUNT];
+    esp_err_t err;
+    size_t slot_index;
+
+    if (argc != 1)
+    {
+        printf("Usage: wifi list\n");
+        return 1;
+    }
+
+    err = wifi_service_get_saved_slots(slots, WIFI_SVC_SLOT_COUNT);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("WiFi slots:\n");
+    for (slot_index = 0; slot_index < WIFI_SVC_SLOT_COUNT; slot_index++)
+    {
+        const wifi_svc_slot_info_t *slot = &slots[slot_index];
+        printf("  %u: %s", (unsigned)(slot_index + 1),
+               slot->configured ? slot->ssid : "<empty>");
+        if (slot->active)
+        {
+            printf(" [active]");
+        }
+        if (slot->preferred)
+        {
+            printf(" [preferred]");
+        }
+        printf("\n");
+    }
+
+    return 0;
+}
+
 static int wifi_status_handler(int argc, char **argv)
 {
     wifi_svc_state_t st = wifi_service_get_state();
+    int active_slot = wifi_service_get_active_slot();
+    int preferred_slot = wifi_service_get_preferred_slot();
+
     printf("WiFi state: %s\n", state_str(st));
     printf("Auto-reconnect: %s\n",
            wifi_service_get_autoreconnect() ? "ON" : "OFF");
+    printf("Preferred slot: %s\n",
+           preferred_slot >= 0 ? "configured" : "none");
+    if (preferred_slot >= 0)
+    {
+        printf("Preferred slot index: %d\n", preferred_slot + 1);
+    }
+    printf("Active slot: %s\n",
+           active_slot >= 0 ? "set" : "none");
+    if (active_slot >= 0)
+    {
+        printf("Active slot index: %d\n", active_slot + 1);
+    }
 
     if (st == WIFI_SVC_STATE_CONNECTED)
     {
@@ -1169,11 +1257,13 @@ static int cmd_wifi(int argc, char **argv)
 {
     static const char *usage =
         "Usage: wifi <subcommand> [args]\n"
-        "  connect <ssid> [password]   Connect to a WiFi access point\n"
+        "  save <slot 1-3> <ssid> [password]  Save or replace a WiFi slot\n"
+        "  connect <slot 1-3>         Connect using a saved WiFi slot\n"
         "  disconnect                  Disconnect from the current network\n"
-        "  reconnect                   Immediately reconnect using saved credentials\n"
+        "  reconnect                   Immediately reconnect using saved WiFi slots\n"
+        "  list                        Show saved WiFi slots\n"
         "  scan                        Scan for nearby access points\n"
-        "  status                      Show WiFi state, IP info, and AP details\n"
+        "  status                      Show WiFi state, preferred slot, and AP details\n"
         "  autoreconnect [on|off]      Get or set 30 s periodic auto-reconnect\n";
 
     if (argc < 2)
@@ -1183,12 +1273,16 @@ static int cmd_wifi(int argc, char **argv)
     }
 
     const char *sub = argv[1];
+    if (strcmp(sub, "save") == 0)
+        return wifi_save_handler(argc - 1, argv + 1);
     if (strcmp(sub, "connect") == 0)
         return wifi_connect_handler(argc - 1, argv + 1);
     if (strcmp(sub, "disconnect") == 0)
         return wifi_disconnect_handler(argc - 1, argv + 1);
     if (strcmp(sub, "reconnect") == 0)
         return wifi_reconnect_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "list") == 0)
+        return wifi_list_handler(argc - 1, argv + 1);
     if (strcmp(sub, "scan") == 0)
         return wifi_scan_handler(argc - 1, argv + 1);
     if (strcmp(sub, "status") == 0)
@@ -1984,13 +2078,15 @@ static int sd_meta_handler(int argc, char **argv)
 static int cmd_lastfm(int argc, char **argv)
 {
     static const char *usage =
-        "Usage: lastfm [status|url <proxy_url>|token|auth [proxy_url] <username> <password>|logout]\n"
+        "Usage: lastfm [status|url <proxy_url>|token|auth [proxy_url] <username> <password>|logout|scrobble [on|off]|nowplaying [on|off]]\n"
         "  status                           Show Last.fm service status\n"
         "  url <proxy_url>                  Save the Last.fm proxy base URL\n"
         "  token                            Request a fresh Last.fm auth token\n"
         "  auth <username> <password>       Authenticate using the saved proxy URL\n"
         "  auth <proxy_url> <user> <pass>   Save a proxy URL, then authenticate\n"
-        "  logout                           Clear the saved session and token\n";
+        "  logout                           Clear the saved session and token\n"
+        "  scrobble [on|off]                Get or set scrobbling\n"
+        "  nowplaying [on|off]              Get or set now-playing updates\n";
     esp_err_t err;
 
     if (argc < 2)
@@ -2011,6 +2107,9 @@ static int cmd_lastfm(int argc, char **argv)
         printf("  Token present:       %s\n", status.has_token ? "yes" : "no");
         printf("  Session present:     %s\n", status.has_session ? "yes" : "no");
         printf("  Busy:                %s\n", status.busy ? "yes" : "no");
+        printf("  Scrobbling:          %s\n", status.scrobbling_enabled ? "enabled" : "disabled");
+        printf("  Now playing:         %s\n", status.now_playing_enabled ? "enabled" : "disabled");
+        printf("  Now playing active:  %s\n", status.now_playing_active ? "yes" : "no");
         printf("  Command queue:       %s\n", status.command_queue_ready ? "ready" : "not ready");
         printf("  Pending commands:    %lu/%lu\n",
                (unsigned long)status.pending_commands,
@@ -2106,6 +2205,88 @@ static int cmd_lastfm(int argc, char **argv)
         }
 
         printf("Last.fm session cleared.\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "scrobble") == 0)
+    {
+        lastfm_service_status_t status = {0};
+
+        lastfm_service_get_status(&status);
+        if (argc == 2)
+        {
+            printf("Last.fm scrobbling is %s\n", status.scrobbling_enabled ? "on" : "off");
+            return 0;
+        }
+
+        if (argc != 3)
+        {
+            printf("Usage: lastfm scrobble [on|off]\n");
+            return 1;
+        }
+
+        if (strcmp(argv[2], "on") == 0)
+        {
+            err = lastfm_service_set_scrobbling_enabled(true);
+        }
+        else if (strcmp(argv[2], "off") == 0)
+        {
+            err = lastfm_service_set_scrobbling_enabled(false);
+        }
+        else
+        {
+            printf("Usage: lastfm scrobble [on|off]\n");
+            return 1;
+        }
+
+        if (err != ESP_OK)
+        {
+            printf("Failed to update Last.fm scrobbling: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        printf("Last.fm scrobbling %s\n", strcmp(argv[2], "on") == 0 ? "enabled" : "disabled");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "nowplaying") == 0)
+    {
+        lastfm_service_status_t status = {0};
+
+        lastfm_service_get_status(&status);
+        if (argc == 2)
+        {
+            printf("Last.fm now-playing is %s\n", status.now_playing_enabled ? "on" : "off");
+            return 0;
+        }
+
+        if (argc != 3)
+        {
+            printf("Usage: lastfm nowplaying [on|off]\n");
+            return 1;
+        }
+
+        if (strcmp(argv[2], "on") == 0)
+        {
+            err = lastfm_service_set_now_playing_enabled(true);
+        }
+        else if (strcmp(argv[2], "off") == 0)
+        {
+            err = lastfm_service_set_now_playing_enabled(false);
+        }
+        else
+        {
+            printf("Usage: lastfm nowplaying [on|off]\n");
+            return 1;
+        }
+
+        if (err != ESP_OK)
+        {
+            printf("Failed to update Last.fm now-playing: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        printf("Last.fm now-playing %s\n", strcmp(argv[2], "on") == 0 ? "enabled" : "disabled");
         return 0;
     }
 
@@ -2516,9 +2697,6 @@ esp_err_t console_service_init(void)
     s_bt_audio_args.end = arg_end(1);
     s_bt_media_key_args.key = arg_str1(NULL, NULL, "<key>", "Media key name or AVRCP passthrough code");
     s_bt_media_key_args.end = arg_end(1);
-    s_connect_args.ssid = arg_str1(NULL, NULL, "<ssid>", "SSID of the AP");
-    s_connect_args.password = arg_str0(NULL, NULL, "<password>", "Password (optional for open networks)");
-    s_connect_args.end = arg_end(2);
     s_autoreconnect_args.action = arg_str0(NULL, NULL, "<on|off>", "Enable or disable");
     s_autoreconnect_args.end = arg_end(1);
     s_audio_output_args.target = arg_str0(NULL, NULL, "<status|i2s|a2dp>", "Get status or switch audio output target");
@@ -2541,7 +2719,7 @@ esp_err_t console_service_init(void)
     /* WiFi command group */
     const esp_console_cmd_t wifi_cmd = {
         .command = "wifi",
-        .help = "WiFi: wifi <connect|disconnect|scan|status|autoreconnect> [args]",
+        .help = "WiFi: wifi <save|connect|disconnect|reconnect|list|scan|status|autoreconnect> [args]",
         .hint = NULL,
         .func = cmd_wifi,
     };
@@ -2584,7 +2762,7 @@ esp_err_t console_service_init(void)
 
     const esp_console_cmd_t lastfm_cmd = {
         .command = "lastfm",
-        .help = "Last.fm commands: lastfm <status|url <proxy_url>|token|auth [proxy_url] <username> <password>|logout>",
+        .help = "Last.fm commands: lastfm <status|url <proxy_url>|token|auth [proxy_url] <username> <password>|logout|scrobble [on|off]|nowplaying [on|off]>",
         .hint = NULL,
         .func = cmd_lastfm,
     };

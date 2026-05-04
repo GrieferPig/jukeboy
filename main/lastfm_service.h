@@ -19,6 +19,9 @@ extern "C"
         bool has_token;
         bool has_session;
         bool busy;
+        bool scrobbling_enabled;
+        bool now_playing_enabled;
+        bool now_playing_active;
         bool command_queue_ready;
         bool scrobble_queue_ready;
         uint32_t pending_commands;
@@ -37,6 +40,8 @@ extern "C"
     esp_err_t lastfm_service_request_token(void);
     esp_err_t lastfm_service_logout(void);
     esp_err_t lastfm_service_send_scrobble(uint32_t album_checksum, uint32_t track_index);
+    esp_err_t lastfm_service_set_scrobbling_enabled(bool enabled);
+    esp_err_t lastfm_service_set_now_playing_enabled(bool enabled);
     void lastfm_service_get_status(lastfm_service_status_t *status);
 
 #ifdef __cplusplus

@@ -8,8 +8,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_tls.h"
 #include "esp_http_client.h"
 #include "nvs.h"
@@ -17,7 +19,9 @@
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
 #include "jukeboy_formats.h"
+#include "player_service.h"
 #include "play_history_service.h"
+#include "wifi_service.h"
 
 #define LASTFM_SERVICE_TASK_STACK_SIZE 8192
 #define LASTFM_SERVICE_TASK_PRIORITY 3
@@ -28,6 +32,8 @@
 #define LASTFM_SERVICE_NVS_TOKEN_KEY "token"
 #define LASTFM_SERVICE_NVS_SESSION_KEY_KEY "sk"
 #define LASTFM_SERVICE_NVS_USERNAME_KEY "username"
+#define LASTFM_SERVICE_NVS_SCROBBLING_ENABLED_KEY "scrobble_en"
+#define LASTFM_SERVICE_NVS_NOW_PLAYING_ENABLED_KEY "nowplay_en"
 #define LASTFM_SERVICE_AUTH_URL_MAX_LEN LASTFM_SERVICE_BASE_URL_MAX_LEN
 #define LASTFM_SERVICE_TOKEN_MAX_LEN 127
 #define LASTFM_SERVICE_SESSION_KEY_MAX_LEN 127
@@ -36,10 +42,15 @@
 #define LASTFM_SERVICE_SCROBBLE_RATE_LIMIT_REQUESTS 3
 #define LASTFM_SERVICE_SCROBBLE_RATE_LIMIT_WINDOW_MS 10000
 #define LASTFM_SERVICE_SCROBBLE_RETRY_DELAY_MS 1000
+#define LASTFM_SERVICE_SCROBBLE_QUEUE_MUTEX_TIMEOUT_MS 50
+#define LASTFM_SERVICE_OFFLINE_POLL_MS 1000
+#define LASTFM_SERVICE_NOW_PLAYING_DELAY_MS 10000
+#define LASTFM_SERVICE_PAUSE_CLEAR_DELAY_MS 10000
 
 #define LASTFM_SERVICE_URL_GET_TOKEN_PATH "/lastfm/auth.getToken"
 #define LASTFM_SERVICE_URL_GET_MOBILE_SESSION_PATH "/lastfm/auth.getMobileSession"
 #define LASTFM_SERVICE_URL_SCROBBLE_PATH "/lastfm/track.scrobble"
+#define LASTFM_SERVICE_URL_UPDATE_NOW_PLAYING_PATH "/lastfm/track.updateNowPlaying"
 
 static const char *TAG = "lastfm_service";
 
@@ -52,17 +63,32 @@ static bool has_auth = false;
 static bool has_token = false;
 static bool has_session = false;
 static bool lastfm_busy = false;
+static bool lastfm_scrobbling_enabled = true;
+static bool lastfm_now_playing_enabled = true;
 static uint32_t lastfm_successful_scrobbles = 0;
 static uint32_t lastfm_failed_scrobbles = 0;
 
 QueueHandle_t lastfm_cmd_scrobble_queue = NULL;
 QueueHandle_t lastfm_cmd_queue = NULL;
 static QueueSetHandle_t lastfm_queue_set = NULL;
+static SemaphoreHandle_t lastfm_scrobble_queue_mutex = NULL;
 
 static nvs_handle_t lastfm_nvs_handle;
 static TickType_t lastfm_scrobble_request_ticks[LASTFM_SERVICE_SCROBBLE_RATE_LIMIT_REQUESTS] = {0};
 static size_t lastfm_scrobble_request_count = 0;
 static size_t lastfm_scrobble_request_next_index = 0;
+static esp_timer_handle_t lastfm_now_playing_timer;
+static esp_timer_handle_t lastfm_pause_clear_timer;
+
+typedef struct
+{
+    uint32_t album_checksum;
+    uint32_t track_index;
+} lastfm_track_ref_t;
+
+static lastfm_track_ref_t lastfm_now_playing_track = {0};
+static bool lastfm_now_playing_track_valid = false;
+static bool lastfm_now_playing_active = false;
 
 static void lastfm_service_log_error_from_err(const char *prefix, esp_err_t err)
 {
@@ -73,6 +99,102 @@ static void lastfm_service_log_error_from_err(const char *prefix, esp_err_t err)
     }
 
     ESP_LOGE(TAG, "%s", esp_err_to_name(err));
+}
+
+static TickType_t lastfm_service_timeout_ticks(uint32_t timeout_ms)
+{
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+
+    return timeout_ticks == 0 ? 1 : timeout_ticks;
+}
+
+static bool lastfm_service_has_internet(void)
+{
+    return wifi_service_has_internet();
+}
+
+static const char *lastfm_service_enabled_state(bool enabled)
+{
+    return enabled ? "enabled" : "disabled";
+}
+
+static bool lastfm_service_lock_scrobble_queue(void)
+{
+    if (!lastfm_scrobble_queue_mutex)
+    {
+        return false;
+    }
+
+    return xSemaphoreTake(lastfm_scrobble_queue_mutex,
+                          lastfm_service_timeout_ticks(LASTFM_SERVICE_SCROBBLE_QUEUE_MUTEX_TIMEOUT_MS)) == pdTRUE;
+}
+
+static void lastfm_service_unlock_scrobble_queue(void)
+{
+    if (lastfm_scrobble_queue_mutex)
+    {
+        xSemaphoreGive(lastfm_scrobble_queue_mutex);
+    }
+}
+
+static esp_err_t lastfm_service_require_internet_connection(const char *operation)
+{
+    if (lastfm_service_has_internet())
+    {
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG,
+             "Cannot %s: internet is not available",
+             operation && operation[0] != '\0' ? operation : "perform Last.fm request");
+    return ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t lastfm_service_store_enabled_flag(const char *key, bool enabled)
+{
+    nvs_handle_t handle;
+    esp_err_t err;
+
+    if (!key)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = nvs_open(LASTFM_SERVICE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = nvs_set_i32(handle, key, enabled ? 1 : 0);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+    return err;
+}
+
+static bool lastfm_service_track_ref_equal(const lastfm_track_ref_t *lhs,
+                                           const lastfm_track_ref_t *rhs)
+{
+    return lhs && rhs &&
+           lhs->album_checksum == rhs->album_checksum &&
+           lhs->track_index == rhs->track_index;
+}
+
+static bool lastfm_service_track_ref_from_player_event(const player_service_track_event_t *event,
+                                                       lastfm_track_ref_t *track_ref)
+{
+    if (!event || !track_ref)
+    {
+        return false;
+    }
+
+    track_ref->album_checksum = event->cartridge_checksum;
+    track_ref->track_index = event->track_index;
+    return true;
 }
 
 static void lastfm_service_on_listen_count_incremented(const play_history_listen_count_event_t *event,
@@ -230,6 +352,12 @@ static esp_err_t lastfm_service_normalize_base_url(const char *base_url,
 
 static void lastfm_service_cleanup_queues(void)
 {
+    if (lastfm_scrobble_queue_mutex)
+    {
+        vSemaphoreDelete(lastfm_scrobble_queue_mutex);
+        lastfm_scrobble_queue_mutex = NULL;
+    }
+
     if (lastfm_queue_set)
     {
         if (lastfm_cmd_queue)
@@ -264,6 +392,8 @@ typedef enum
     LASTFM_CMD_AUTH,
     LASTFM_CMD_SCROBBLE,
     LASTFM_CMD_LOGOUT,
+    LASTFM_CMD_UPDATE_NOW_PLAYING,
+    LASTFM_CMD_CLEAR_NOW_PLAYING,
 } lastfm_cmd_t;
 typedef struct
 {
@@ -272,11 +402,7 @@ typedef struct
 } lastfm_cmd_auth_t;
 
 // For track info we query from persisted track database in play_history_service to save memory
-typedef struct
-{
-    uint32_t album_checksum;
-    uint32_t track_index;
-} lastfm_cmd_scrobble_t;
+typedef lastfm_track_ref_t lastfm_cmd_scrobble_t;
 
 typedef struct
 {
@@ -284,7 +410,8 @@ typedef struct
     union
     {
         lastfm_cmd_auth_t auth;
-    } *data;
+        lastfm_track_ref_t track;
+    } data;
 } lastfm_cmd_payload_t;
 
 typedef struct
@@ -293,7 +420,7 @@ typedef struct
     lastfm_cmd_scrobble_t scrobble;
 } lastfm_cmd_scrobble_payload_t;
 
-static void lastfm_service_wait_for_scrobble_rate_limit(void)
+static void lastfm_service_wait_for_request_rate_limit(void)
 {
     const TickType_t window_ticks = pdMS_TO_TICKS(LASTFM_SERVICE_SCROBBLE_RATE_LIMIT_WINDOW_MS);
     TickType_t now;
@@ -321,7 +448,7 @@ static void lastfm_service_wait_for_scrobble_rate_limit(void)
     vTaskDelay(wait_ticks);
 }
 
-static void lastfm_service_record_scrobble_request(void)
+static void lastfm_service_record_request(void)
 {
     lastfm_scrobble_request_ticks[lastfm_scrobble_request_next_index] = xTaskGetTickCount();
     lastfm_scrobble_request_next_index =
@@ -344,6 +471,9 @@ void lastfm_service_get_status(lastfm_service_status_t *status)
     status->has_token = has_token;
     status->has_session = has_session;
     status->busy = lastfm_busy;
+    status->scrobbling_enabled = lastfm_scrobbling_enabled;
+    status->now_playing_enabled = lastfm_now_playing_enabled;
+    status->now_playing_active = lastfm_now_playing_active;
     status->command_queue_ready = (lastfm_cmd_queue != NULL);
     status->scrobble_queue_ready = (lastfm_cmd_scrobble_queue != NULL);
     status->command_queue_capacity = LASTFM_SERVICE_CMD_QUEUE_LENGTH;
@@ -364,6 +494,260 @@ void lastfm_service_get_status(lastfm_service_status_t *status)
     status->auth_url[sizeof(status->auth_url) - 1] = '\0';
     strncpy(status->username, lastfm_username, sizeof(status->username) - 1);
     status->username[sizeof(status->username) - 1] = '\0';
+}
+
+static esp_err_t lastfm_service_enqueue_command(const lastfm_cmd_payload_t *payload)
+{
+    if (!payload || !lastfm_cmd_queue)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return xQueueSend(lastfm_cmd_queue, payload, 0) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static void lastfm_service_stop_timer(esp_timer_handle_t timer_handle)
+{
+    esp_err_t err;
+
+    if (!timer_handle)
+    {
+        return;
+    }
+
+    err = esp_timer_stop(timer_handle);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGW(TAG, "failed to stop timer: %s", esp_err_to_name(err));
+    }
+}
+
+static esp_err_t lastfm_service_start_timer_once(esp_timer_handle_t timer_handle,
+                                                 uint32_t delay_ms)
+{
+    esp_err_t err;
+
+    if (!timer_handle)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    lastfm_service_stop_timer(timer_handle);
+    err = esp_timer_start_once(timer_handle, (uint64_t)delay_ms * 1000ULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to start timer: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+static void lastfm_service_reset_now_playing_state(void)
+{
+    memset(&lastfm_now_playing_track, 0, sizeof(lastfm_now_playing_track));
+    lastfm_now_playing_track_valid = false;
+    lastfm_now_playing_active = false;
+}
+
+static void lastfm_service_now_playing_timer_cb(void *arg)
+{
+    lastfm_cmd_payload_t payload;
+
+    (void)arg;
+
+    if (!lastfm_now_playing_track_valid)
+    {
+        return;
+    }
+
+    memset(&payload, 0, sizeof(payload));
+    payload.cmd = LASTFM_CMD_UPDATE_NOW_PLAYING;
+    payload.data.track = lastfm_now_playing_track;
+    if (lastfm_service_enqueue_command(&payload) != ESP_OK)
+    {
+        ESP_LOGW(TAG,
+                 "failed to queue now-playing update checksum=0x%08lx track=%lu",
+                 (unsigned long)payload.data.track.album_checksum,
+                 (unsigned long)payload.data.track.track_index);
+    }
+}
+
+static void lastfm_service_pause_clear_timer_cb(void *arg)
+{
+    lastfm_cmd_payload_t payload;
+
+    (void)arg;
+
+    if (!lastfm_now_playing_track_valid)
+    {
+        return;
+    }
+
+    memset(&payload, 0, sizeof(payload));
+    payload.cmd = LASTFM_CMD_CLEAR_NOW_PLAYING;
+    payload.data.track = lastfm_now_playing_track;
+    if (lastfm_service_enqueue_command(&payload) != ESP_OK)
+    {
+        ESP_LOGW(TAG,
+                 "failed to queue now-playing clear checksum=0x%08lx track=%lu",
+                 (unsigned long)payload.data.track.album_checksum,
+                 (unsigned long)payload.data.track.track_index);
+    }
+}
+
+static esp_err_t lastfm_service_init_timers(void)
+{
+    esp_err_t err;
+    esp_timer_create_args_t now_playing_timer_args = {
+        .callback = lastfm_service_now_playing_timer_cb,
+        .arg = NULL,
+        .name = "lfm_now_play",
+    };
+    esp_timer_create_args_t pause_clear_timer_args = {
+        .callback = lastfm_service_pause_clear_timer_cb,
+        .arg = NULL,
+        .name = "lfm_pause",
+    };
+
+    if (!lastfm_now_playing_timer)
+    {
+        err = esp_timer_create(&now_playing_timer_args, &lastfm_now_playing_timer);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    if (!lastfm_pause_clear_timer)
+    {
+        err = esp_timer_create(&pause_clear_timer_args, &lastfm_pause_clear_timer);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static void lastfm_service_handle_track_started_event(const player_service_track_event_t *event)
+{
+    lastfm_track_ref_t track_ref;
+    bool same_track;
+    bool is_resume;
+
+    if (!lastfm_now_playing_enabled)
+    {
+        lastfm_service_stop_timer(lastfm_now_playing_timer);
+        lastfm_service_stop_timer(lastfm_pause_clear_timer);
+        lastfm_service_reset_now_playing_state();
+        ESP_LOGI(TAG, "ignoring now-playing start event while now-playing is disabled");
+        return;
+    }
+
+    if (!lastfm_service_track_ref_from_player_event(event, &track_ref))
+    {
+        lastfm_service_stop_timer(lastfm_now_playing_timer);
+        lastfm_service_stop_timer(lastfm_pause_clear_timer);
+        lastfm_service_reset_now_playing_state();
+        ESP_LOGI(TAG, "cleared now-playing state due to missing track context");
+        return;
+    }
+
+    same_track = lastfm_now_playing_track_valid &&
+                 lastfm_service_track_ref_equal(&lastfm_now_playing_track, &track_ref);
+    is_resume = event && event->playback_position_sec > 0;
+
+    lastfm_service_stop_timer(lastfm_pause_clear_timer);
+    if (same_track && lastfm_now_playing_active && is_resume)
+    {
+        ESP_LOGI(TAG,
+                 "keeping now-playing active on resume checksum=0x%08lx track=%lu",
+                 (unsigned long)track_ref.album_checksum,
+                 (unsigned long)track_ref.track_index);
+        return;
+    }
+
+    lastfm_service_stop_timer(lastfm_now_playing_timer);
+    lastfm_now_playing_track = track_ref;
+    lastfm_now_playing_track_valid = true;
+    lastfm_now_playing_active = false;
+    (void)lastfm_service_start_timer_once(lastfm_now_playing_timer,
+                                          LASTFM_SERVICE_NOW_PLAYING_DELAY_MS);
+    ESP_LOGI(TAG,
+             "%s now-playing update in %u ms for checksum=0x%08lx track=%lu",
+             is_resume ? "scheduled resumed" : "scheduled",
+             (unsigned)LASTFM_SERVICE_NOW_PLAYING_DELAY_MS,
+             (unsigned long)track_ref.album_checksum,
+             (unsigned long)track_ref.track_index);
+}
+
+static void lastfm_service_handle_track_paused_event(const player_service_track_event_t *event)
+{
+    lastfm_track_ref_t track_ref;
+
+    lastfm_service_stop_timer(lastfm_now_playing_timer);
+    if (!lastfm_now_playing_enabled)
+    {
+        lastfm_service_stop_timer(lastfm_pause_clear_timer);
+        lastfm_service_reset_now_playing_state();
+        ESP_LOGI(TAG, "ignoring now-playing pause event while now-playing is disabled");
+        return;
+    }
+
+    if (lastfm_service_track_ref_from_player_event(event, &track_ref))
+    {
+        lastfm_now_playing_track = track_ref;
+        lastfm_now_playing_track_valid = true;
+    }
+
+    if (lastfm_now_playing_active)
+    {
+        (void)lastfm_service_start_timer_once(lastfm_pause_clear_timer,
+                                              LASTFM_SERVICE_PAUSE_CLEAR_DELAY_MS);
+        ESP_LOGI(TAG,
+                 "scheduled local now-playing clear in %u ms for checksum=0x%08lx track=%lu",
+                 (unsigned)LASTFM_SERVICE_PAUSE_CLEAR_DELAY_MS,
+                 (unsigned long)lastfm_now_playing_track.album_checksum,
+                 (unsigned long)lastfm_now_playing_track.track_index);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "canceled pending now-playing update because playback paused");
+    }
+}
+
+static void lastfm_service_handle_track_finished_event(const player_service_track_event_t *event)
+{
+    (void)event;
+
+    lastfm_service_stop_timer(lastfm_now_playing_timer);
+    lastfm_service_stop_timer(lastfm_pause_clear_timer);
+    lastfm_service_reset_now_playing_state();
+    ESP_LOGI(TAG, "cleared now-playing state because playback finished or session was reset");
+}
+
+static void lastfm_service_on_player_event(void *handler_arg,
+                                           esp_event_base_t event_base,
+                                           int32_t event_id,
+                                           void *event_data)
+{
+    (void)handler_arg;
+    (void)event_base;
+
+    switch (event_id)
+    {
+    case PLAYER_SVC_EVENT_TRACK_STARTED:
+        lastfm_service_handle_track_started_event((const player_service_track_event_t *)event_data);
+        break;
+    case PLAYER_SVC_EVENT_TRACK_PAUSED:
+        lastfm_service_handle_track_paused_event((const player_service_track_event_t *)event_data);
+        break;
+    case PLAYER_SVC_EVENT_TRACK_FINISHED:
+        lastfm_service_handle_track_finished_event((const player_service_track_event_t *)event_data);
+        break;
+    default:
+        break;
+    }
 }
 
 static bool lastfm_service_lookup_scrobble_track(uint32_t album_checksum,
@@ -408,15 +792,101 @@ static bool lastfm_service_lookup_scrobble_track(uint32_t album_checksum,
     return false;
 }
 
+static esp_err_t lastfm_service_resolve_track_metadata(const lastfm_track_ref_t *track_ref,
+                                                       play_history_track_record_t *track_record,
+                                                       play_history_album_record_t *album_record,
+                                                       const char **artist_out,
+                                                       const char **track_name_out)
+{
+    const char *artist;
+    const char *track_name;
+
+    if (!track_ref || !track_record || !album_record || !artist_out || !track_name_out)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!lastfm_service_lookup_scrobble_track(track_ref->album_checksum,
+                                              track_ref->track_index,
+                                              track_record,
+                                              album_record))
+    {
+        ESP_LOGW(TAG,
+                 "failed to resolve track metadata checksum=0x%08lx track=%lu",
+                 (unsigned long)track_ref->album_checksum,
+                 (unsigned long)track_ref->track_index);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    track_name = track_record->metadata.track_name;
+    artist = track_record->metadata.artists[0] != '\0'
+                 ? track_record->metadata.artists
+                 : album_record->metadata.artist;
+    if (track_name[0] == '\0' || artist[0] == '\0')
+    {
+        ESP_LOGW(TAG,
+                 "track metadata missing artist or track checksum=0x%08lx track=%lu",
+                 (unsigned long)track_ref->album_checksum,
+                 (unsigned long)track_ref->track_index);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    *artist_out = artist;
+    *track_name_out = track_name;
+    return ESP_OK;
+}
+
 static void lastfm_service_requeue_scrobble(const lastfm_cmd_scrobble_payload_t *payload, esp_err_t err)
 {
+    lastfm_cmd_scrobble_payload_t dropped_payload;
+
     if (!payload)
     {
         return;
     }
 
+    if (!lastfm_cmd_scrobble_queue || !lastfm_scrobble_queue_mutex)
+    {
+        ESP_LOGE(TAG,
+                 "failed to requeue scrobble checksum=0x%08lx track=%lu after error %s: queue is not ready",
+                 (unsigned long)payload->scrobble.album_checksum,
+                 (unsigned long)payload->scrobble.track_index,
+                 esp_err_to_name(err));
+        return;
+    }
+
+    if (!lastfm_service_lock_scrobble_queue())
+    {
+        ESP_LOGE(TAG,
+                 "failed to requeue scrobble checksum=0x%08lx track=%lu after error %s: mutex timeout",
+                 (unsigned long)payload->scrobble.album_checksum,
+                 (unsigned long)payload->scrobble.track_index,
+                 esp_err_to_name(err));
+        return;
+    }
+
     if (xQueueSendToFront(lastfm_cmd_scrobble_queue, payload, 0) != pdTRUE)
     {
+        if (xQueueReceive(lastfm_cmd_scrobble_queue, &dropped_payload, 0) == pdTRUE &&
+            xQueueSendToFront(lastfm_cmd_scrobble_queue, payload, 0) == pdTRUE)
+        {
+            lastfm_service_unlock_scrobble_queue();
+            ESP_LOGW(TAG,
+                     "dropped oldest queued scrobble checksum=0x%08lx track=%lu while requeueing failed scrobble checksum=0x%08lx track=%lu",
+                     (unsigned long)dropped_payload.scrobble.album_checksum,
+                     (unsigned long)dropped_payload.scrobble.track_index,
+                     (unsigned long)payload->scrobble.album_checksum,
+                     (unsigned long)payload->scrobble.track_index);
+            ESP_LOGW(TAG,
+                     "requeued scrobble checksum=0x%08lx track=%lu after error %s",
+                     (unsigned long)payload->scrobble.album_checksum,
+                     (unsigned long)payload->scrobble.track_index,
+                     esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(LASTFM_SERVICE_SCROBBLE_RETRY_DELAY_MS));
+            return;
+        }
+
+        lastfm_service_unlock_scrobble_queue();
         ESP_LOGE(TAG,
                  "failed to requeue scrobble checksum=0x%08lx track=%lu after error %s",
                  (unsigned long)payload->scrobble.album_checksum,
@@ -425,12 +895,239 @@ static void lastfm_service_requeue_scrobble(const lastfm_cmd_scrobble_payload_t 
         return;
     }
 
+    lastfm_service_unlock_scrobble_queue();
+
     ESP_LOGW(TAG,
              "requeued scrobble checksum=0x%08lx track=%lu after error %s",
              (unsigned long)payload->scrobble.album_checksum,
              (unsigned long)payload->scrobble.track_index,
              esp_err_to_name(err));
     vTaskDelay(pdMS_TO_TICKS(LASTFM_SERVICE_SCROBBLE_RETRY_DELAY_MS));
+}
+
+static esp_err_t lastfm_service_receive_scrobble(lastfm_cmd_scrobble_payload_t *payload)
+{
+    BaseType_t queue_result;
+
+    if (!payload)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!lastfm_cmd_scrobble_queue || !lastfm_scrobble_queue_mutex)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!lastfm_service_lock_scrobble_queue())
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    queue_result = xQueueReceive(lastfm_cmd_scrobble_queue, payload, 0);
+    lastfm_service_unlock_scrobble_queue();
+
+    return queue_result == pdTRUE ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t lastfm_update_now_playing(const char *artist, const char *track)
+{
+    char url[256];
+    cJSON *root = NULL;
+    char *post_data = NULL;
+    esp_http_client_handle_t http_client = NULL;
+    esp_err_t err;
+
+    lastfm_busy = true;
+
+    if (!has_auth || !has_session)
+    {
+        ESP_LOGW(TAG, "Cannot update Last.fm now playing: missing auth URL or session key");
+        lastfm_busy = false;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    root = cJSON_CreateObject();
+    if (!root)
+    {
+        lastfm_busy = false;
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "sk", session_key);
+    cJSON_AddStringToObject(root, "artist", artist);
+    cJSON_AddStringToObject(root, "track", track);
+
+    post_data = cJSON_PrintUnformatted(root);
+    if (!post_data)
+    {
+        cJSON_Delete(root);
+        lastfm_busy = false;
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(url, sizeof(url), "%s%s", auth_url, LASTFM_SERVICE_URL_UPDATE_NOW_PLAYING_PATH);
+
+    esp_http_client_config_t http_client_config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    http_client = esp_http_client_init(&http_client_config);
+    if (!http_client)
+    {
+        free(post_data);
+        cJSON_Delete(root);
+        lastfm_busy = false;
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_header(http_client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(http_client, post_data, strlen(post_data));
+
+    err = esp_http_client_perform(http_client);
+    if (err == ESP_OK)
+    {
+        int status_code = esp_http_client_get_status_code(http_client);
+        ESP_LOGI(TAG, "Now-playing update sent. HTTP Status: %d", status_code);
+        if (status_code != 200)
+        {
+            ESP_LOGE(TAG, "track.updateNowPlaying returned HTTP status %d", status_code);
+            err = ESP_FAIL;
+        }
+    }
+    else
+    {
+        lastfm_service_log_error_from_err("track.updateNowPlaying request failed", err);
+    }
+
+    esp_http_client_cleanup(http_client);
+    cJSON_Delete(root);
+    free(post_data);
+    lastfm_busy = false;
+    return err;
+}
+
+static esp_err_t lastfm_service_process_now_playing_track(const lastfm_track_ref_t *track_ref)
+{
+    play_history_track_record_t track_record;
+    play_history_album_record_t album_record;
+    const char *artist;
+    const char *track_name;
+    esp_err_t err;
+
+    if (!track_ref)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!lastfm_now_playing_enabled)
+    {
+        ESP_LOGI(TAG,
+                 "consumed now-playing update without sending checksum=0x%08lx track=%lu because now-playing is disabled",
+                 (unsigned long)track_ref->album_checksum,
+                 (unsigned long)track_ref->track_index);
+        return ESP_OK;
+    }
+
+    if (!lastfm_now_playing_track_valid ||
+        !lastfm_service_track_ref_equal(track_ref, &lastfm_now_playing_track) ||
+        lastfm_now_playing_active)
+    {
+        return ESP_OK;
+    }
+
+    err = lastfm_service_require_internet_connection("update Last.fm now playing");
+    if (err != ESP_OK)
+    {
+        ESP_LOGI(TAG,
+                 "consumed now-playing update without sending checksum=0x%08lx track=%lu because internet is unavailable",
+                 (unsigned long)track_ref->album_checksum,
+                 (unsigned long)track_ref->track_index);
+        return ESP_OK;
+    }
+
+    err = lastfm_service_resolve_track_metadata(track_ref,
+                                                &track_record,
+                                                &album_record,
+                                                &artist,
+                                                &track_name);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    lastfm_service_wait_for_request_rate_limit();
+    lastfm_service_record_request();
+    err = lastfm_update_now_playing(artist, track_name);
+    if (err == ESP_OK &&
+        lastfm_now_playing_track_valid &&
+        lastfm_service_track_ref_equal(track_ref, &lastfm_now_playing_track))
+    {
+        lastfm_now_playing_active = true;
+        ESP_LOGI(TAG,
+                 "now-playing active for checksum=0x%08lx track=%lu",
+                 (unsigned long)track_ref->album_checksum,
+                 (unsigned long)track_ref->track_index);
+    }
+    return err;
+}
+
+static void lastfm_service_process_now_playing_clear(const lastfm_track_ref_t *track_ref)
+{
+    if (!track_ref ||
+        !lastfm_now_playing_track_valid ||
+        !lastfm_service_track_ref_equal(track_ref, &lastfm_now_playing_track))
+    {
+        return;
+    }
+
+    lastfm_now_playing_active = false;
+    ESP_LOGI(TAG,
+             "cleared local now-playing state after pause timeout checksum=0x%08lx track=%lu",
+             (unsigned long)track_ref->album_checksum,
+             (unsigned long)track_ref->track_index);
+}
+
+static void lastfm_service_process_command(lastfm_cmd_payload_t *cmd_payload)
+{
+    esp_err_t err;
+
+    if (!cmd_payload)
+    {
+        return;
+    }
+
+    switch (cmd_payload->cmd)
+    {
+    case LASTFM_CMD_GET_TOKEN:
+        lastfm_service_request_token();
+        break;
+    case LASTFM_CMD_AUTH:
+        lastfm_service_request_auth(cmd_payload->data.auth.username, cmd_payload->data.auth.password);
+        break;
+    case LASTFM_CMD_LOGOUT:
+        lastfm_service_logout();
+        lastfm_service_handle_track_finished_event(NULL);
+        break;
+    case LASTFM_CMD_UPDATE_NOW_PLAYING:
+        err = lastfm_service_process_now_playing_track(&cmd_payload->data.track);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG,
+                     "failed to process now-playing update checksum=0x%08lx track=%lu: %s",
+                     (unsigned long)cmd_payload->data.track.album_checksum,
+                     (unsigned long)cmd_payload->data.track.track_index,
+                     esp_err_to_name(err));
+        }
+        break;
+    case LASTFM_CMD_CLEAR_NOW_PLAYING:
+        lastfm_service_process_now_playing_clear(&cmd_payload->data.track);
+        break;
+    default:
+        ESP_LOGW(TAG, "Received unknown command: %d", cmd_payload->cmd);
+        break;
+    }
 }
 
 esp_err_t lastfm_service_send_scrobble(uint32_t album_checksum, uint32_t track_index)
@@ -442,17 +1139,50 @@ esp_err_t lastfm_service_send_scrobble(uint32_t album_checksum, uint32_t track_i
             .track_index = track_index,
         },
     };
-    if (!lastfm_cmd_scrobble_queue)
+    lastfm_cmd_scrobble_payload_t dropped_payload;
+
+    if (!lastfm_scrobbling_enabled)
+    {
+        ESP_LOGI(TAG,
+                 "ignoring scrobble checksum=0x%08lx track=%lu because scrobbling is disabled",
+                 (unsigned long)album_checksum,
+                 (unsigned long)track_index);
+        return ESP_OK;
+    }
+
+    if (!lastfm_cmd_scrobble_queue || !lastfm_scrobble_queue_mutex)
     {
         ESP_LOGE(TAG, "Cannot queue Last.fm scrobble: scrobble queue is not ready");
         return ESP_ERR_INVALID_STATE;
     }
-    if (xQueueSend(lastfm_cmd_scrobble_queue, &payload, 0) != pdTRUE)
+
+    if (!lastfm_service_lock_scrobble_queue())
     {
-        ESP_LOGE(TAG, "Cannot queue Last.fm scrobble: scrobble queue is full");
-        return ESP_FAIL;
+        ESP_LOGE(TAG, "Cannot queue Last.fm scrobble: mutex timeout");
+        return ESP_ERR_TIMEOUT;
     }
 
+    if (xQueueSend(lastfm_cmd_scrobble_queue, &payload, 0) != pdTRUE)
+    {
+        if (xQueueReceive(lastfm_cmd_scrobble_queue, &dropped_payload, 0) != pdTRUE ||
+            xQueueSend(lastfm_cmd_scrobble_queue, &payload, 0) != pdTRUE)
+        {
+            lastfm_service_unlock_scrobble_queue();
+            ESP_LOGE(TAG, "Cannot queue Last.fm scrobble: scrobble queue is full");
+            return ESP_FAIL;
+        }
+
+        lastfm_service_unlock_scrobble_queue();
+        ESP_LOGW(TAG,
+                 "dropped oldest queued scrobble checksum=0x%08lx track=%lu to queue checksum=0x%08lx track=%lu",
+                 (unsigned long)dropped_payload.scrobble.album_checksum,
+                 (unsigned long)dropped_payload.scrobble.track_index,
+                 (unsigned long)payload.scrobble.album_checksum,
+                 (unsigned long)payload.scrobble.track_index);
+        return ESP_OK;
+    }
+
+    lastfm_service_unlock_scrobble_queue();
     return ESP_OK;
 }
 
@@ -461,12 +1191,20 @@ esp_err_t lastfm_service_request_token(void)
     lastfm_busy = true;
     bool token_received = false;
     lastfm_http_response_buffer_t response_buffer = {0};
+    esp_err_t err;
 
     if (!has_auth)
     {
         ESP_LOGW(TAG, "Cannot request Last.fm token: missing auth URL");
         lastfm_busy = false;
         return ESP_ERR_INVALID_STATE;
+    }
+
+    err = lastfm_service_require_internet_connection("request Last.fm token");
+    if (err != ESP_OK)
+    {
+        lastfm_busy = false;
+        return err;
     }
 
     char url[256];
@@ -491,7 +1229,7 @@ esp_err_t lastfm_service_request_token(void)
     esp_http_client_set_post_field(client, "{}", 2);
     esp_http_client_set_header(client, "Content-Type", "application/json");
 
-    esp_err_t err = esp_http_client_perform(client);
+    err = esp_http_client_perform(client);
     if (err == ESP_OK && response_buffer.err != ESP_OK)
     {
         err = response_buffer.err;
@@ -702,6 +1440,7 @@ esp_err_t lastfm_service_request_auth(const char *username, const char *password
     lastfm_busy = true;
     bool session_received = false;
     lastfm_http_response_buffer_t response_buffer = {0};
+    esp_err_t err;
 
     if (!has_auth)
     {
@@ -709,6 +1448,14 @@ esp_err_t lastfm_service_request_auth(const char *username, const char *password
         lastfm_busy = false;
         return ESP_ERR_INVALID_STATE;
     }
+
+    err = lastfm_service_require_internet_connection("authenticate with Last.fm");
+    if (err != ESP_OK)
+    {
+        lastfm_busy = false;
+        return err;
+    }
+
     cJSON *root = cJSON_CreateObject();
     if (!root)
     {
@@ -752,7 +1499,7 @@ esp_err_t lastfm_service_request_auth(const char *username, const char *password
     esp_http_client_set_post_field(client, post_data, strlen(post_data));
 
     // 3. Perform the request and handle the response
-    esp_err_t err = esp_http_client_perform(client);
+    err = esp_http_client_perform(client);
     if (err == ESP_OK && response_buffer.err != ESP_OK)
     {
         err = response_buffer.err;
@@ -842,10 +1589,20 @@ static esp_err_t lastfm_service_process_scrobble_payload(const lastfm_cmd_scrobb
     play_history_album_record_t album_record;
     const char *artist;
     const char *track_name;
+    esp_err_t err;
 
     if (!payload)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!lastfm_scrobbling_enabled)
+    {
+        ESP_LOGI(TAG,
+                 "consumed scrobble without sending checksum=0x%08lx track=%lu because scrobbling is disabled",
+                 (unsigned long)payload->scrobble.album_checksum,
+                 (unsigned long)payload->scrobble.track_index);
+        return ESP_OK;
     }
 
     if (!lastfm_service_lookup_scrobble_track(payload->scrobble.album_checksum,
@@ -873,8 +1630,14 @@ static esp_err_t lastfm_service_process_scrobble_payload(const lastfm_cmd_scrobb
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    lastfm_service_wait_for_scrobble_rate_limit();
-    lastfm_service_record_scrobble_request();
+    err = lastfm_service_require_internet_connection("scrobble to Last.fm");
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    lastfm_service_wait_for_request_rate_limit();
+    lastfm_service_record_request();
     return lastfm_scrobble(artist, track_name);
 }
 
@@ -930,8 +1693,44 @@ esp_err_t lastfm_service_logout(void)
     return ESP_OK;
 }
 
+esp_err_t lastfm_service_set_scrobbling_enabled(bool enabled)
+{
+    esp_err_t err = lastfm_service_store_enabled_flag(LASTFM_SERVICE_NVS_SCROBBLING_ENABLED_KEY, enabled);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    lastfm_scrobbling_enabled = enabled;
+    ESP_LOGI(TAG, "Last.fm scrobbling %s", lastfm_service_enabled_state(enabled));
+    return ESP_OK;
+}
+
+esp_err_t lastfm_service_set_now_playing_enabled(bool enabled)
+{
+    esp_err_t err = lastfm_service_store_enabled_flag(LASTFM_SERVICE_NVS_NOW_PLAYING_ENABLED_KEY, enabled);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    lastfm_now_playing_enabled = enabled;
+    if (!enabled)
+    {
+        lastfm_service_stop_timer(lastfm_now_playing_timer);
+        lastfm_service_stop_timer(lastfm_pause_clear_timer);
+        lastfm_service_reset_now_playing_state();
+    }
+    ESP_LOGI(TAG, "Last.fm now-playing %s", lastfm_service_enabled_state(enabled));
+    return ESP_OK;
+}
+
 void lastfm_service_task(void *pvParameters)
 {
+    (void)pvParameters;
+
     // init queues
     lastfm_cmd_queue = xQueueCreateWithCaps(LASTFM_SERVICE_CMD_QUEUE_LENGTH, sizeof(lastfm_cmd_payload_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!lastfm_cmd_queue)
@@ -944,6 +1743,14 @@ void lastfm_service_task(void *pvParameters)
     if (!lastfm_cmd_scrobble_queue)
     {
         ESP_LOGE(TAG, "Failed to create scrobble queue");
+        lastfm_service_cleanup_queues();
+        return;
+    }
+
+    lastfm_scrobble_queue_mutex = xSemaphoreCreateMutex();
+    if (!lastfm_scrobble_queue_mutex)
+    {
+        ESP_LOGE(TAG, "Failed to create scrobble queue mutex");
         lastfm_service_cleanup_queues();
         return;
     }
@@ -1011,6 +1818,37 @@ void lastfm_service_task(void *pvParameters)
         lastfm_service_cleanup_queues();
         return;
     }
+    {
+        int32_t scrobbling_enabled_i32 = 1;
+        int32_t now_playing_enabled_i32 = 1;
+
+        err = nvs_get_i32_or_init(lastfm_nvs_handle,
+                                  LASTFM_SERVICE_NVS_SCROBBLING_ENABLED_KEY,
+                                  &scrobbling_enabled_i32,
+                                  1);
+        if (err != ESP_OK)
+        {
+            lastfm_service_log_error_from_err("failed to load Last.fm scrobbling toggle", err);
+            nvs_close(lastfm_nvs_handle);
+            lastfm_service_cleanup_queues();
+            return;
+        }
+
+        err = nvs_get_i32_or_init(lastfm_nvs_handle,
+                                  LASTFM_SERVICE_NVS_NOW_PLAYING_ENABLED_KEY,
+                                  &now_playing_enabled_i32,
+                                  1);
+        if (err != ESP_OK)
+        {
+            lastfm_service_log_error_from_err("failed to load Last.fm now-playing toggle", err);
+            nvs_close(lastfm_nvs_handle);
+            lastfm_service_cleanup_queues();
+            return;
+        }
+
+        lastfm_scrobbling_enabled = (scrobbling_enabled_i32 != 0);
+        lastfm_now_playing_enabled = (now_playing_enabled_i32 != 0);
+    }
 
     nvs_close(lastfm_nvs_handle);
 
@@ -1018,9 +1856,28 @@ void lastfm_service_task(void *pvParameters)
     has_auth = (auth_url[0] != '\0');
     has_session = (session_key[0] != '\0');
     has_token = (lastfm_token[0] != '\0');
+    ESP_LOGI(TAG,
+             "Last.fm toggles loaded: scrobbling=%s now-playing=%s",
+             lastfm_service_enabled_state(lastfm_scrobbling_enabled),
+             lastfm_service_enabled_state(lastfm_now_playing_enabled));
 
     while (1)
     {
+        if (!lastfm_service_has_internet())
+        {
+            lastfm_cmd_payload_t cmd_payload;
+
+            if (xQueueReceive(lastfm_cmd_queue,
+                              &cmd_payload,
+                              lastfm_service_timeout_ticks(LASTFM_SERVICE_OFFLINE_POLL_MS)) != pdTRUE)
+            {
+                continue;
+            }
+
+            lastfm_service_process_command(&cmd_payload);
+            continue;
+        }
+
         QueueSetMemberHandle_t ready_queue = xQueueSelectFromSet(lastfm_queue_set, portMAX_DELAY);
         if (ready_queue == lastfm_cmd_queue)
         {
@@ -1030,34 +1887,17 @@ void lastfm_service_task(void *pvParameters)
                 continue;
             }
 
-            switch (cmd_payload.cmd)
-            {
-            case LASTFM_CMD_GET_TOKEN:
-                lastfm_service_request_token();
-                break;
-            case LASTFM_CMD_AUTH:
-                if (cmd_payload.data)
-                {
-                    lastfm_service_request_auth(cmd_payload.data->auth.username, cmd_payload.data->auth.password);
-                }
-                break;
-            case LASTFM_CMD_LOGOUT:
-                lastfm_service_logout();
-                break;
-            default:
-                ESP_LOGW(TAG, "Received unknown command: %d", cmd_payload.cmd);
-                break;
-            }
-
-            if (cmd_payload.data)
-            {
-                free(cmd_payload.data);
-            }
+            lastfm_service_process_command(&cmd_payload);
         }
         else if (ready_queue == lastfm_cmd_scrobble_queue)
         {
             lastfm_cmd_scrobble_payload_t scrobble_payload;
-            if (xQueueReceive(lastfm_cmd_scrobble_queue, &scrobble_payload, 0) != pdTRUE)
+            if (!lastfm_service_has_internet())
+            {
+                continue;
+            }
+
+            if (lastfm_service_receive_scrobble(&scrobble_payload) != ESP_OK)
             {
                 continue;
             }
@@ -1083,8 +1923,17 @@ void lastfm_service_task(void *pvParameters)
 
 esp_err_t lastfm_service_init(void)
 {
+    esp_err_t err;
+
     // nvs should be initialized by main
     ESP_LOGI(TAG, "Initializing Last.fm service");
+
+    err = lastfm_service_init_timers();
+    if (err != ESP_OK)
+    {
+        lastfm_service_log_error_from_err("failed to initialize Last.fm now-playing timers", err);
+        return err;
+    }
 
     TaskHandle_t lastfm_service_task_handle;
     xTaskCreatePinnedToCore(
@@ -1101,6 +1950,10 @@ esp_err_t lastfm_service_init(void)
         return ESP_FAIL;
     }
 
+    ESP_ERROR_CHECK(esp_event_handler_register(PLAYER_SERVICE_EVENT,
+                                               ESP_EVENT_ANY_ID,
+                                               lastfm_service_on_player_event,
+                                               NULL));
     play_history_service_register_listen_count_callback(lastfm_service_on_listen_count_incremented,
                                                         NULL);
 
