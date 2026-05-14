@@ -14,7 +14,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-
 SUPPORTED_EXTENSIONS = {
     ".aac",
     ".aif",
@@ -52,6 +51,7 @@ JBM_TAG_BYTES = 32
 JBM_TRACK_NAME_BYTES = 128
 JBM_TRACK_ARTISTS_BYTES = 256
 JBM_FILENAME = "album.jbm"
+COVER_FILENAME = "cover.png"
 
 
 @dataclass
@@ -183,10 +183,15 @@ def require_uint32(value: int, description: str) -> int:
     return value
 
 
-def probe_duration_seconds(ffmpeg: str, input_file: Path) -> int:
+def resolve_ffprobe(ffmpeg: str) -> str | None:
     ffprobe_name = "ffprobe.exe" if Path(ffmpeg).suffix.lower() == ".exe" else "ffprobe"
     ffprobe_path = Path(ffmpeg).with_name(ffprobe_name)
     ffprobe = str(ffprobe_path) if ffprobe_path.is_file() else shutil.which("ffprobe")
+    return ffprobe
+
+
+def probe_duration_seconds(ffmpeg: str, input_file: Path) -> int:
+    ffprobe = resolve_ffprobe(ffmpeg)
     if ffprobe is None:
         return 0
 
@@ -211,6 +216,68 @@ def probe_duration_seconds(ffmpeg: str, input_file: Path) -> int:
         return 0
 
     return max(1, math.ceil(duration)) if duration > 0 else 0
+
+
+def extract_cover_art(ffmpeg: str, input_file: Path, output_path: Path) -> bool:
+    ffprobe = resolve_ffprobe(ffmpeg)
+
+    if ffprobe is not None:
+        probe_command = [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(input_file),
+        ]
+        probe_result = subprocess.run(probe_command, capture_output=True, check=False)
+        if probe_result.returncode != 0 or not probe_result.stdout.strip():
+            return False
+
+    command = [
+        ffmpeg,
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-i",
+        str(input_file),
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        "-an",
+        "-sn",
+        "-dn",
+        "-c:v",
+        "png",
+        str(output_path),
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        if output_path.exists():
+            output_path.unlink()
+        if ffprobe is None and (
+            "matches no streams" in stderr
+            or "Output file does not contain any stream" in stderr
+        ):
+            return False
+        raise RuntimeError(
+            f"ffmpeg failed to extract cover art from {input_file}: {stderr.strip() or 'unknown error'}"
+        )
+
+    return output_path.is_file() and output_path.stat().st_size > 0
 
 
 def iter_ogg_packets(ogg_data: bytes):
@@ -483,6 +550,15 @@ def write_outputs(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     track_infos: list[TrackMetadata] = []
+    cover_path = output_dir / COVER_FILENAME
+
+    if audio_files:
+        if extract_cover_art(ffmpeg, audio_files[0], cover_path):
+            print(f"Wrote cover art: {cover_path}")
+        else:
+            if cover_path.exists():
+                cover_path.unlink()
+            print(f"No embedded cover art found in {audio_files[0]}")
 
     for index, input_file in enumerate(audio_files):
         output_name = f"{index:03d}.jba"

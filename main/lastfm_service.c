@@ -10,6 +10,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_tls.h"
@@ -27,6 +28,11 @@
 #define LASTFM_SERVICE_TASK_PRIORITY 3
 #define LASTFM_SERVICE_TASK_NAME "lastfm"
 #define LASTFM_SERVICE_TASK_CORE 1
+#define LASTFM_SERVICE_STACK_ALLOC_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define LASTFM_SERVICE_NVS_TASK_STACK_SIZE 4096
+#define LASTFM_SERVICE_NVS_TASK_PRIORITY 4
+#define LASTFM_SERVICE_NVS_TASK_NAME "lastfm_nvs"
+#define LASTFM_SERVICE_NVS_QUEUE_LENGTH 4
 #define LASTFM_SERVICE_NVS_NAMESPACE "lastfm"
 #define LASTFM_SERVICE_NVS_AUTH_URL_KEY "auth_url"
 #define LASTFM_SERVICE_NVS_TOKEN_KEY "token"
@@ -67,13 +73,16 @@ static bool lastfm_scrobbling_enabled = true;
 static bool lastfm_now_playing_enabled = true;
 static uint32_t lastfm_successful_scrobbles = 0;
 static uint32_t lastfm_failed_scrobbles = 0;
+static StackType_t *lastfm_task_stack = NULL;
+static StaticTask_t lastfm_task_tcb;
 
 QueueHandle_t lastfm_cmd_scrobble_queue = NULL;
 QueueHandle_t lastfm_cmd_queue = NULL;
 static QueueSetHandle_t lastfm_queue_set = NULL;
 static SemaphoreHandle_t lastfm_scrobble_queue_mutex = NULL;
+static QueueHandle_t lastfm_nvs_cmd_queue = NULL;
+static TaskHandle_t lastfm_nvs_task_handle = NULL;
 
-static nvs_handle_t lastfm_nvs_handle;
 static TickType_t lastfm_scrobble_request_ticks[LASTFM_SERVICE_SCROBBLE_RATE_LIMIT_REQUESTS] = {0};
 static size_t lastfm_scrobble_request_count = 0;
 static size_t lastfm_scrobble_request_next_index = 0;
@@ -91,6 +100,60 @@ typedef struct
     play_history_track_record_t track_record;
     play_history_album_record_t album_record;
 } lastfm_metadata_work_buffer_t;
+
+typedef struct
+{
+    char auth_url[LASTFM_SERVICE_AUTH_URL_MAX_LEN + 1];
+    char token[LASTFM_SERVICE_TOKEN_MAX_LEN + 1];
+    char session_key[LASTFM_SERVICE_SESSION_KEY_MAX_LEN + 1];
+    char username[LASTFM_SERVICE_USERNAME_MAX_LEN + 1];
+    int32_t scrobbling_enabled;
+    int32_t now_playing_enabled;
+} lastfm_nvs_state_t;
+
+typedef enum
+{
+    LASTFM_NVS_CMD_LOAD_STATE,
+    LASTFM_NVS_CMD_STORE_AUTH_URL,
+    LASTFM_NVS_CMD_STORE_TOKEN,
+    LASTFM_NVS_CMD_STORE_SESSION,
+    LASTFM_NVS_CMD_STORE_I32,
+    LASTFM_NVS_CMD_CLEAR_SESSION,
+} lastfm_nvs_cmd_t;
+
+typedef struct
+{
+    char key[NVS_KEY_NAME_MAX_SIZE];
+    int32_t value;
+} lastfm_nvs_i32_write_t;
+
+typedef struct
+{
+    lastfm_nvs_cmd_t cmd;
+    SemaphoreHandle_t completion_sem;
+    esp_err_t *result_out;
+    union
+    {
+        struct
+        {
+            lastfm_nvs_state_t *state_out;
+        } load_state;
+        struct
+        {
+            char value[LASTFM_SERVICE_AUTH_URL_MAX_LEN + 1];
+        } auth_url;
+        struct
+        {
+            char value[LASTFM_SERVICE_TOKEN_MAX_LEN + 1];
+        } token;
+        struct
+        {
+            char session_key[LASTFM_SERVICE_SESSION_KEY_MAX_LEN + 1];
+            char username[LASTFM_SERVICE_USERNAME_MAX_LEN + 1];
+        } session;
+        lastfm_nvs_i32_write_t i32_write;
+    } data;
+} lastfm_nvs_request_t;
 
 static lastfm_track_ref_t lastfm_now_playing_track = {0};
 static bool lastfm_now_playing_track_valid = false;
@@ -123,6 +186,360 @@ static bool lastfm_service_has_internet(void)
 static const char *lastfm_service_enabled_state(bool enabled)
 {
     return enabled ? "enabled" : "disabled";
+}
+
+static void lastfm_service_copy_string(char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || dst_len == 0)
+    {
+        return;
+    }
+
+    if (!src)
+    {
+        dst[0] = '\0';
+        return;
+    }
+
+    strncpy(dst, src, dst_len - 1);
+    dst[dst_len - 1] = '\0';
+}
+
+static esp_err_t lastfm_service_dispatch_nvs_request(lastfm_nvs_request_t *request)
+{
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    SemaphoreHandle_t completion_sem;
+
+    if (!request || !lastfm_nvs_cmd_queue)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    completion_sem = xSemaphoreCreateBinary();
+    if (!completion_sem)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    request->completion_sem = completion_sem;
+    request->result_out = &result;
+    if (xQueueSend(lastfm_nvs_cmd_queue, request, portMAX_DELAY) != pdPASS)
+    {
+        vSemaphoreDelete(completion_sem);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    xSemaphoreTake(completion_sem, portMAX_DELAY);
+    vSemaphoreDelete(completion_sem);
+    return result;
+}
+
+static esp_err_t lastfm_service_store_token_in_nvs(const char *token)
+{
+    lastfm_nvs_request_t request = {
+        .cmd = LASTFM_NVS_CMD_STORE_TOKEN,
+    };
+
+    lastfm_service_copy_string(request.data.token.value,
+                               sizeof(request.data.token.value),
+                               token);
+    return lastfm_service_dispatch_nvs_request(&request);
+}
+
+static esp_err_t lastfm_service_store_session_in_nvs(const char *session,
+                                                     const char *username)
+{
+    lastfm_nvs_request_t request = {
+        .cmd = LASTFM_NVS_CMD_STORE_SESSION,
+    };
+
+    lastfm_service_copy_string(request.data.session.session_key,
+                               sizeof(request.data.session.session_key),
+                               session);
+    lastfm_service_copy_string(request.data.session.username,
+                               sizeof(request.data.session.username),
+                               username);
+    return lastfm_service_dispatch_nvs_request(&request);
+}
+
+static esp_err_t lastfm_service_clear_session_in_nvs(void)
+{
+    lastfm_nvs_request_t request = {
+        .cmd = LASTFM_NVS_CMD_CLEAR_SESSION,
+    };
+
+    return lastfm_service_dispatch_nvs_request(&request);
+}
+
+static esp_err_t lastfm_service_load_persisted_state(void)
+{
+    lastfm_nvs_request_t request = {
+        .cmd = LASTFM_NVS_CMD_LOAD_STATE,
+    };
+    lastfm_nvs_state_t persisted_state = {0};
+    esp_err_t err;
+
+    request.data.load_state.state_out = &persisted_state;
+    err = lastfm_service_dispatch_nvs_request(&request);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    lastfm_service_copy_string(auth_url, sizeof(auth_url), persisted_state.auth_url);
+    lastfm_service_copy_string(lastfm_token, sizeof(lastfm_token), persisted_state.token);
+    lastfm_service_copy_string(session_key, sizeof(session_key), persisted_state.session_key);
+    lastfm_service_copy_string(lastfm_username, sizeof(lastfm_username), persisted_state.username);
+    lastfm_scrobbling_enabled = (persisted_state.scrobbling_enabled != 0);
+    lastfm_now_playing_enabled = (persisted_state.now_playing_enabled != 0);
+    has_auth = (auth_url[0] != '\0');
+    has_session = (session_key[0] != '\0');
+    has_token = (lastfm_token[0] != '\0');
+    return ESP_OK;
+}
+
+static void lastfm_service_nvs_respond(const lastfm_nvs_request_t *request, esp_err_t err)
+{
+    if (request && request->result_out)
+    {
+        *request->result_out = err;
+    }
+    if (request && request->completion_sem)
+    {
+        xSemaphoreGive(request->completion_sem);
+    }
+}
+
+static esp_err_t lastfm_service_nvs_erase_key_if_present(nvs_handle_t handle, const char *key)
+{
+    esp_err_t err = nvs_erase_key(handle, key);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+
+    return err;
+}
+
+static esp_err_t lastfm_service_process_nvs_request(const lastfm_nvs_request_t *request)
+{
+    nvs_handle_t handle;
+    esp_err_t err;
+
+    if (!request)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = nvs_open(LASTFM_SERVICE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    switch (request->cmd)
+    {
+    case LASTFM_NVS_CMD_LOAD_STATE:
+        if (!request->data.load_state.state_out)
+        {
+            err = ESP_ERR_INVALID_ARG;
+            break;
+        }
+        else
+        {
+            lastfm_nvs_state_t loaded_state = {0};
+
+            err = nvs_get_str_or_init(handle,
+                                      LASTFM_SERVICE_NVS_AUTH_URL_KEY,
+                                      loaded_state.auth_url,
+                                      sizeof(loaded_state.auth_url),
+                                      "");
+            if (err != ESP_OK)
+            {
+                break;
+            }
+
+            err = nvs_get_str_or_init(handle,
+                                      LASTFM_SERVICE_NVS_SESSION_KEY_KEY,
+                                      loaded_state.session_key,
+                                      sizeof(loaded_state.session_key),
+                                      "");
+            if (err != ESP_OK)
+            {
+                break;
+            }
+
+            err = nvs_get_str_or_init(handle,
+                                      LASTFM_SERVICE_NVS_TOKEN_KEY,
+                                      loaded_state.token,
+                                      sizeof(loaded_state.token),
+                                      "");
+            if (err != ESP_OK)
+            {
+                break;
+            }
+
+            err = nvs_get_str_or_init(handle,
+                                      LASTFM_SERVICE_NVS_USERNAME_KEY,
+                                      loaded_state.username,
+                                      sizeof(loaded_state.username),
+                                      "");
+            if (err != ESP_OK)
+            {
+                break;
+            }
+
+            err = nvs_get_i32_or_init(handle,
+                                      LASTFM_SERVICE_NVS_SCROBBLING_ENABLED_KEY,
+                                      &loaded_state.scrobbling_enabled,
+                                      1);
+            if (err != ESP_OK)
+            {
+                break;
+            }
+
+            err = nvs_get_i32_or_init(handle,
+                                      LASTFM_SERVICE_NVS_NOW_PLAYING_ENABLED_KEY,
+                                      &loaded_state.now_playing_enabled,
+                                      1);
+            if (err != ESP_OK)
+            {
+                break;
+            }
+
+            *request->data.load_state.state_out = loaded_state;
+        }
+        break;
+    case LASTFM_NVS_CMD_STORE_AUTH_URL:
+        err = nvs_set_str(handle,
+                          LASTFM_SERVICE_NVS_AUTH_URL_KEY,
+                          request->data.auth_url.value);
+        if (err == ESP_OK)
+        {
+            err = nvs_commit(handle);
+        }
+        break;
+    case LASTFM_NVS_CMD_STORE_TOKEN:
+        err = nvs_set_str(handle,
+                          LASTFM_SERVICE_NVS_TOKEN_KEY,
+                          request->data.token.value);
+        if (err == ESP_OK)
+        {
+            err = nvs_commit(handle);
+        }
+        break;
+    case LASTFM_NVS_CMD_STORE_SESSION:
+        err = nvs_set_str(handle,
+                          LASTFM_SERVICE_NVS_SESSION_KEY_KEY,
+                          request->data.session.session_key);
+        if (err == ESP_OK)
+        {
+            err = nvs_set_str(handle,
+                              LASTFM_SERVICE_NVS_USERNAME_KEY,
+                              request->data.session.username);
+        }
+        if (err == ESP_OK)
+        {
+            err = nvs_commit(handle);
+        }
+        break;
+    case LASTFM_NVS_CMD_STORE_I32:
+        err = nvs_set_i32(handle,
+                          request->data.i32_write.key,
+                          request->data.i32_write.value);
+        if (err == ESP_OK)
+        {
+            err = nvs_commit(handle);
+        }
+        break;
+    case LASTFM_NVS_CMD_CLEAR_SESSION:
+        err = lastfm_service_nvs_erase_key_if_present(handle, LASTFM_SERVICE_NVS_SESSION_KEY_KEY);
+        if (err == ESP_OK)
+        {
+            err = lastfm_service_nvs_erase_key_if_present(handle, LASTFM_SERVICE_NVS_USERNAME_KEY);
+        }
+        if (err == ESP_OK)
+        {
+            err = lastfm_service_nvs_erase_key_if_present(handle, LASTFM_SERVICE_NVS_TOKEN_KEY);
+        }
+        if (err == ESP_OK)
+        {
+            err = nvs_commit(handle);
+        }
+        break;
+    default:
+        err = ESP_ERR_INVALID_ARG;
+        break;
+    }
+
+    nvs_close(handle);
+    return err;
+}
+
+static void lastfm_service_nvs_task(void *pvParameters)
+{
+    lastfm_nvs_request_t request;
+
+    (void)pvParameters;
+
+    while (1)
+    {
+        if (xQueueReceive(lastfm_nvs_cmd_queue, &request, portMAX_DELAY) != pdTRUE)
+        {
+            continue;
+        }
+
+        lastfm_service_nvs_respond(&request,
+                                   lastfm_service_process_nvs_request(&request));
+    }
+}
+
+static void lastfm_service_cleanup_nvs_proxy(void)
+{
+    if (lastfm_nvs_task_handle)
+    {
+        vTaskDelete(lastfm_nvs_task_handle);
+        lastfm_nvs_task_handle = NULL;
+    }
+
+    if (lastfm_nvs_cmd_queue)
+    {
+        vQueueDelete(lastfm_nvs_cmd_queue);
+        lastfm_nvs_cmd_queue = NULL;
+    }
+}
+
+static esp_err_t lastfm_service_init_nvs_proxy(void)
+{
+    BaseType_t task_created;
+
+    if (lastfm_nvs_cmd_queue && lastfm_nvs_task_handle)
+    {
+        return ESP_OK;
+    }
+
+    lastfm_nvs_cmd_queue = xQueueCreate(LASTFM_SERVICE_NVS_QUEUE_LENGTH,
+                                        sizeof(lastfm_nvs_request_t));
+    if (!lastfm_nvs_cmd_queue)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    task_created = xTaskCreatePinnedToCore(lastfm_service_nvs_task,
+                                           LASTFM_SERVICE_NVS_TASK_NAME,
+                                           LASTFM_SERVICE_NVS_TASK_STACK_SIZE,
+                                           NULL,
+                                           LASTFM_SERVICE_NVS_TASK_PRIORITY,
+                                           &lastfm_nvs_task_handle,
+                                           LASTFM_SERVICE_TASK_CORE);
+    if (task_created != pdPASS || !lastfm_nvs_task_handle)
+    {
+        lastfm_service_cleanup_nvs_proxy();
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 static bool lastfm_service_lock_scrobble_queue(void)
@@ -159,28 +576,20 @@ static esp_err_t lastfm_service_require_internet_connection(const char *operatio
 
 static esp_err_t lastfm_service_store_enabled_flag(const char *key, bool enabled)
 {
-    nvs_handle_t handle;
-    esp_err_t err;
+    lastfm_nvs_request_t request = {
+        .cmd = LASTFM_NVS_CMD_STORE_I32,
+    };
 
     if (!key)
     {
         return ESP_ERR_INVALID_ARG;
     }
 
-    err = nvs_open(LASTFM_SERVICE_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    err = nvs_set_i32(handle, key, enabled ? 1 : 0);
-    if (err == ESP_OK)
-    {
-        err = nvs_commit(handle);
-    }
-
-    nvs_close(handle);
-    return err;
+    lastfm_service_copy_string(request.data.i32_write.key,
+                               sizeof(request.data.i32_write.key),
+                               key);
+    request.data.i32_write.value = enabled ? 1 : 0;
+    return lastfm_service_dispatch_nvs_request(&request);
 }
 
 static bool lastfm_service_track_ref_equal(const lastfm_track_ref_t *lhs,
@@ -511,6 +920,45 @@ static esp_err_t lastfm_service_enqueue_command(const lastfm_cmd_payload_t *payl
     }
 
     return xQueueSend(lastfm_cmd_queue, payload, 0) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t lastfm_service_queue_request_token(void)
+{
+    lastfm_cmd_payload_t payload = {0};
+
+    if (!has_auth)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    payload.cmd = LASTFM_CMD_GET_TOKEN;
+    return lastfm_service_enqueue_command(&payload);
+}
+
+esp_err_t lastfm_service_queue_request_auth(const char *username, const char *password)
+{
+    lastfm_cmd_payload_t payload = {0};
+    esp_err_t err;
+
+    if (!username || !password)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!has_auth)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    payload.cmd = LASTFM_CMD_AUTH;
+    lastfm_service_copy_string(payload.data.auth.username,
+                               sizeof(payload.data.auth.username),
+                               username);
+    lastfm_service_copy_string(payload.data.auth.password,
+                               sizeof(payload.data.auth.password),
+                               password);
+    err = lastfm_service_enqueue_command(&payload);
+    memset(payload.data.auth.password, 0, sizeof(payload.data.auth.password));
+    return err;
 }
 
 static void lastfm_service_stop_timer(esp_timer_handle_t timer_handle)
@@ -1109,6 +1557,7 @@ static void lastfm_service_process_command(lastfm_cmd_payload_t *cmd_payload)
         break;
     case LASTFM_CMD_AUTH:
         lastfm_service_request_auth(cmd_payload->data.auth.username, cmd_payload->data.auth.password);
+        memset(cmd_payload->data.auth.password, 0, sizeof(cmd_payload->data.auth.password));
         break;
     case LASTFM_CMD_LOGOUT:
         lastfm_service_logout();
@@ -1257,13 +1706,17 @@ esp_err_t lastfm_service_request_token(void)
                         has_token = true;
                         token_received = true;
 
-                        nvs_handle_t nvs_h;
-                        if (nvs_open(LASTFM_SERVICE_NVS_NAMESPACE, NVS_READWRITE, &nvs_h) == ESP_OK)
+                        err = lastfm_service_store_token_in_nvs(lastfm_token);
+                        if (err == ESP_OK)
                         {
-                            nvs_set_str(nvs_h, LASTFM_SERVICE_NVS_TOKEN_KEY, lastfm_token);
-                            nvs_commit(nvs_h);
-                            nvs_close(nvs_h);
                             ESP_LOGI(TAG, "Token received and saved: %s", lastfm_token);
+                        }
+                        else
+                        {
+                            ESP_LOGW(TAG,
+                                     "Token received but failed to persist: %s",
+                                     esp_err_to_name(err));
+                            err = ESP_OK;
                         }
                     }
                     cJSON_Delete(resp_json);
@@ -1404,6 +1857,9 @@ static esp_err_t lastfm_scrobble(const char *artist, const char *track)
 esp_err_t lastfm_service_set_auth_url(const char *url)
 {
     char normalized_url[LASTFM_SERVICE_AUTH_URL_MAX_LEN + 1];
+    lastfm_nvs_request_t request = {
+        .cmd = LASTFM_NVS_CMD_STORE_AUTH_URL,
+    };
     esp_err_t err = lastfm_service_normalize_base_url(url, normalized_url, sizeof(normalized_url));
 
     if (err != ESP_OK)
@@ -1412,30 +1868,21 @@ esp_err_t lastfm_service_set_auth_url(const char *url)
         return err;
     }
 
-    err = nvs_open(LASTFM_SERVICE_NVS_NAMESPACE, NVS_READWRITE, &lastfm_nvs_handle);
-    if (err != ESP_OK)
-    {
-        lastfm_service_log_error_from_err("failed to open Last.fm NVS namespace", err);
-        return err;
-    }
-
-    err = nvs_set_str(lastfm_nvs_handle, LASTFM_SERVICE_NVS_AUTH_URL_KEY, normalized_url);
+    lastfm_service_copy_string(request.data.auth_url.value,
+                               sizeof(request.data.auth_url.value),
+                               normalized_url);
+    err = lastfm_service_dispatch_nvs_request(&request);
     if (err == ESP_OK)
     {
-        err = nvs_commit(lastfm_nvs_handle);
-        if (err == ESP_OK)
-        {
-            strncpy(auth_url, normalized_url, sizeof(auth_url) - 1);
-            auth_url[sizeof(auth_url) - 1] = '\0';
-            has_auth = true;
-        }
+        strncpy(auth_url, normalized_url, sizeof(auth_url) - 1);
+        auth_url[sizeof(auth_url) - 1] = '\0';
+        has_auth = true;
     }
     if (err != ESP_OK)
     {
         lastfm_service_log_error_from_err("failed to save Last.fm base URL", err);
     }
 
-    nvs_close(lastfm_nvs_handle);
     return err;
 }
 
@@ -1536,15 +1983,17 @@ esp_err_t lastfm_service_request_auth(const char *username, const char *password
                         has_session = true;
                         session_received = true;
 
-                        // 5. Save to NVS
-                        nvs_handle_t my_handle;
-                        if (nvs_open(LASTFM_SERVICE_NVS_NAMESPACE, NVS_READWRITE, &my_handle) == ESP_OK)
+                        err = lastfm_service_store_session_in_nvs(sk, username);
+                        if (err == ESP_OK)
                         {
-                            nvs_set_str(my_handle, LASTFM_SERVICE_NVS_SESSION_KEY_KEY, sk);
-                            nvs_set_str(my_handle, LASTFM_SERVICE_NVS_USERNAME_KEY, username);
-                            nvs_commit(my_handle);
-                            nvs_close(my_handle);
                             ESP_LOGI(TAG, "Last.fm session key saved to NVS");
+                        }
+                        else
+                        {
+                            ESP_LOGW(TAG,
+                                     "Last.fm session established but failed to persist: %s",
+                                     esp_err_to_name(err));
+                            err = ESP_OK;
                         }
 
                         strncpy(lastfm_username, username, sizeof(lastfm_username) - 1);
@@ -1626,42 +2075,8 @@ static esp_err_t lastfm_service_process_scrobble_payload(const lastfm_cmd_scrobb
 
 esp_err_t lastfm_service_logout(void)
 {
-    esp_err_t err;
+    esp_err_t err = lastfm_service_clear_session_in_nvs();
 
-    err = nvs_open(LASTFM_SERVICE_NVS_NAMESPACE, NVS_READWRITE, &lastfm_nvs_handle);
-    if (err != ESP_OK)
-    {
-        lastfm_service_log_error_from_err("failed to open Last.fm NVS namespace", err);
-        return err;
-    }
-
-    err = nvs_erase_key(lastfm_nvs_handle, LASTFM_SERVICE_NVS_SESSION_KEY_KEY);
-    if (err == ESP_ERR_NVS_NOT_FOUND)
-    {
-        err = ESP_OK;
-    }
-    if (err == ESP_OK)
-    {
-        esp_err_t erase_username_err = nvs_erase_key(lastfm_nvs_handle, LASTFM_SERVICE_NVS_USERNAME_KEY);
-        if (erase_username_err != ESP_OK && erase_username_err != ESP_ERR_NVS_NOT_FOUND)
-        {
-            err = erase_username_err;
-        }
-    }
-    if (err == ESP_OK)
-    {
-        esp_err_t erase_token_err = nvs_erase_key(lastfm_nvs_handle, LASTFM_SERVICE_NVS_TOKEN_KEY);
-        if (erase_token_err != ESP_OK && erase_token_err != ESP_ERR_NVS_NOT_FOUND)
-        {
-            err = erase_token_err;
-        }
-    }
-    if (err == ESP_OK)
-    {
-        err = nvs_commit(lastfm_nvs_handle);
-    }
-
-    nvs_close(lastfm_nvs_handle);
     if (err != ESP_OK)
     {
         lastfm_service_log_error_from_err("failed to clear Last.fm session", err);
@@ -1760,90 +2175,6 @@ void lastfm_service_task(void *pvParameters)
         return;
     }
 
-    esp_err_t err = nvs_open(LASTFM_SERVICE_NVS_NAMESPACE, NVS_READWRITE, &lastfm_nvs_handle);
-    if (err != ESP_OK)
-    {
-        lastfm_service_log_error_from_err("failed to open Last.fm NVS namespace", err);
-        lastfm_service_cleanup_queues();
-        return;
-    }
-
-    // initialize keys if they don't exist
-    err = nvs_get_str_or_init(lastfm_nvs_handle, LASTFM_SERVICE_NVS_AUTH_URL_KEY, auth_url, LASTFM_SERVICE_AUTH_URL_MAX_LEN + 1, "");
-    if (err != ESP_OK)
-    {
-        lastfm_service_log_error_from_err("failed to load Last.fm base URL", err);
-        nvs_close(lastfm_nvs_handle);
-        lastfm_service_cleanup_queues();
-        return;
-    }
-    err = nvs_get_str_or_init(lastfm_nvs_handle, LASTFM_SERVICE_NVS_SESSION_KEY_KEY, session_key, LASTFM_SERVICE_SESSION_KEY_MAX_LEN + 1, "");
-    if (err != ESP_OK)
-    {
-        lastfm_service_log_error_from_err("failed to load Last.fm session key", err);
-        nvs_close(lastfm_nvs_handle);
-        lastfm_service_cleanup_queues();
-        return;
-    }
-    err = nvs_get_str_or_init(lastfm_nvs_handle, LASTFM_SERVICE_NVS_TOKEN_KEY, lastfm_token, LASTFM_SERVICE_TOKEN_MAX_LEN + 1, "");
-    if (err != ESP_OK)
-    {
-        lastfm_service_log_error_from_err("failed to load Last.fm token", err);
-        nvs_close(lastfm_nvs_handle);
-        lastfm_service_cleanup_queues();
-        return;
-    }
-    err = nvs_get_str_or_init(lastfm_nvs_handle, LASTFM_SERVICE_NVS_USERNAME_KEY, lastfm_username, LASTFM_SERVICE_USERNAME_MAX_LEN + 1, "");
-    if (err != ESP_OK)
-    {
-        lastfm_service_log_error_from_err("failed to load Last.fm username", err);
-        nvs_close(lastfm_nvs_handle);
-        lastfm_service_cleanup_queues();
-        return;
-    }
-    {
-        int32_t scrobbling_enabled_i32 = 1;
-        int32_t now_playing_enabled_i32 = 1;
-
-        err = nvs_get_i32_or_init(lastfm_nvs_handle,
-                                  LASTFM_SERVICE_NVS_SCROBBLING_ENABLED_KEY,
-                                  &scrobbling_enabled_i32,
-                                  1);
-        if (err != ESP_OK)
-        {
-            lastfm_service_log_error_from_err("failed to load Last.fm scrobbling toggle", err);
-            nvs_close(lastfm_nvs_handle);
-            lastfm_service_cleanup_queues();
-            return;
-        }
-
-        err = nvs_get_i32_or_init(lastfm_nvs_handle,
-                                  LASTFM_SERVICE_NVS_NOW_PLAYING_ENABLED_KEY,
-                                  &now_playing_enabled_i32,
-                                  1);
-        if (err != ESP_OK)
-        {
-            lastfm_service_log_error_from_err("failed to load Last.fm now-playing toggle", err);
-            nvs_close(lastfm_nvs_handle);
-            lastfm_service_cleanup_queues();
-            return;
-        }
-
-        lastfm_scrobbling_enabled = (scrobbling_enabled_i32 != 0);
-        lastfm_now_playing_enabled = (now_playing_enabled_i32 != 0);
-    }
-
-    nvs_close(lastfm_nvs_handle);
-
-    // Check if auth url and session key are present
-    has_auth = (auth_url[0] != '\0');
-    has_session = (session_key[0] != '\0');
-    has_token = (lastfm_token[0] != '\0');
-    ESP_LOGI(TAG,
-             "Last.fm toggles loaded: scrobbling=%s now-playing=%s",
-             lastfm_service_enabled_state(lastfm_scrobbling_enabled),
-             lastfm_service_enabled_state(lastfm_now_playing_enabled));
-
     while (1)
     {
         if (!lastfm_service_has_internet())
@@ -1918,19 +2249,55 @@ esp_err_t lastfm_service_init(void)
         return err;
     }
 
+    err = lastfm_service_init_nvs_proxy();
+    if (err != ESP_OK)
+    {
+        lastfm_service_log_error_from_err("failed to initialize Last.fm NVS proxy", err);
+        return err;
+    }
+
+    err = lastfm_service_load_persisted_state();
+    if (err != ESP_OK)
+    {
+        lastfm_service_log_error_from_err("failed to load Last.fm persisted state", err);
+        lastfm_service_cleanup_nvs_proxy();
+        return err;
+    }
+
+    ESP_LOGI(TAG,
+             "Last.fm toggles loaded: scrobbling=%s now-playing=%s",
+             lastfm_service_enabled_state(lastfm_scrobbling_enabled),
+             lastfm_service_enabled_state(lastfm_now_playing_enabled));
+
     TaskHandle_t lastfm_service_task_handle;
-    xTaskCreatePinnedToCore(
+    if (lastfm_task_stack == NULL)
+    {
+        lastfm_task_stack = heap_caps_calloc(LASTFM_SERVICE_TASK_STACK_SIZE,
+                                             sizeof(StackType_t),
+                                             LASTFM_SERVICE_STACK_ALLOC_CAPS);
+        if (lastfm_task_stack == NULL)
+        {
+            lastfm_service_cleanup_nvs_proxy();
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    lastfm_service_task_handle = xTaskCreateStaticPinnedToCore(
         lastfm_service_task,
         LASTFM_SERVICE_TASK_NAME,
         LASTFM_SERVICE_TASK_STACK_SIZE,
         NULL,
         LASTFM_SERVICE_TASK_PRIORITY,
-        &lastfm_service_task_handle,
+        lastfm_task_stack,
+        &lastfm_task_tcb,
         LASTFM_SERVICE_TASK_CORE);
 
     if (lastfm_service_task_handle == NULL)
     {
-        return ESP_FAIL;
+        heap_caps_free(lastfm_task_stack);
+        lastfm_task_stack = NULL;
+        lastfm_service_cleanup_nvs_proxy();
+        return ESP_ERR_NO_MEM;
     }
 
     ESP_ERROR_CHECK(esp_event_handler_register(PLAYER_SERVICE_EVENT,

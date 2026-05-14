@@ -35,7 +35,7 @@
 #define QEMU_PCM_SVC_TASK_STACK_SIZE 3072
 #define QEMU_PCM_SVC_TASK_PRIORITY 6
 #define QEMU_PCM_SVC_QUEUE_DEPTH 4
-#define QEMU_PCM_SVC_POLL_MS 10
+#define QEMU_PCM_SVC_POLL_MS 20
 
 static const char *TAG = "qemu_pcm_svc";
 

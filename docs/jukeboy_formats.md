@@ -158,6 +158,10 @@ typedef struct __attribute__((packed)) {
 
 `.jbm` stores album-level and track-level metadata for a Jukeboy album or collection.
 
+An album directory may also include an optional `cover.png` sidecar image. The
+current host tooling extracts this from the first source track when embedded art
+is available, and the companion API can transfer it with `LIBRARY_COVER`.
+
 ### `.jbm` Layout
 
 The file layout is:

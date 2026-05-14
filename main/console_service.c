@@ -154,8 +154,8 @@ static void print_memory_stats(void)
 
     task_count = uxTaskGetSystemState(s_task_state_buf, task_count, &total_runtime);
     ESP_LOGI(TAG, "--- CPU TELEMETRY (INTERVAL) ---");
-    ESP_LOGI(TAG, "Task Name\tDelta Time\t%% Interval");
-    ESP_LOGI(TAG, "---------------------------------");
+    ESP_LOGI(TAG, "Task Name\tDelta Time\t%% Interval\tStack Free");
+    ESP_LOGI(TAG, "--------------------------------------------");
 
     if (s_prev_snapshot_count == 0 || total_runtime <= s_prev_total_runtime)
     {
@@ -178,14 +178,15 @@ static void print_memory_stats(void)
             }
 
             float pct = runtime_delta ? ((float)task_delta * 100.0f) / (float)runtime_delta : 0.0f;
-            printf("%s\t%lu\t%.1f%%\n",
+                 printf("%s\t%lu\t%.1f%%\t%u\n",
                    s_task_state_buf[index].pcTaskName,
                    (unsigned long)task_delta,
-                   pct);
+                     pct,
+                     (unsigned int)s_task_state_buf[index].usStackHighWaterMark);
         }
     }
 
-    ESP_LOGI(TAG, "---------------------------------");
+            ESP_LOGI(TAG, "--------------------------------------------");
 
     uint8_t next_idx = s_snapshot_idx ^ 1;
     for (UBaseType_t index = 0; index < task_count; index++)

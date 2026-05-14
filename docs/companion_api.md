@@ -106,6 +106,7 @@ Trusted apps can be inspected and revoked from the console:
 | `0x0102` | `PLAYBACK_CONTROL` | Yes | Playback action + optional value |
 | `0x0110` | `LIBRARY_ALBUM` | Yes | Album/cartridge metadata |
 | `0x0111` | `LIBRARY_TRACK_PAGE` | Yes | Paged track metadata, max 8 per response |
+| `0x0112` | `LIBRARY_COVER` | Yes | Paged `cover.png` transfer, max 1024 bytes per response |
 | `0x0200` | `WIFI_STATUS` | Yes | Wi-Fi status snapshot |
 | `0x0201` | `WIFI_SCAN_START` | Yes | Starts async scan |
 | `0x0202` | `WIFI_SCAN_RESULTS` | Yes | Paged scan results, max 8 per response |
@@ -137,6 +138,20 @@ Trusted apps can be inspected and revoked from the console:
 | 8 | Set volume percent | `0..100` |
 | 9 | Set playback mode | player mode enum |
 | 10 | Set output target | `0` Bluetooth, `1` I2S |
+
+## Library Cover Transfer
+
+`LIBRARY_COVER` accepts TLV `OFFSET` (`0x040A`) and optional `COUNT`
+(`0x040B`) as a requested byte window. The response includes:
+
+- `OFFSET` (`0x040A`) for the returned chunk start
+- `RETURNED_COUNT` (`0x040C`) for bytes included in this frame
+- `TOTAL_SIZE` (`0x040D`) for the full PNG length
+- `MIME_TYPE` (`0x040F`) currently set to `image/png`
+- `BINARY_DATA` (`0x040E`) containing the raw PNG bytes for the chunk
+
+`LIBRARY_ALBUM` also includes `ALBUM_HAS_COVER` (`0x0410`) so clients can
+avoid requesting the asset when the cartridge does not provide `cover.png`.
 
 ## Heartbeat And Resync
 

@@ -99,10 +99,10 @@ def merge_flash(build_dir: Path, dry_run: bool) -> None:
         "esptool",
         "--chip",
         "esp32",
-        "merge-bin",
-        "--pad-to-size",
+        "merge_bin",
+        "--fill-flash-size",
         "8MB",
-        "-o",
+        "--output",
         "qemu_flash.bin",
         "@flash_args",
     ]

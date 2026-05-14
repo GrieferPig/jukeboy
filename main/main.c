@@ -8,7 +8,6 @@
 #include "esp_partition.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
-// #include "esp_flash_dispatcher.h"
 #include "esp_gap_bt_api.h"
 #include "esp_littlefs.h"
 #include "esp_eth.h"
@@ -142,28 +141,28 @@ void app_main(void)
     };
     const bool running_in_qemu = app_is_running_in_qemu();
 
-    if (running_in_qemu)
-    {
-        ESP_LOGW(TAG,
-                 "detected QEMU runtime from blank factory eFuse MAC; skipping Wi-Fi, Bluetooth, and hardware I2S init");
-        /* Lock CPU at fixed frequency: QEMU does not support dynamic frequency
-         * switching and asserts in pm_impl.c:on_freq_update if it is attempted. */
-        esp_pm_config_t pm_config = {
-            .max_freq_mhz = 240,
-            .min_freq_mhz = 240,
-            .light_sleep_enable = false,
-        };
-        ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
-    }
-    else
-    {
-        esp_pm_config_t pm_config = {
-            .max_freq_mhz = 240,
-            .min_freq_mhz = 80,
-            .light_sleep_enable = false,
-        };
-        ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
-    }
+    // if (running_in_qemu)
+    // {
+    //     ESP_LOGW(TAG,
+    //              "detected QEMU runtime from blank factory eFuse MAC; skipping Wi-Fi, Bluetooth, and hardware I2S init");
+    //     /* Lock CPU at fixed frequency: QEMU does not support dynamic frequency
+    //      * switching and asserts in pm_impl.c:on_freq_update if it is attempted. */
+    //     esp_pm_config_t pm_config = {
+    //         .max_freq_mhz = 240,
+    //         .min_freq_mhz = 240,
+    //         .light_sleep_enable = false,
+    //     };
+    //     ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+    // }
+    // else
+    // {
+    //     esp_pm_config_t pm_config = {
+    //         .max_freq_mhz = 240,
+    //         .min_freq_mhz = 240,
+    //         .light_sleep_enable = false,
+    //     };
+    //     ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+    // }
 
     ESP_ERROR_CHECK(power_mgmt_service_init());
 
@@ -209,7 +208,14 @@ void app_main(void)
 
     ESP_ERROR_CHECK(player_service_init());
     ESP_ERROR_CHECK(play_history_service_init());
-    ESP_ERROR_CHECK(lastfm_service_init());
+    if (running_in_qemu)
+    {
+        ESP_LOGW(TAG, "skipping Last.fm service init under QEMU because Wi-Fi is unavailable");
+    }
+    else
+    {
+        ESP_ERROR_CHECK(lastfm_service_init());
+    }
     if (!running_in_qemu)
     {
         ESP_ERROR_CHECK(companion_api_service_init());
@@ -240,10 +246,10 @@ void app_main(void)
         }
     }
 
-    if (script_service_init() != ESP_OK)
-    {
-        ESP_LOGW(TAG, "script service init failed; continuing without WASM console support");
-    }
+    // if (script_service_init() != ESP_OK)
+    // {
+    //     ESP_LOGW(TAG, "script service init failed; continuing without WASM console support");
+    // }
 
     ESP_ERROR_CHECK(console_service_init());
     app_run_super_loop(running_in_qemu);

@@ -9,6 +9,7 @@
 #include "esp_bt_defs.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_gap_bt_api.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -78,6 +79,29 @@ extern "C"
     size_t bluetooth_service_spp_get_max_payload(void);
     size_t bluetooth_service_get_bonded_device_count(void);
     esp_err_t bluetooth_service_get_bonded_devices(size_t *count, esp_bd_addr_t *devices);
+
+    /** Start a Bluetooth Classic inquiry without auto-pairing the strongest result. */
+    esp_err_t bluetooth_service_start_discovery(void);
+    /** True when a discovery scan is currently running. */
+    bool bluetooth_service_is_discovery_running(void);
+
+    typedef struct
+    {
+        esp_bd_addr_t bda;
+        int8_t rssi;
+        uint32_t cod;
+        char name[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
+    } bluetooth_service_scan_entry_t;
+
+    /**
+     * Copy discovered devices into out_entries. On entry *count is the buffer capacity;
+     * on return *count is the number of entries actually populated.
+     */
+    esp_err_t bluetooth_service_get_discovery_results(bluetooth_service_scan_entry_t *out_entries,
+                                                      size_t *count);
+
+    /** Remove a bonded BR/EDR device. */
+    esp_err_t bluetooth_service_unbond(const esp_bd_addr_t addr);
 
     /**
      * Register a custom A2DP source stream endpoint configured for 48 kHz

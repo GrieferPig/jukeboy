@@ -16,6 +16,7 @@ extern "C"
 
 #define PLAYER_SVC_TRACK_FILENAME_MAX_LEN 16
 #define PLAYER_SVC_TRACK_TITLE_MAX_LEN JUKEBOY_JBM_TRACK_NAME_BYTES
+#define PLAYER_SVC_TRACK_ARTISTS_MAX_LEN JUKEBOY_JBM_TRACK_ARTISTS_BYTES
 
     typedef enum
     {
@@ -66,6 +67,16 @@ extern "C"
         char filename[PLAYER_SVC_TRACK_FILENAME_MAX_LEN];
     } player_service_snapshot_t;
 
+    typedef struct
+    {
+        uint32_t track_index;
+        uint32_t duration_sec;
+        uint32_t file_num;
+        char track_title[PLAYER_SVC_TRACK_TITLE_MAX_LEN];
+        char track_artists[PLAYER_SVC_TRACK_ARTISTS_MAX_LEN];
+        char filename[PLAYER_SVC_TRACK_FILENAME_MAX_LEN];
+    } player_service_playlist_track_info_t;
+
     typedef enum
     {
         PLAYER_SVC_CONTROL_NEXT,
@@ -82,6 +93,9 @@ extern "C"
     esp_err_t player_service_play_track_by_index(uint32_t track_index);
     esp_err_t player_service_seek_to_seconds(uint32_t seconds);
     esp_err_t player_service_get_snapshot(player_service_snapshot_t *snapshot);
+    uint32_t player_service_get_playlist_track_count(void);
+    esp_err_t player_service_get_playlist_track_info(uint32_t track_index,
+                                                     player_service_playlist_track_info_t *track_info);
     bool player_service_is_paused(void);
     uint8_t player_service_get_volume_percent(void);
     void player_service_set_volume_absolute(uint8_t avrc_vol);

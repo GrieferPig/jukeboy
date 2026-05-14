@@ -38,6 +38,8 @@ extern "C"
     esp_err_t lastfm_service_set_auth_url(const char *url);
     esp_err_t lastfm_service_request_auth(const char *username, const char *password);
     esp_err_t lastfm_service_request_token(void);
+    esp_err_t lastfm_service_queue_request_auth(const char *username, const char *password);
+    esp_err_t lastfm_service_queue_request_token(void);
     esp_err_t lastfm_service_logout(void);
     esp_err_t lastfm_service_send_scrobble(uint32_t album_checksum, uint32_t track_index);
     esp_err_t lastfm_service_set_scrobbling_enabled(bool enabled);

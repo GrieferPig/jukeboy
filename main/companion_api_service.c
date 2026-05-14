@@ -1,9 +1,11 @@
 #include "companion_api_service.h"
 
+#include <dirent.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "freertos/FreeRTOS.h"
@@ -24,13 +26,16 @@
 #include "audio_output_switch.h"
 #include "bluetooth_service.h"
 #include "cartridge_service.h"
+#include "hid_service.h"
 #include "lastfm_service.h"
 #include "play_history_service.h"
 #include "player_service.h"
+#include "power_mgmt_service.h"
+#include "script_service.h"
 #include "wifi_service.h"
 
 #define COMPANION_API_TASK_NAME "companion_api"
-#define COMPANION_API_TASK_STACK_WORDS 8192
+#define COMPANION_API_TASK_STACK_WORDS 12288
 #define COMPANION_API_TASK_PRIORITY 4
 #define COMPANION_API_TASK_CORE 1
 #define COMPANION_API_QUEUE_DEPTH 16
@@ -43,6 +48,10 @@
 #define COMPANION_API_SECRET_LEN 32
 #define COMPANION_API_AUTH_NONCE_LEN 16
 #define COMPANION_API_HMAC_LEN 32
+#define COMPANION_API_COVER_FILENAME "cover.png"
+#define COMPANION_API_COVER_MIME_TYPE "image/png"
+#define COMPANION_API_COVER_CHUNK_MAX_LEN 1024U
+#define COMPANION_API_SCRIPT_LOG_CHUNK_MAX_LEN 512U
 #define COMPANION_API_NVS_NAMESPACE "companion_api"
 #define COMPANION_API_NVS_RECORD_VERSION 1U
 #define COMPANION_API_PSRAM_ALLOC_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
@@ -78,8 +87,11 @@ typedef enum
     COMPANION_API_OP_SNAPSHOT = 0x0100,
     COMPANION_API_OP_PLAYBACK_STATUS = 0x0101,
     COMPANION_API_OP_PLAYBACK_CONTROL = 0x0102,
+    COMPANION_API_OP_OUTPUT_STATUS = 0x0103,
+    COMPANION_API_OP_OUTPUT_SELECT = 0x0104,
     COMPANION_API_OP_LIBRARY_ALBUM = 0x0110,
     COMPANION_API_OP_LIBRARY_TRACK_PAGE = 0x0111,
+    COMPANION_API_OP_LIBRARY_COVER = 0x0112,
     COMPANION_API_OP_WIFI_STATUS = 0x0200,
     COMPANION_API_OP_WIFI_SCAN_START = 0x0201,
     COMPANION_API_OP_WIFI_SCAN_RESULTS = 0x0202,
@@ -87,12 +99,30 @@ typedef enum
     COMPANION_API_OP_WIFI_CONNECT_SLOT = 0x0204,
     COMPANION_API_OP_WIFI_DISCONNECT = 0x0205,
     COMPANION_API_OP_WIFI_AUTORECONNECT = 0x0206,
+    COMPANION_API_OP_WIFI_LIST_SLOTS = 0x0207,
+    COMPANION_API_OP_WIFI_SAVE_SLOT = 0x0208,
+    COMPANION_API_OP_WIFI_RECONNECT = 0x0209,
     COMPANION_API_OP_LASTFM_STATUS = 0x0300,
     COMPANION_API_OP_LASTFM_CONTROL = 0x0301,
+    COMPANION_API_OP_LASTFM_REQUEST_TOKEN = 0x0302,
     COMPANION_API_OP_HISTORY_SUMMARY = 0x0400,
     COMPANION_API_OP_HISTORY_ALBUM_PAGE = 0x0401,
+    COMPANION_API_OP_HISTORY_TRACK_PAGE = 0x0402,
+    COMPANION_API_OP_HISTORY_CLEAR = 0x0403,
     COMPANION_API_OP_BT_AUDIO_STATUS = 0x0500,
     COMPANION_API_OP_BT_AUDIO_CONTROL = 0x0501,
+    COMPANION_API_OP_BT_SCAN_START = 0x0502,
+    COMPANION_API_OP_BT_SCAN_RESULTS = 0x0503,
+    COMPANION_API_OP_BT_BONDED_LIST = 0x0504,
+    COMPANION_API_OP_BT_UNBOND = 0x0505,
+    COMPANION_API_OP_HID_STATUS = 0x0600,
+    COMPANION_API_OP_HID_LED_SET = 0x0601,
+    COMPANION_API_OP_SCRIPT_STATUS = 0x0700,
+    COMPANION_API_OP_SCRIPT_LIST = 0x0701,
+    COMPANION_API_OP_SCRIPT_LOG = 0x0702,
+    COMPANION_API_OP_SCRIPT_RUN = 0x0703,
+    COMPANION_API_OP_SYSTEM_REBOOT = 0x0F00,
+    COMPANION_API_OP_SYSTEM_REBOOT_DOWNLOAD = 0x0F01,
 } companion_api_opcode_t;
 
 typedef enum
@@ -171,6 +201,10 @@ typedef enum
     COMPANION_API_TLV_OFFSET = 0x040A,
     COMPANION_API_TLV_COUNT = 0x040B,
     COMPANION_API_TLV_RETURNED_COUNT = 0x040C,
+    COMPANION_API_TLV_TOTAL_SIZE = 0x040D,
+    COMPANION_API_TLV_BINARY_DATA = 0x040E,
+    COMPANION_API_TLV_MIME_TYPE = 0x040F,
+    COMPANION_API_TLV_ALBUM_HAS_COVER = 0x0410,
 
     COMPANION_API_TLV_WIFI_STATE = 0x0500,
     COMPANION_API_TLV_WIFI_INTERNET = 0x0501,
@@ -206,6 +240,37 @@ typedef enum
 
     COMPANION_API_TLV_BT_A2DP_CONNECTED = 0x0800,
     COMPANION_API_TLV_BT_BONDED_COUNT = 0x0801,
+    COMPANION_API_TLV_BT_ADDR = 0x0802,
+    COMPANION_API_TLV_BT_NAME = 0x0803,
+    COMPANION_API_TLV_BT_RSSI = 0x0804,
+    COMPANION_API_TLV_BT_COD = 0x0805,
+    COMPANION_API_TLV_BT_SCAN_RUNNING = 0x0806,
+
+    COMPANION_API_TLV_WIFI_HAS_PASSWORD = 0x0900,
+    COMPANION_API_TLV_WIFI_SLOT_CONFIGURED = 0x0901,
+    COMPANION_API_TLV_WIFI_SLOT_PREFERRED = 0x0902,
+    COMPANION_API_TLV_WIFI_SLOT_ACTIVE = 0x0903,
+
+    COMPANION_API_TLV_HID_BUTTON_BITMAP = 0x0A00,
+    COMPANION_API_TLV_HID_ADC_RAW = 0x0A01,
+    COMPANION_API_TLV_HID_LED_R = 0x0A02,
+    COMPANION_API_TLV_HID_LED_G = 0x0A03,
+    COMPANION_API_TLV_HID_LED_B = 0x0A04,
+    COMPANION_API_TLV_HID_LED_BRIGHTNESS = 0x0A05,
+    COMPANION_API_TLV_HID_LED_OFF = 0x0A06,
+
+    COMPANION_API_TLV_SCRIPT_STATE = 0x0B00,
+    COMPANION_API_TLV_SCRIPT_NAME = 0x0B01,
+    COMPANION_API_TLV_SCRIPT_RESOLVED_PATH = 0x0B02,
+    COMPANION_API_TLV_SCRIPT_MESSAGE = 0x0B03,
+    COMPANION_API_TLV_SCRIPT_OUTPUT = 0x0B04,
+    COMPANION_API_TLV_SCRIPT_RUN_ID = 0x0B05,
+    COMPANION_API_TLV_SCRIPT_EXIT_CODE = 0x0B06,
+    COMPANION_API_TLV_SCRIPT_KIND = 0x0B07,
+    COMPANION_API_TLV_SCRIPT_SIZE = 0x0B08,
+    COMPANION_API_TLV_SCRIPT_ARGS = 0x0B09,
+
+    COMPANION_API_TLV_OUTPUT_TARGET_RESULT = 0x0C00,
 } companion_api_tlv_type_t;
 
 typedef enum
@@ -249,6 +314,7 @@ typedef enum
     COMPANION_API_MSG_CONSOLE_REVOKE_ALL,
     COMPANION_API_MSG_LINK_CONNECTED,
     COMPANION_API_MSG_LINK_DISCONNECTED,
+    COMPANION_API_MSG_STATE_EVENT,
 } companion_api_msg_type_t;
 
 typedef struct
@@ -260,6 +326,7 @@ typedef struct
         uint8_t bytes[COMPANION_API_SPP_CHUNK_MAX_LEN];
         hid_button_t button;
         char client_id[COMPANION_API_CLIENT_ID_MAX_LEN + 1];
+        uint16_t opcode;
     } data;
     SemaphoreHandle_t completion_semaphore;
     esp_err_t *result_out;
@@ -310,6 +377,8 @@ static uint32_t s_tx_frames;
 static uint32_t s_rx_errors;
 static uint32_t s_dropped_rx_chunks;
 static uint8_t s_trusted_client_count;
+EXT_RAM_BSS_ATTR static script_service_status_snapshot_t s_script_status_snapshot;
+EXT_RAM_BSS_ATTR static uint8_t s_script_log_chunk[COMPANION_API_SCRIPT_LOG_CHUNK_MAX_LEN];
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static uint16_t companion_api_read_u16(const uint8_t *data)
@@ -434,6 +503,48 @@ static bool companion_api_append_string(companion_api_writer_t *writer, uint16_t
     }
 
     return companion_api_append_tlv(writer, type, value, (uint16_t)len);
+}
+
+static bool companion_api_resolve_cartridge_path(const char *filename,
+                                                 char *buffer,
+                                                 size_t buffer_len)
+{
+    const char *mount_point;
+    int written;
+
+    if (!filename || !buffer || buffer_len == 0 || !cartridge_service_is_mounted())
+    {
+        return false;
+    }
+
+    mount_point = cartridge_service_get_mount_point();
+    if (!mount_point || mount_point[0] == '\0')
+    {
+        return false;
+    }
+
+    written = snprintf(buffer, buffer_len, "%s/%s", mount_point, filename);
+    return written > 0 && (size_t)written < buffer_len;
+}
+
+static bool companion_api_cover_exists(void)
+{
+    char path[320];
+    FILE *handle;
+
+    if (!companion_api_resolve_cartridge_path(COMPANION_API_COVER_FILENAME, path, sizeof(path)))
+    {
+        return false;
+    }
+
+    handle = fopen(path, "rb");
+    if (!handle)
+    {
+        return false;
+    }
+
+    fclose(handle);
+    return true;
 }
 
 static bool companion_api_find_tlv(const uint8_t *payload,
@@ -1279,6 +1390,23 @@ static esp_err_t companion_api_handle_snapshot(uint16_t opcode, uint32_t request
     return companion_api_send_ok(opcode, request_id, &writer);
 }
 
+static esp_err_t companion_api_send_snapshot_event(uint16_t opcode)
+{
+    companion_api_writer_t writer;
+    companion_api_writer_init(&writer);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_GENERATION, s_event_generation);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_UPTIME_MS, (uint32_t)(esp_timer_get_time() / 1000ULL));
+    companion_api_append_auth_status(&writer);
+    companion_api_append_pairing_status(&writer);
+    companion_api_append_playback_status(&writer);
+    companion_api_append_cartridge_status(&writer);
+    companion_api_append_wifi_status(&writer);
+    companion_api_append_lastfm_status(&writer);
+    companion_api_append_history_summary(&writer);
+    companion_api_append_bt_audio_status(&writer);
+    return companion_api_send_frame(COMPANION_API_FRAME_EVENT, opcode, 0, writer.len);
+}
+
 static esp_err_t companion_api_handle_playback_control(uint32_t request_id, const uint8_t *payload, size_t payload_len)
 {
     uint8_t action;
@@ -1356,16 +1484,18 @@ static esp_err_t companion_api_handle_library_album(uint32_t request_id)
     companion_api_append_u32(&writer, COMPANION_API_TLV_ALBUM_YEAR, cartridge_service_get_album_year());
     companion_api_append_u32(&writer, COMPANION_API_TLV_ALBUM_DURATION, cartridge_service_get_album_duration_sec());
     companion_api_append_string(&writer, COMPANION_API_TLV_ALBUM_GENRE, cartridge_service_get_album_genre());
+    companion_api_append_bool(&writer, COMPANION_API_TLV_ALBUM_HAS_COVER, companion_api_cover_exists());
     return companion_api_send_ok(COMPANION_API_OP_LIBRARY_ALBUM, request_id, &writer);
 }
 
 static esp_err_t companion_api_handle_track_page(uint32_t request_id, const uint8_t *payload, size_t payload_len)
 {
     companion_api_writer_t writer;
+    player_service_playlist_track_info_t track_info;
     uint32_t offset = 0;
     uint32_t count = 8;
     uint32_t returned = 0;
-    size_t total = cartridge_service_get_metadata_track_count();
+    uint32_t total = player_service_get_playlist_track_count();
 
     (void)companion_api_tlv_u32(payload, payload_len, COMPANION_API_TLV_OFFSET, &offset);
     (void)companion_api_tlv_u32(payload, payload_len, COMPANION_API_TLV_COUNT, &count);
@@ -1376,16 +1506,17 @@ static esp_err_t companion_api_handle_track_page(uint32_t request_id, const uint
 
     companion_api_writer_init(&writer);
     companion_api_append_u32(&writer, COMPANION_API_TLV_OFFSET, offset);
-    companion_api_append_u32(&writer, COMPANION_API_TLV_TRACK_COUNT, (uint32_t)total);
-    for (uint32_t index = 0; index < count && (size_t)(offset + index) < total; index++)
+    companion_api_append_u32(&writer, COMPANION_API_TLV_TRACK_COUNT, total);
+    for (uint32_t index = 0; index < count && (offset + index) < total; index++)
     {
-        size_t track_index = (size_t)(offset + index);
+        uint32_t track_index = offset + index;
         size_t before = writer.len;
-        if (!companion_api_append_u32(&writer, COMPANION_API_TLV_TRACK_INDEX, (uint32_t)track_index) ||
-            !companion_api_append_string(&writer, COMPANION_API_TLV_TRACK_TITLE, cartridge_service_get_track_name(track_index)) ||
-            !companion_api_append_string(&writer, COMPANION_API_TLV_TRACK_ARTIST, cartridge_service_get_track_artists(track_index)) ||
-            !companion_api_append_u32(&writer, COMPANION_API_TLV_DURATION_SEC, cartridge_service_get_track_duration_sec(track_index)) ||
-            !companion_api_append_u32(&writer, COMPANION_API_TLV_TRACK_FILE, cartridge_service_get_track_file_num(track_index)))
+        if (player_service_get_playlist_track_info(track_index, &track_info) != ESP_OK ||
+            !companion_api_append_u32(&writer, COMPANION_API_TLV_TRACK_INDEX, track_info.track_index) ||
+            !companion_api_append_string(&writer, COMPANION_API_TLV_TRACK_TITLE, track_info.track_title) ||
+            !companion_api_append_string(&writer, COMPANION_API_TLV_TRACK_ARTIST, track_info.track_artists) ||
+            !companion_api_append_u32(&writer, COMPANION_API_TLV_DURATION_SEC, track_info.duration_sec) ||
+            !companion_api_append_u32(&writer, COMPANION_API_TLV_TRACK_FILE, track_info.file_num))
         {
             writer.len = before;
             break;
@@ -1394,6 +1525,115 @@ static esp_err_t companion_api_handle_track_page(uint32_t request_id, const uint
     }
     companion_api_append_u32(&writer, COMPANION_API_TLV_RETURNED_COUNT, returned);
     return companion_api_send_ok(COMPANION_API_OP_LIBRARY_TRACK_PAGE, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_library_cover(uint32_t request_id,
+                                                    const uint8_t *payload,
+                                                    size_t payload_len)
+{
+    companion_api_writer_t writer;
+    char path[320];
+    FILE *cover = NULL;
+    uint8_t chunk[COMPANION_API_COVER_CHUNK_MAX_LEN];
+    uint32_t offset = 0;
+    uint32_t count = COMPANION_API_COVER_CHUNK_MAX_LEN;
+    size_t total_size;
+    size_t bytes_to_read;
+    size_t bytes_read = 0;
+    long file_size;
+
+    if (!cartridge_service_is_mounted())
+    {
+        return companion_api_send_error(COMPANION_API_OP_LIBRARY_COVER,
+                                        request_id,
+                                        COMPANION_API_ERR_INVALID_STATE);
+    }
+
+    (void)companion_api_tlv_u32(payload, payload_len, COMPANION_API_TLV_OFFSET, &offset);
+    (void)companion_api_tlv_u32(payload, payload_len, COMPANION_API_TLV_COUNT, &count);
+    if (count > COMPANION_API_COVER_CHUNK_MAX_LEN)
+    {
+        count = COMPANION_API_COVER_CHUNK_MAX_LEN;
+    }
+
+    if (!companion_api_resolve_cartridge_path(COMPANION_API_COVER_FILENAME, path, sizeof(path)))
+    {
+        return companion_api_send_error(COMPANION_API_OP_LIBRARY_COVER,
+                                        request_id,
+                                        COMPANION_API_ERR_INVALID_STATE);
+    }
+
+    cover = fopen(path, "rb");
+    if (!cover)
+    {
+        return companion_api_send_error(COMPANION_API_OP_LIBRARY_COVER,
+                                        request_id,
+                                        COMPANION_API_ERR_NOT_FOUND);
+    }
+
+    if (fseek(cover, 0, SEEK_END) != 0)
+    {
+        fclose(cover);
+        return companion_api_send_error(COMPANION_API_OP_LIBRARY_COVER,
+                                        request_id,
+                                        COMPANION_API_ERR_INTERNAL);
+    }
+
+    file_size = ftell(cover);
+    if (file_size < 0 || (uint64_t)file_size > UINT32_MAX)
+    {
+        fclose(cover);
+        return companion_api_send_error(COMPANION_API_OP_LIBRARY_COVER,
+                                        request_id,
+                                        COMPANION_API_ERR_INTERNAL);
+    }
+
+    total_size = (size_t)file_size;
+    if ((size_t)offset > total_size)
+    {
+        offset = (uint32_t)total_size;
+    }
+
+    if (fseek(cover, (long)offset, SEEK_SET) != 0)
+    {
+        fclose(cover);
+        return companion_api_send_error(COMPANION_API_OP_LIBRARY_COVER,
+                                        request_id,
+                                        COMPANION_API_ERR_INTERNAL);
+    }
+
+    bytes_to_read = total_size - (size_t)offset;
+    if (bytes_to_read > count)
+    {
+        bytes_to_read = count;
+    }
+    if (bytes_to_read > 0)
+    {
+        bytes_read = fread(chunk, 1, bytes_to_read, cover);
+        if (bytes_read != bytes_to_read && ferror(cover))
+        {
+            fclose(cover);
+            return companion_api_send_error(COMPANION_API_OP_LIBRARY_COVER,
+                                            request_id,
+                                            COMPANION_API_ERR_INTERNAL);
+        }
+    }
+
+    fclose(cover);
+
+    companion_api_writer_init(&writer);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_OFFSET, offset);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_TOTAL_SIZE, (uint32_t)total_size);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_RETURNED_COUNT, (uint32_t)bytes_read);
+    companion_api_append_string(&writer, COMPANION_API_TLV_MIME_TYPE, COMPANION_API_COVER_MIME_TYPE);
+    if (bytes_read > 0)
+    {
+        companion_api_append_tlv(&writer,
+                                 COMPANION_API_TLV_BINARY_DATA,
+                                 chunk,
+                                 (uint16_t)bytes_read);
+    }
+    return companion_api_send_ok(COMPANION_API_OP_LIBRARY_COVER, request_id, &writer);
 }
 
 static esp_err_t companion_api_handle_wifi_scan_results(uint32_t request_id, const uint8_t *payload, size_t payload_len)
@@ -1535,7 +1775,7 @@ static esp_err_t companion_api_handle_lastfm_control(uint32_t request_id, const 
         }
         break;
     case COMPANION_API_LASTFM_ACTION_REQUEST_TOKEN:
-        err = lastfm_service_request_token();
+        err = lastfm_service_queue_request_token();
         break;
     case COMPANION_API_LASTFM_ACTION_AUTH:
         if (!companion_api_tlv_string(payload, payload_len, COMPANION_API_TLV_LASTFM_USERNAME, text_a, sizeof(text_a)) ||
@@ -1545,7 +1785,7 @@ static esp_err_t companion_api_handle_lastfm_control(uint32_t request_id, const 
         }
         else
         {
-            err = lastfm_service_request_auth(text_a, text_b);
+            err = lastfm_service_queue_request_auth(text_a, text_b);
             companion_api_zero_secret((uint8_t *)text_b, sizeof(text_b));
         }
         break;
@@ -1661,6 +1901,701 @@ static esp_err_t companion_api_handle_bt_audio_control(uint32_t request_id, cons
     return companion_api_handle_snapshot(COMPANION_API_OP_BT_AUDIO_CONTROL, request_id);
 }
 
+/* ------------------------------------------------------------------ */
+/* Phase B: new opcode handlers (output, wifi slots, bt scan, history, hid, script, system) */
+/* ------------------------------------------------------------------ */
+
+static void companion_api_append_output_status(companion_api_writer_t *writer)
+{
+    companion_api_append_u8(writer, COMPANION_API_TLV_OUTPUT_TARGET, (uint8_t)audio_output_switch_get_target());
+    companion_api_append_bool(writer, COMPANION_API_TLV_BT_A2DP_CONNECTED, bluetooth_service_is_a2dp_connected());
+}
+
+static esp_err_t companion_api_send_output_status_event(void) __attribute__((unused));
+static esp_err_t companion_api_send_output_status_event(void)
+{
+    companion_api_writer_t writer;
+    companion_api_writer_init(&writer);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_GENERATION, s_event_generation);
+    companion_api_append_output_status(&writer);
+    return companion_api_send_frame(COMPANION_API_FRAME_EVENT, COMPANION_API_OP_OUTPUT_STATUS, 0, writer.len);
+}
+
+static esp_err_t companion_api_handle_output_status(uint32_t request_id)
+{
+    companion_api_writer_t writer;
+    companion_api_writer_init(&writer);
+    companion_api_append_output_status(&writer);
+    return companion_api_send_ok(COMPANION_API_OP_OUTPUT_STATUS, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_output_select(uint32_t request_id,
+                                                    const uint8_t *payload,
+                                                    size_t payload_len)
+{
+    uint8_t target;
+    esp_err_t err;
+    companion_api_writer_t writer;
+
+    if (!companion_api_tlv_u8(payload, payload_len, COMPANION_API_TLV_OUTPUT_TARGET, &target))
+    {
+        return companion_api_send_error(COMPANION_API_OP_OUTPUT_SELECT, request_id, COMPANION_API_ERR_INVALID_ARG);
+    }
+    if (target != AUDIO_OUTPUT_TARGET_BLUETOOTH && target != AUDIO_OUTPUT_TARGET_I2S)
+    {
+        return companion_api_send_error(COMPANION_API_OP_OUTPUT_SELECT, request_id, COMPANION_API_ERR_INVALID_ARG);
+    }
+
+    err = audio_output_switch_select((audio_output_target_t)target);
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_OUTPUT_SELECT,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+    companion_api_touch_generation();
+    companion_api_writer_init(&writer);
+    companion_api_append_u16(&writer, COMPANION_API_TLV_STATUS, COMPANION_API_ERR_OK);
+    companion_api_append_output_status(&writer);
+    return companion_api_send_ok(COMPANION_API_OP_OUTPUT_SELECT, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_wifi_list_slots(uint32_t request_id)
+{
+    companion_api_writer_t writer;
+    wifi_svc_slot_info_t slots[WIFI_SVC_SLOT_COUNT];
+    esp_err_t err = wifi_service_get_saved_slots(slots, WIFI_SVC_SLOT_COUNT);
+
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_WIFI_LIST_SLOTS,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+
+    companion_api_writer_init(&writer);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_COUNT, WIFI_SVC_SLOT_COUNT);
+    for (size_t i = 0; i < WIFI_SVC_SLOT_COUNT; i++)
+    {
+        size_t before = writer.len;
+        if (!companion_api_append_u8(&writer, COMPANION_API_TLV_WIFI_SLOT, (uint8_t)(i + 1)) ||
+            !companion_api_append_bool(&writer, COMPANION_API_TLV_WIFI_SLOT_CONFIGURED, slots[i].configured) ||
+            !companion_api_append_bool(&writer, COMPANION_API_TLV_WIFI_SLOT_PREFERRED, slots[i].preferred) ||
+            !companion_api_append_bool(&writer, COMPANION_API_TLV_WIFI_SLOT_ACTIVE, slots[i].active) ||
+            !companion_api_append_string(&writer, COMPANION_API_TLV_WIFI_SSID, slots[i].ssid))
+        {
+            writer.len = before;
+            break;
+        }
+    }
+    return companion_api_send_ok(COMPANION_API_OP_WIFI_LIST_SLOTS, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_wifi_save_slot(uint32_t request_id,
+                                                     const uint8_t *payload,
+                                                     size_t payload_len)
+{
+    uint32_t slot = 0;
+    char ssid[33];
+    char password[65];
+    bool has_password;
+    esp_err_t err;
+    companion_api_writer_t writer;
+
+    if (!companion_api_tlv_u32(payload, payload_len, COMPANION_API_TLV_WIFI_SLOT, &slot) ||
+        slot < 1 || slot > WIFI_SVC_SLOT_COUNT ||
+        !companion_api_tlv_string(payload, payload_len, COMPANION_API_TLV_WIFI_SSID, ssid, sizeof(ssid)))
+    {
+        return companion_api_send_error(COMPANION_API_OP_WIFI_SAVE_SLOT, request_id, COMPANION_API_ERR_INVALID_ARG);
+    }
+    has_password = companion_api_tlv_string(payload, payload_len, COMPANION_API_TLV_WIFI_PASSWORD, password, sizeof(password));
+    if (!has_password)
+    {
+        password[0] = '\0';
+    }
+
+    err = wifi_service_save_slot((uint8_t)slot, ssid, password);
+    companion_api_zero_secret((uint8_t *)password, sizeof(password));
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_WIFI_SAVE_SLOT,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+    companion_api_touch_generation();
+    companion_api_writer_init(&writer);
+    companion_api_append_u16(&writer, COMPANION_API_TLV_STATUS, COMPANION_API_ERR_OK);
+    return companion_api_send_ok(COMPANION_API_OP_WIFI_SAVE_SLOT, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_wifi_reconnect(uint32_t request_id)
+{
+    esp_err_t err = wifi_service_reconnect();
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_WIFI_RECONNECT,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+    companion_api_touch_generation();
+    return companion_api_handle_snapshot(COMPANION_API_OP_WIFI_RECONNECT, request_id);
+}
+
+static esp_err_t companion_api_handle_lastfm_request_token(uint32_t request_id)
+{
+    esp_err_t err = lastfm_service_queue_request_token();
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_LASTFM_REQUEST_TOKEN,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+    companion_api_touch_generation();
+    return companion_api_handle_snapshot(COMPANION_API_OP_LASTFM_REQUEST_TOKEN, request_id);
+}
+
+static esp_err_t companion_api_handle_history_track_page(uint32_t request_id,
+                                                         const uint8_t *payload,
+                                                         size_t payload_len)
+{
+    companion_api_writer_t writer;
+    uint32_t checksum = 0;
+    uint32_t offset = 0;
+    uint32_t count = 4;
+    uint32_t returned = 0;
+    size_t total;
+
+    if (!companion_api_tlv_u32(payload, payload_len, COMPANION_API_TLV_CARTRIDGE_CHECKSUM, &checksum))
+    {
+        return companion_api_send_error(COMPANION_API_OP_HISTORY_TRACK_PAGE, request_id, COMPANION_API_ERR_INVALID_ARG);
+    }
+    (void)companion_api_tlv_u32(payload, payload_len, COMPANION_API_TLV_OFFSET, &offset);
+    (void)companion_api_tlv_u32(payload, payload_len, COMPANION_API_TLV_COUNT, &count);
+    if (count > 4)
+    {
+        count = 4;
+    }
+
+    total = play_history_service_get_album_track_count(checksum);
+
+    companion_api_writer_init(&writer);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_CARTRIDGE_CHECKSUM, checksum);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_OFFSET, offset);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_TRACK_COUNT, (uint32_t)total);
+    for (uint32_t i = 0; i < count && (size_t)(offset + i) < total; i++)
+    {
+        play_history_track_record_t record;
+        size_t before = writer.len;
+        if (!play_history_service_get_album_track_record(checksum, (size_t)(offset + i), &record))
+        {
+            continue;
+        }
+        if (!companion_api_append_u32(&writer, COMPANION_API_TLV_TRACK_INDEX, record.track_index) ||
+            !companion_api_append_string(&writer, COMPANION_API_TLV_TRACK_TITLE, record.metadata.track_name) ||
+            !companion_api_append_u32(&writer, COMPANION_API_TLV_HISTORY_PLAY_COUNT, record.play_count) ||
+            !companion_api_append_u32(&writer, COMPANION_API_TLV_HISTORY_FIRST_SEEN, record.first_seen_sequence) ||
+            !companion_api_append_u32(&writer, COMPANION_API_TLV_HISTORY_LAST_SEEN, record.last_seen_sequence))
+        {
+            writer.len = before;
+            break;
+        }
+        returned++;
+    }
+    companion_api_append_u32(&writer, COMPANION_API_TLV_RETURNED_COUNT, returned);
+    return companion_api_send_ok(COMPANION_API_OP_HISTORY_TRACK_PAGE, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_history_clear(uint32_t request_id)
+{
+    esp_err_t err = play_history_service_request_clear();
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_HISTORY_CLEAR,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+    companion_api_touch_generation();
+    return companion_api_handle_snapshot(COMPANION_API_OP_HISTORY_CLEAR, request_id);
+}
+
+static esp_err_t companion_api_handle_bt_scan_start(uint32_t request_id)
+{
+    esp_err_t err = bluetooth_service_start_discovery();
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_BT_SCAN_START,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+    companion_api_touch_generation();
+    companion_api_writer_t writer;
+    companion_api_writer_init(&writer);
+    companion_api_append_u16(&writer, COMPANION_API_TLV_STATUS, COMPANION_API_ERR_OK);
+    companion_api_append_bool(&writer, COMPANION_API_TLV_BT_SCAN_RUNNING, true);
+    return companion_api_send_ok(COMPANION_API_OP_BT_SCAN_START, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_bt_scan_results(uint32_t request_id)
+{
+    bluetooth_service_scan_entry_t entries[8];
+    size_t count = sizeof(entries) / sizeof(entries[0]);
+    companion_api_writer_t writer;
+    esp_err_t err = bluetooth_service_get_discovery_results(entries, &count);
+
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_BT_SCAN_RESULTS,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+
+    companion_api_writer_init(&writer);
+    companion_api_append_bool(&writer, COMPANION_API_TLV_BT_SCAN_RUNNING, bluetooth_service_is_discovery_running());
+    companion_api_append_u32(&writer, COMPANION_API_TLV_COUNT, (uint32_t)count);
+    for (size_t i = 0; i < count; i++)
+    {
+        size_t before = writer.len;
+        if (!companion_api_append_tlv(&writer, COMPANION_API_TLV_BT_ADDR, entries[i].bda, ESP_BD_ADDR_LEN) ||
+            !companion_api_append_string(&writer, COMPANION_API_TLV_BT_NAME, entries[i].name) ||
+            !companion_api_append_u32(&writer, COMPANION_API_TLV_BT_RSSI, (uint32_t)(int32_t)entries[i].rssi) ||
+            !companion_api_append_u32(&writer, COMPANION_API_TLV_BT_COD, entries[i].cod))
+        {
+            writer.len = before;
+            break;
+        }
+    }
+    return companion_api_send_ok(COMPANION_API_OP_BT_SCAN_RESULTS, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_bt_bonded_list(uint32_t request_id)
+{
+    esp_bd_addr_t devices[16];
+    size_t count = sizeof(devices) / sizeof(devices[0]);
+    companion_api_writer_t writer;
+    esp_err_t err;
+
+    size_t bonded_n = bluetooth_service_get_bonded_device_count();
+    if (bonded_n == 0)
+    {
+        count = 0;
+    }
+    else
+    {
+        err = bluetooth_service_get_bonded_devices(&count, devices);
+        if (err != ESP_OK)
+        {
+            return companion_api_send_error(COMPANION_API_OP_BT_BONDED_LIST,
+                                            request_id,
+                                            companion_api_error_from_esp(err));
+        }
+    }
+
+    companion_api_writer_init(&writer);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_BT_BONDED_COUNT, (uint32_t)count);
+    for (size_t i = 0; i < count; i++)
+    {
+        companion_api_append_tlv(&writer, COMPANION_API_TLV_BT_ADDR, devices[i], ESP_BD_ADDR_LEN);
+    }
+    return companion_api_send_ok(COMPANION_API_OP_BT_BONDED_LIST, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_bt_unbond(uint32_t request_id,
+                                                const uint8_t *payload,
+                                                size_t payload_len)
+{
+    const uint8_t *addr;
+    uint16_t addr_len;
+    esp_err_t err;
+    companion_api_writer_t writer;
+
+    if (!companion_api_find_tlv(payload, payload_len, COMPANION_API_TLV_BT_ADDR, &addr, &addr_len) ||
+        addr_len != ESP_BD_ADDR_LEN)
+    {
+        return companion_api_send_error(COMPANION_API_OP_BT_UNBOND, request_id, COMPANION_API_ERR_INVALID_ARG);
+    }
+
+    err = bluetooth_service_unbond((const uint8_t *)addr);
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_BT_UNBOND,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+    companion_api_touch_generation();
+    companion_api_writer_init(&writer);
+    companion_api_append_u16(&writer, COMPANION_API_TLV_STATUS, COMPANION_API_ERR_OK);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_BT_BONDED_COUNT,
+                             (uint32_t)bluetooth_service_get_bonded_device_count());
+    return companion_api_send_ok(COMPANION_API_OP_BT_UNBOND, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_hid_status(uint32_t request_id)
+{
+    companion_api_writer_t writer;
+    uint32_t button_state = 0;
+    hid_service_adc_status_t adc = {0};
+
+    (void)hid_service_get_button_state(&button_state);
+    (void)hid_service_get_adc_status(&adc);
+
+    companion_api_writer_init(&writer);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_HID_BUTTON_BITMAP, button_state);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_HID_ADC_RAW, (uint32_t)adc.main_raw);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_HID_ADC_RAW, (uint32_t)adc.misc_raw);
+    return companion_api_send_ok(COMPANION_API_OP_HID_STATUS, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_hid_led_set(uint32_t request_id,
+                                                  const uint8_t *payload,
+                                                  size_t payload_len)
+{
+    uint8_t off = 0;
+    uint8_t r = 0, g = 0, b = 0, brightness = 0;
+    bool has_color = false;
+    bool has_brightness;
+    esp_err_t err = ESP_OK;
+    companion_api_writer_t writer;
+
+    if (companion_api_tlv_u8(payload, payload_len, COMPANION_API_TLV_HID_LED_OFF, &off) && off)
+    {
+        err = hid_service_led_off();
+    }
+    else
+    {
+        has_color = companion_api_tlv_u8(payload, payload_len, COMPANION_API_TLV_HID_LED_R, &r) &&
+                    companion_api_tlv_u8(payload, payload_len, COMPANION_API_TLV_HID_LED_G, &g) &&
+                    companion_api_tlv_u8(payload, payload_len, COMPANION_API_TLV_HID_LED_B, &b);
+        has_brightness = companion_api_tlv_u8(payload, payload_len, COMPANION_API_TLV_HID_LED_BRIGHTNESS, &brightness);
+        if (has_brightness)
+        {
+            err = hid_service_led_set_brightness(brightness);
+        }
+        if (err == ESP_OK && has_color)
+        {
+            err = hid_service_led_set_rgb(r, g, b);
+        }
+        if (err == ESP_OK && !has_color && !has_brightness)
+        {
+            err = ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_HID_LED_SET,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+    companion_api_writer_init(&writer);
+    companion_api_append_u16(&writer, COMPANION_API_TLV_STATUS, COMPANION_API_ERR_OK);
+    return companion_api_send_ok(COMPANION_API_OP_HID_LED_SET, request_id, &writer);
+}
+
+static void companion_api_append_script_run_result(companion_api_writer_t *writer,
+                                                   const script_service_run_result_t *run)
+{
+    companion_api_append_u32(writer, COMPANION_API_TLV_SCRIPT_RUN_ID, run->run_id);
+    companion_api_append_string(writer, COMPANION_API_TLV_SCRIPT_RESOLVED_PATH, run->resolved_path);
+    companion_api_append_string(writer, COMPANION_API_TLV_SCRIPT_MESSAGE, run->message);
+    companion_api_append_string(writer, COMPANION_API_TLV_SCRIPT_OUTPUT, run->output);
+    companion_api_append_u32(writer, COMPANION_API_TLV_SCRIPT_EXIT_CODE, (uint32_t)run->exit_code);
+    companion_api_append_u32(writer, COMPANION_API_TLV_SCRIPT_SIZE, run->script_size_bytes);
+}
+
+static void companion_api_append_script_status(companion_api_writer_t *writer)
+{
+    script_service_status_snapshot_t *snap = &s_script_status_snapshot;
+    if (script_service_get_status_snapshot(snap) != ESP_OK)
+    {
+        memset(snap, 0, sizeof(*snap));
+    }
+    companion_api_append_u8(writer, COMPANION_API_TLV_SCRIPT_STATE, (uint8_t)snap->status);
+    if (snap->has_active_run)
+    {
+        companion_api_append_bool(writer, COMPANION_API_TLV_PLAYING, true);
+        companion_api_append_script_run_result(writer, &snap->active_run);
+    }
+    else if (snap->has_last_run)
+    {
+        companion_api_append_bool(writer, COMPANION_API_TLV_PLAYING, false);
+        companion_api_append_script_run_result(writer, &snap->last_run);
+    }
+}
+
+static esp_err_t companion_api_handle_script_status(uint32_t request_id)
+{
+    companion_api_writer_t writer;
+    companion_api_writer_init(&writer);
+    companion_api_append_script_status(&writer);
+    return companion_api_send_ok(COMPANION_API_OP_SCRIPT_STATUS, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_script_list(uint32_t request_id,
+                                                  const uint8_t *payload,
+                                                  size_t payload_len)
+{
+    char name[SCRIPT_SERVICE_MAX_PATH_LEN];
+    char dir_path[SCRIPT_SERVICE_MAX_PATH_LEN];
+    DIR *dir;
+    struct dirent *entry;
+    companion_api_writer_t writer;
+    bool has_name = companion_api_tlv_string(payload, payload_len, COMPANION_API_TLV_SCRIPT_NAME, name, sizeof(name));
+    uint32_t returned = 0;
+
+    if (has_name && name[0])
+    {
+        if (script_service_get_script_directory(name, dir_path, sizeof(dir_path)) != ESP_OK)
+        {
+            return companion_api_send_error(COMPANION_API_OP_SCRIPT_LIST, request_id, COMPANION_API_ERR_NOT_FOUND);
+        }
+    }
+    else
+    {
+        const char *root = script_service_get_root_path();
+        if (!root || !root[0])
+        {
+            return companion_api_send_error(COMPANION_API_OP_SCRIPT_LIST, request_id, COMPANION_API_ERR_INVALID_STATE);
+        }
+        strncpy(dir_path, root, sizeof(dir_path) - 1);
+        dir_path[sizeof(dir_path) - 1] = '\0';
+    }
+
+    dir = opendir(dir_path);
+    if (!dir)
+    {
+        return companion_api_send_error(COMPANION_API_OP_SCRIPT_LIST, request_id, COMPANION_API_ERR_NOT_FOUND);
+    }
+
+    companion_api_writer_init(&writer);
+    companion_api_append_string(&writer, COMPANION_API_TLV_SCRIPT_RESOLVED_PATH, dir_path);
+    while ((entry = readdir(dir)) != NULL)
+    {
+        size_t before = writer.len;
+        struct stat st;
+        char child_path[SCRIPT_SERVICE_MAX_PATH_LEN];
+        uint8_t kind = 0;
+        uint32_t size = 0;
+
+        if (entry->d_name[0] == '.')
+        {
+            continue;
+        }
+        int _np = snprintf(child_path, sizeof(child_path), "%s/%s", dir_path, entry->d_name);
+        if (_np <= 0 || (size_t)_np >= sizeof(child_path))
+        {
+            continue;
+        }
+        if (stat(child_path, &st) == 0)
+        {
+            if (S_ISDIR(st.st_mode))
+            {
+                kind = 1;
+            }
+            if (st.st_size > 0 && (uint64_t)st.st_size <= UINT32_MAX)
+            {
+                size = (uint32_t)st.st_size;
+            }
+        }
+        if (!companion_api_append_string(&writer, COMPANION_API_TLV_SCRIPT_NAME, entry->d_name) ||
+            !companion_api_append_u8(&writer, COMPANION_API_TLV_SCRIPT_KIND, kind) ||
+            !companion_api_append_u32(&writer, COMPANION_API_TLV_SCRIPT_SIZE, size))
+        {
+            writer.len = before;
+            break;
+        }
+        returned++;
+    }
+    closedir(dir);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_RETURNED_COUNT, returned);
+    return companion_api_send_ok(COMPANION_API_OP_SCRIPT_LIST, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_script_log(uint32_t request_id,
+                                                 const uint8_t *payload,
+                                                 size_t payload_len)
+{
+    char name[SCRIPT_SERVICE_MAX_PATH_LEN];
+    char log_path[SCRIPT_SERVICE_MAX_PATH_LEN];
+    FILE *fp;
+    uint32_t offset = 0;
+    uint32_t count = 1024;
+    size_t total_size;
+    size_t bytes_to_read;
+    size_t bytes_read = 0;
+    long file_size;
+    companion_api_writer_t writer;
+
+    if (!companion_api_tlv_string(payload, payload_len, COMPANION_API_TLV_SCRIPT_NAME, name, sizeof(name)) ||
+        name[0] == '\0')
+    {
+        return companion_api_send_error(COMPANION_API_OP_SCRIPT_LOG, request_id, COMPANION_API_ERR_INVALID_ARG);
+    }
+    (void)companion_api_tlv_u32(payload, payload_len, COMPANION_API_TLV_OFFSET, &offset);
+    (void)companion_api_tlv_u32(payload, payload_len, COMPANION_API_TLV_COUNT, &count);
+    if (count > sizeof(s_script_log_chunk))
+    {
+        count = sizeof(s_script_log_chunk);
+    }
+
+    if (script_service_get_log_path(name, log_path, sizeof(log_path)) != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_SCRIPT_LOG, request_id, COMPANION_API_ERR_NOT_FOUND);
+    }
+    fp = fopen(log_path, "rb");
+    if (!fp)
+    {
+        return companion_api_send_error(COMPANION_API_OP_SCRIPT_LOG, request_id, COMPANION_API_ERR_NOT_FOUND);
+    }
+    if (fseek(fp, 0, SEEK_END) != 0 || (file_size = ftell(fp)) < 0)
+    {
+        fclose(fp);
+        return companion_api_send_error(COMPANION_API_OP_SCRIPT_LOG, request_id, COMPANION_API_ERR_INTERNAL);
+    }
+    total_size = (size_t)file_size;
+    if ((size_t)offset > total_size)
+    {
+        offset = (uint32_t)total_size;
+    }
+    if (fseek(fp, (long)offset, SEEK_SET) != 0)
+    {
+        fclose(fp);
+        return companion_api_send_error(COMPANION_API_OP_SCRIPT_LOG, request_id, COMPANION_API_ERR_INTERNAL);
+    }
+    bytes_to_read = total_size - (size_t)offset;
+    if (bytes_to_read > count)
+    {
+        bytes_to_read = count;
+    }
+    if (bytes_to_read > 0)
+    {
+        bytes_read = fread(s_script_log_chunk, 1, bytes_to_read, fp);
+    }
+    fclose(fp);
+
+    companion_api_writer_init(&writer);
+    companion_api_append_string(&writer, COMPANION_API_TLV_SCRIPT_NAME, name);
+    companion_api_append_string(&writer, COMPANION_API_TLV_SCRIPT_RESOLVED_PATH, log_path);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_OFFSET, offset);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_TOTAL_SIZE, (uint32_t)total_size);
+    companion_api_append_u32(&writer, COMPANION_API_TLV_RETURNED_COUNT, (uint32_t)bytes_read);
+    if (bytes_read > 0)
+    {
+        companion_api_append_tlv(&writer, COMPANION_API_TLV_BINARY_DATA, s_script_log_chunk, (uint16_t)bytes_read);
+    }
+    return companion_api_send_ok(COMPANION_API_OP_SCRIPT_LOG, request_id, &writer);
+}
+
+#define COMPANION_API_SCRIPT_MAX_ARGV 8
+
+static size_t companion_api_split_args(char *buffer,
+                                       const char **argv_out,
+                                       size_t max_argv)
+{
+    size_t argc = 0;
+    char *cursor = buffer;
+
+    while (*cursor && argc < max_argv)
+    {
+        while (*cursor == ' ' || *cursor == '\t')
+        {
+            *cursor++ = '\0';
+        }
+        if (!*cursor)
+        {
+            break;
+        }
+        argv_out[argc++] = cursor;
+        while (*cursor && *cursor != ' ' && *cursor != '\t')
+        {
+            cursor++;
+        }
+    }
+    return argc;
+}
+
+static esp_err_t companion_api_handle_script_run(uint32_t request_id,
+                                                 const uint8_t *payload,
+                                                 size_t payload_len)
+{
+    char name[SCRIPT_SERVICE_MAX_PATH_LEN];
+    char args_buf[256];
+    const char *argv[COMPANION_API_SCRIPT_MAX_ARGV];
+    int argc = 0;
+    script_service_run_result_t result;
+    companion_api_writer_t writer;
+    esp_err_t err;
+
+    if (!companion_api_tlv_string(payload, payload_len, COMPANION_API_TLV_SCRIPT_NAME, name, sizeof(name)) ||
+        name[0] == '\0')
+    {
+        return companion_api_send_error(COMPANION_API_OP_SCRIPT_RUN, request_id, COMPANION_API_ERR_INVALID_ARG);
+    }
+    if (companion_api_tlv_string(payload, payload_len, COMPANION_API_TLV_SCRIPT_ARGS, args_buf, sizeof(args_buf)))
+    {
+        argc = (int)companion_api_split_args(args_buf, argv, COMPANION_API_SCRIPT_MAX_ARGV);
+    }
+
+    memset(&result, 0, sizeof(result));
+    err = script_service_start(name, argc, argv, &result);
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_SCRIPT_RUN,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+    companion_api_touch_generation();
+    companion_api_writer_init(&writer);
+    companion_api_append_u16(&writer, COMPANION_API_TLV_STATUS, COMPANION_API_ERR_OK);
+    companion_api_append_string(&writer, COMPANION_API_TLV_SCRIPT_NAME, name);
+    companion_api_append_script_run_result(&writer, &result);
+    return companion_api_send_ok(COMPANION_API_OP_SCRIPT_RUN, request_id, &writer);
+}
+
+static void companion_api_reboot_timer_cb(void *arg)
+{
+    bool download_mode = (arg != NULL);
+    if (download_mode)
+    {
+        ESP_LOGW(TAG, "companion-requested reboot to download mode");
+        (void)power_mgmt_service_reboot_to_download();
+    }
+    else
+    {
+        ESP_LOGW(TAG, "companion-requested reboot");
+        (void)power_mgmt_service_reboot();
+    }
+}
+
+static esp_err_t companion_api_schedule_reboot(bool download_mode)
+{
+    esp_timer_handle_t timer;
+    esp_timer_create_args_t args = {
+        .callback = companion_api_reboot_timer_cb,
+        .arg = download_mode ? (void *)1 : NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "companion_reboot",
+    };
+    esp_err_t err = esp_timer_create(&args, &timer);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    return esp_timer_start_once(timer, 500 * 1000);
+}
+
+static esp_err_t companion_api_handle_system_reboot(uint16_t opcode, uint32_t request_id, bool download_mode)
+{
+    companion_api_writer_t writer;
+    esp_err_t err = companion_api_schedule_reboot(download_mode);
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(opcode, request_id, companion_api_error_from_esp(err));
+    }
+    companion_api_writer_init(&writer);
+    companion_api_append_u16(&writer, COMPANION_API_TLV_STATUS, COMPANION_API_ERR_OK);
+    return companion_api_send_ok(opcode, request_id, &writer);
+}
+
 static esp_err_t companion_api_handle_request(uint16_t opcode,
                                               uint32_t request_id,
                                               const uint8_t *payload,
@@ -1726,6 +2661,8 @@ static esp_err_t companion_api_handle_request(uint16_t opcode,
         return companion_api_handle_library_album(request_id);
     case COMPANION_API_OP_LIBRARY_TRACK_PAGE:
         return companion_api_handle_track_page(request_id, payload, payload_len);
+    case COMPANION_API_OP_LIBRARY_COVER:
+        return companion_api_handle_library_cover(request_id, payload, payload_len);
     case COMPANION_API_OP_WIFI_SCAN_START:
     case COMPANION_API_OP_WIFI_CONNECT_SLOT:
     case COMPANION_API_OP_WIFI_DISCONNECT:
@@ -1741,6 +2678,46 @@ static esp_err_t companion_api_handle_request(uint16_t opcode,
         return companion_api_handle_history_album_page(request_id, payload, payload_len);
     case COMPANION_API_OP_BT_AUDIO_CONTROL:
         return companion_api_handle_bt_audio_control(request_id, payload, payload_len);
+    case COMPANION_API_OP_OUTPUT_STATUS:
+        return companion_api_handle_output_status(request_id);
+    case COMPANION_API_OP_OUTPUT_SELECT:
+        return companion_api_handle_output_select(request_id, payload, payload_len);
+    case COMPANION_API_OP_WIFI_LIST_SLOTS:
+        return companion_api_handle_wifi_list_slots(request_id);
+    case COMPANION_API_OP_WIFI_SAVE_SLOT:
+        return companion_api_handle_wifi_save_slot(request_id, payload, payload_len);
+    case COMPANION_API_OP_WIFI_RECONNECT:
+        return companion_api_handle_wifi_reconnect(request_id);
+    case COMPANION_API_OP_LASTFM_REQUEST_TOKEN:
+        return companion_api_handle_lastfm_request_token(request_id);
+    case COMPANION_API_OP_HISTORY_TRACK_PAGE:
+        return companion_api_handle_history_track_page(request_id, payload, payload_len);
+    case COMPANION_API_OP_HISTORY_CLEAR:
+        return companion_api_handle_history_clear(request_id);
+    case COMPANION_API_OP_BT_SCAN_START:
+        return companion_api_handle_bt_scan_start(request_id);
+    case COMPANION_API_OP_BT_SCAN_RESULTS:
+        return companion_api_handle_bt_scan_results(request_id);
+    case COMPANION_API_OP_BT_BONDED_LIST:
+        return companion_api_handle_bt_bonded_list(request_id);
+    case COMPANION_API_OP_BT_UNBOND:
+        return companion_api_handle_bt_unbond(request_id, payload, payload_len);
+    case COMPANION_API_OP_HID_STATUS:
+        return companion_api_handle_hid_status(request_id);
+    case COMPANION_API_OP_HID_LED_SET:
+        return companion_api_handle_hid_led_set(request_id, payload, payload_len);
+    case COMPANION_API_OP_SCRIPT_STATUS:
+        return companion_api_handle_script_status(request_id);
+    case COMPANION_API_OP_SCRIPT_LIST:
+        return companion_api_handle_script_list(request_id, payload, payload_len);
+    case COMPANION_API_OP_SCRIPT_LOG:
+        return companion_api_handle_script_log(request_id, payload, payload_len);
+    case COMPANION_API_OP_SCRIPT_RUN:
+        return companion_api_handle_script_run(request_id, payload, payload_len);
+    case COMPANION_API_OP_SYSTEM_REBOOT:
+        return companion_api_handle_system_reboot(opcode, request_id, false);
+    case COMPANION_API_OP_SYSTEM_REBOOT_DOWNLOAD:
+        return companion_api_handle_system_reboot(opcode, request_id, true);
     default:
         return companion_api_send_error(opcode, request_id, COMPANION_API_ERR_UNKNOWN_OPCODE);
     }
@@ -1888,6 +2865,7 @@ static void companion_api_process_msg(companion_api_msg_t *msg)
     case COMPANION_API_MSG_LINK_CONNECTED:
         s_rx_len = 0;
         companion_api_touch_generation();
+        (void)companion_api_send_snapshot_event(COMPANION_API_OP_SNAPSHOT);
         break;
     case COMPANION_API_MSG_LINK_DISCONNECTED:
         s_rx_len = 0;
@@ -1895,6 +2873,11 @@ static void companion_api_process_msg(companion_api_msg_t *msg)
         s_auth_challenge_pending = false;
         s_active_client_id[0] = '\0';
         companion_api_touch_generation();
+        (void)companion_api_send_snapshot_event(COMPANION_API_OP_SNAPSHOT);
+        break;
+    case COMPANION_API_MSG_STATE_EVENT:
+        companion_api_touch_generation();
+        (void)companion_api_send_snapshot_event(msg->data.opcode);
         break;
     default:
         result = ESP_ERR_INVALID_ARG;
@@ -1954,6 +2937,18 @@ static void companion_api_queue_link_message(companion_api_msg_type_t type)
     }
 }
 
+static void companion_api_queue_state_event(uint16_t opcode)
+{
+    companion_api_msg_t msg = {.type = COMPANION_API_MSG_STATE_EVENT};
+    msg.data.opcode = opcode;
+    if (s_msg_queue && xQueueSend(s_msg_queue, &msg, 0) != pdPASS)
+    {
+        taskENTER_CRITICAL(&s_state_lock);
+        s_dropped_rx_chunks++;
+        taskEXIT_CRITICAL(&s_state_lock);
+    }
+}
+
 static void companion_api_spp_rx_cb(const uint8_t *data, size_t len, void *user_ctx)
 {
     companion_api_msg_t msg = {.type = COMPANION_API_MSG_RX_CHUNK};
@@ -1996,7 +2991,7 @@ static void companion_api_bt_connection_cb(bluetooth_service_connection_event_t 
     case BLUETOOTH_SVC_CONNECTION_EVENT_A2DP_CONNECTION_STATE:
     case BLUETOOTH_SVC_CONNECTION_EVENT_A2DP_AUDIO_STATE:
     case BLUETOOTH_SVC_CONNECTION_EVENT_AUTH_COMPLETE:
-        companion_api_touch_generation();
+        companion_api_queue_state_event(COMPANION_API_OP_BT_AUDIO_STATUS);
         break;
     default:
         break;
@@ -2021,10 +3016,21 @@ static void companion_api_hid_event_handler(void *arg, esp_event_base_t base, in
 static void companion_api_state_event_handler(void *arg, esp_event_base_t base, int32_t id, void *event_data)
 {
     (void)arg;
-    (void)base;
     (void)id;
     (void)event_data;
-    companion_api_touch_generation();
+
+    if (base == PLAYER_SERVICE_EVENT)
+    {
+        companion_api_queue_state_event(COMPANION_API_OP_PLAYBACK_STATUS);
+    }
+    else if (base == WIFI_SERVICE_EVENT)
+    {
+        companion_api_queue_state_event(COMPANION_API_OP_WIFI_STATUS);
+    }
+    else
+    {
+        companion_api_queue_state_event(COMPANION_API_OP_SNAPSHOT);
+    }
 }
 
 static esp_err_t companion_api_queue_admin_message(companion_api_msg_t *msg)

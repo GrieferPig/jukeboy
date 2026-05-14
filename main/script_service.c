@@ -27,7 +27,6 @@
 #include "player_service.h"
 #include "power_mgmt_service.h"
 #include "ramdisk_service.h"
-#include "runtime_env.h"
 #include "script_socket_env.h"
 #include "storage_paths.h"
 #include "wifi_service.h"
@@ -42,7 +41,7 @@
 #define SCRIPT_SERVICE_RUNNER_PRIORITY tskIDLE_PRIORITY
 /* Managed WASM stack and heap allocations flow through wm_wamr.c, which places
  * them in PSRAM when external RAM support is enabled. */
-#define SCRIPT_SERVICE_WASM_STACK_SIZE (128 * 1024)
+#define SCRIPT_SERVICE_WASM_STACK_SIZE (96 * 1024)
 #define SCRIPT_SERVICE_WASM_HEAP_SIZE (128 * 1024)
 #define SCRIPT_SERVICE_MAX_SCRIPT_SIZE (512 * 1024)
 #define SCRIPT_SERVICE_MAX_ARGC 32
@@ -50,9 +49,11 @@
 #define SCRIPT_SERVICE_MAX_ARG_STORAGE_BYTES \
     ((SCRIPT_SERVICE_MAX_ARGC + 1U) * (SCRIPT_SERVICE_MAX_ARG_LEN + 1U))
 #define SCRIPT_SERVICE_MAX_PRINTF_CAPTURE_LEN 512
-#define SCRIPT_SERVICE_YIELD_STACK_WORDS 512
+#define SCRIPT_SERVICE_YIELD_STACK_WORDS 1024
 #define SCRIPT_SERVICE_YIELD_PRIORITY 24
 #define SCRIPT_SERVICE_YIELD_CORE 1
+#define SCRIPT_SERVICE_YIELD_INTERVAL_MS 50
+#define SCRIPT_SERVICE_YIELD_SLEEP_TICKS 1
 
 #define SCRIPT_LFS_ROOT_PATH APP_LITTLEFS_MOUNT_PATH "/scripts"
 #define SCRIPT_CWASM_EXTENSION ".cwasm"
@@ -651,6 +652,7 @@ static esp_err_t script_build_script_directory(const char *name,
                                                size_t out_path_size)
 {
     char script_name[SCRIPT_SERVICE_MAX_PATH_LEN];
+    const char *root_path;
     int written;
     esp_err_t err = script_parse_name(name, script_name, sizeof(script_name), NULL);
 
@@ -659,7 +661,8 @@ static esp_err_t script_build_script_directory(const char *name,
         return err;
     }
 
-    written = snprintf(out_path, out_path_size, "%s/%s", SCRIPT_LFS_ROOT_PATH, script_name);
+    root_path = script_service_get_root_path();
+    written = snprintf(out_path, out_path_size, "%s/%s", root_path, script_name);
     if (written <= 0 || (size_t)written >= out_path_size)
     {
         return ESP_ERR_INVALID_SIZE;
@@ -675,6 +678,7 @@ static esp_err_t script_build_resolve_base_path(const char *name,
 {
     char script_name[SCRIPT_SERVICE_MAX_PATH_LEN];
     const char *extension = NULL;
+    const char *root_path;
     int written;
     esp_err_t err = script_parse_name(name, script_name, sizeof(script_name), &extension);
 
@@ -683,10 +687,11 @@ static esp_err_t script_build_resolve_base_path(const char *name,
         return err;
     }
 
+    root_path = script_service_get_root_path();
     written = snprintf(out_path,
                        out_path_size,
                        "%s/%s/%s%s",
-                       SCRIPT_LFS_ROOT_PATH,
+                       root_path,
                        script_name,
                        script_name,
                        extension ? extension : "");
@@ -1360,19 +1365,13 @@ static esp_err_t script_prepare_builtin_argv(script_run_context_t *context,
 static void script_yield_task(void *pvParameters)
 {
     TaskHandle_t target_task = (TaskHandle_t)pvParameters;
+    TickType_t interval_ticks = pdMS_TO_TICKS(SCRIPT_SERVICE_YIELD_INTERVAL_MS);
 
     while (1)
     {
-        // Run every 1000 ms to give the watchdog a breather
-        vTaskDelay(pdMS_TO_TICKS(1000));
-
-        // Stop the heavy WAMR execution
+        vTaskDelay(interval_ticks == 0 ? 1 : interval_ticks);
         vTaskSuspend(target_task);
-
-        // Sleep for exactly 1 OS tick (10ms on ESP32 by default) to let IDLE1 run
-        vTaskDelay(1);
-
-        // Restart the WAMR execution
+        vTaskDelay(SCRIPT_SERVICE_YIELD_SLEEP_TICKS);
         vTaskResume(target_task);
     }
 }
@@ -1953,7 +1952,7 @@ esp_err_t script_service_init(void)
         s_natives_registered = true;
     }
 
-    script_ensure_directory(SCRIPT_LFS_ROOT_PATH);
+    script_ensure_directory(script_service_get_root_path());
 
     if (!s_worker_thread_started)
     {

@@ -34,7 +34,7 @@
 #include "esp_random.h"
 
 #define PLAYER_SVC_PCM_STREAM_BUF_SIZE (16 * 1024)
-#define PLAYER_SVC_QEMU_PCM_STREAM_BUF_SIZE (64 * 1024)
+#define PLAYER_SVC_QEMU_PCM_STREAM_BUF_SIZE (32 * 1024)
 #define PLAYER_SVC_CHUNK_BUF_COUNT 2
 #define PLAYER_SVC_CHUNK_MAX_BYTES (24 * 1024)
 #define PLAYER_SVC_READER_TASK_STACK 4096
@@ -60,9 +60,10 @@
 #define PLAYER_SVC_OPUS_MAX_FRAME_LEN 1275
 #define PLAYER_SVC_NVS_NAMESPACE "player_service"
 #define PLAYER_SVC_NVS_KEY_RESUME "resume"
-#define PLAYER_SVC_RESUME_STATE_VERSION 1U
-#define PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS 100
-#define PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS 100
+#define PLAYER_SVC_RESUME_STATE_VERSION 2U
+#define PLAYER_SVC_RESUME_RTC_MAGIC 0x4A425254U
+#define PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS 0
+#define PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS 0
 #define PLAYER_SVC_LOOKUP_WINDOW_CHUNKS 50U
 #define PLAYER_SVC_LOOKUP_WINDOW_ENTRIES (PLAYER_SVC_LOOKUP_WINDOW_CHUNKS + 1U)
 #define PLAYER_SVC_MAX_LOOKUP_ENTRIES (24U * 60U * 60U)
@@ -136,6 +137,8 @@ typedef struct
     uint32_t track_count;
     uint32_t current_track_num;
     uint32_t current_sec;
+    uint8_t paused;
+    uint8_t reserved[3];
 } player_service_resume_state_t;
 
 typedef enum
@@ -201,6 +204,8 @@ static size_t s_shuffle_position = 0;  /* position of current track in s_shuffle
 static bool s_countable_play_emitted;
 static uint32_t s_track_started_unix;
 EXT_RAM_BSS_ATTR static size_t s_shuffle_order_storage[JUKEBOY_MAX_TRACK_FILES];
+RTC_NOINIT_ATTR static uint32_t s_resume_rtc_magic;
+RTC_NOINIT_ATTR static player_service_resume_state_t s_resume_rtc_state;
 
 static bool player_service_format_track_filename(char *buffer, size_t buffer_len, uint32_t file_num);
 
@@ -266,6 +271,11 @@ static StreamBufferHandle_t player_service_create_pcm_stream(void)
 
 static TickType_t player_service_qemu_pcm_wait_ticks(uint32_t wait_ms)
 {
+    if (wait_ms == 0)
+    {
+        return 0;
+    }
+
     TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
 
     if (wait_ticks == 0)
@@ -310,6 +320,50 @@ static const char *player_service_playlist_title(size_t index)
     }
 
     return track->track_name;
+}
+
+static bool player_service_fill_playlist_track_info(size_t index,
+                                                    player_service_playlist_track_info_t *track_info)
+{
+    const jukeboy_jbm_track_t *track;
+
+    if (!track_info || index >= s_playlist_count)
+    {
+        return false;
+    }
+
+    memset(track_info, 0, sizeof(*track_info));
+    track_info->track_index = (uint32_t)index;
+
+    track = cartridge_service_get_metadata_track(index);
+    if (track)
+    {
+        track_info->duration_sec = track->duration_sec;
+        track_info->file_num = track->file_num;
+        strncpy(track_info->track_title, track->track_name, sizeof(track_info->track_title) - 1);
+        strncpy(track_info->track_artists, track->artists, sizeof(track_info->track_artists) - 1);
+        if (player_service_format_track_filename(track_info->filename,
+                                                 sizeof(track_info->filename),
+                                                 track->file_num))
+        {
+            return true;
+        }
+    }
+
+    track_info->file_num = (uint32_t)index;
+    if (!player_service_format_track_filename(track_info->filename,
+                                              sizeof(track_info->filename),
+                                              track_info->file_num))
+    {
+        return false;
+    }
+
+    if (track_info->track_title[0] == '\0')
+    {
+        strncpy(track_info->track_title, track_info->filename, sizeof(track_info->track_title) - 1);
+    }
+
+    return true;
 }
 
 static size_t player_service_playlist_metadata_index(size_t index)
@@ -724,6 +778,53 @@ static void player_service_post_countable_track_event(void)
                               sizeof(event_data));
 }
 
+static void player_service_clear_rtc_playback_status(void)
+{
+    s_resume_rtc_magic = 0;
+    memset(&s_resume_rtc_state, 0, sizeof(s_resume_rtc_state));
+}
+
+static void player_service_cache_rtc_playback_status(const player_service_resume_state_t *status)
+{
+    if (!status)
+    {
+        player_service_clear_rtc_playback_status();
+        return;
+    }
+
+    s_resume_rtc_state = *status;
+    s_resume_rtc_magic = PLAYER_SVC_RESUME_RTC_MAGIC;
+}
+
+static bool player_service_build_resume_state(player_service_resume_state_t *status)
+{
+    const jukeboy_jbm_header_t *metadata = cartridge_service_get_metadata_header();
+
+    if (!status || !cartridge_service_is_mounted() || !metadata || s_playlist_count == 0 || (!s_playing && !s_paused))
+    {
+        return false;
+    }
+
+    memset(status, 0, sizeof(*status));
+    status->version = PLAYER_SVC_RESUME_STATE_VERSION;
+    status->cartridge_checksum = metadata->checksum;
+    status->track_count = metadata->track_count;
+    status->current_track_num = (uint32_t)s_playlist_index;
+    status->current_sec = (uint32_t)player_service_current_second();
+    status->paused = s_paused ? 1U : 0U;
+    return true;
+}
+
+static void player_service_cache_current_playback_status(void)
+{
+    player_service_resume_state_t status;
+
+    if (player_service_build_resume_state(&status))
+    {
+        player_service_cache_rtc_playback_status(&status);
+    }
+}
+
 static esp_err_t player_service_erase_saved_playback_status_locked(nvs_handle_t handle)
 {
     esp_err_t err = nvs_erase_key(handle, PLAYER_SVC_NVS_KEY_RESUME);
@@ -741,22 +842,43 @@ static esp_err_t player_service_erase_saved_playback_status_locked(nvs_handle_t 
     return nvs_commit(handle);
 }
 
-static esp_err_t player_service_write_playback_status(size_t track_index, size_t current_sec)
+static void player_service_clear_saved_playback_status(void)
 {
-    const jukeboy_jbm_header_t *metadata = cartridge_service_get_metadata_header();
     nvs_handle_t handle;
-    player_service_resume_state_t status = {
-        .version = PLAYER_SVC_RESUME_STATE_VERSION,
-        .cartridge_checksum = metadata ? metadata->checksum : 0,
-        .track_count = metadata ? metadata->track_count : 0,
-        .current_track_num = (uint32_t)track_index,
-        .current_sec = (uint32_t)current_sec,
-    };
     esp_err_t err;
 
-    if (!cartridge_service_is_mounted() || !metadata)
+    player_service_clear_rtc_playback_status();
+
+    err = nvs_open(PLAYER_SVC_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
     {
-        return ESP_ERR_INVALID_STATE;
+        return;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to open NVS namespace %s while clearing resume state: %s",
+                 PLAYER_SVC_NVS_NAMESPACE,
+                 esp_err_to_name(err));
+        return;
+    }
+
+    err = player_service_erase_saved_playback_status_locked(handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to clear playback status from NVS: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static esp_err_t player_service_write_playback_status(const player_service_resume_state_t *status)
+{
+    nvs_handle_t handle;
+    esp_err_t err;
+
+    if (!status)
+    {
+        return ESP_ERR_INVALID_ARG;
     }
 
     err = nvs_open(PLAYER_SVC_NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -768,7 +890,7 @@ static esp_err_t player_service_write_playback_status(size_t track_index, size_t
         return err;
     }
 
-    err = nvs_set_blob(handle, PLAYER_SVC_NVS_KEY_RESUME, &status, sizeof(status));
+    err = nvs_set_blob(handle, PLAYER_SVC_NVS_KEY_RESUME, status, sizeof(*status));
     if (err == ESP_OK)
     {
         err = nvs_commit(handle);
@@ -785,12 +907,15 @@ static esp_err_t player_service_write_playback_status(size_t track_index, size_t
 
 static esp_err_t player_service_persist_current_playback_status(void)
 {
-    if (!s_playing || s_playlist_count == 0)
+    player_service_resume_state_t status;
+
+    if (!player_service_build_resume_state(&status))
     {
         return ESP_OK;
     }
 
-    return player_service_write_playback_status(s_playlist_index, player_service_current_second());
+    player_service_cache_rtc_playback_status(&status);
+    return player_service_write_playback_status(&status);
 }
 
 static esp_err_t player_service_shutdown_callback(void *user_ctx)
@@ -832,18 +957,79 @@ static esp_err_t player_service_shutdown_callback(void *user_ctx)
     return result;
 }
 
-static bool player_service_load_saved_playback_status(size_t *track_index, size_t *start_chunk)
+static bool player_service_validate_resume_state(const player_service_resume_state_t *status,
+                                                 size_t *track_index,
+                                                 size_t *start_chunk,
+                                                 bool *paused)
 {
     const jukeboy_jbm_header_t *metadata = cartridge_service_get_metadata_header();
     size_t metadata_track_count = cartridge_service_get_metadata_track_count();
+
+    if (!status || !track_index || !start_chunk || !paused || !cartridge_service_is_mounted() || !metadata)
+    {
+        return false;
+    }
+
+    if (status->version != PLAYER_SVC_RESUME_STATE_VERSION)
+    {
+        return false;
+    }
+
+    if (status->cartridge_checksum != metadata->checksum)
+    {
+        return false;
+    }
+
+    if (status->track_count != metadata->track_count ||
+        (size_t)status->current_track_num >= metadata_track_count ||
+        (size_t)status->current_track_num >= s_playlist_count)
+    {
+        return false;
+    }
+
+    *track_index = (size_t)status->current_track_num;
+    *start_chunk = (size_t)status->current_sec;
+    *paused = status->paused != 0;
+    return true;
+}
+
+static bool player_service_load_saved_playback_status(size_t *track_index, size_t *start_chunk, bool *paused)
+{
+    const jukeboy_jbm_header_t *metadata = cartridge_service_get_metadata_header();
     nvs_handle_t handle;
     player_service_resume_state_t status;
     size_t status_size = sizeof(status);
     esp_err_t err;
 
-    if (!track_index || !start_chunk || !cartridge_service_is_mounted() || !metadata)
+    if (!track_index || !start_chunk || !paused || !cartridge_service_is_mounted() || !metadata)
     {
         return false;
+    }
+
+    if (s_resume_rtc_magic == PLAYER_SVC_RESUME_RTC_MAGIC)
+    {
+        status = s_resume_rtc_state;
+        if (player_service_validate_resume_state(&status, track_index, start_chunk, paused))
+        {
+            return true;
+        }
+
+        if (status.version == PLAYER_SVC_RESUME_STATE_VERSION)
+        {
+            if (status.cartridge_checksum != metadata->checksum)
+            {
+                ESP_LOGI(TAG,
+                         "stored RTC resume belongs to cartridge checksum 0x%08lx, current cartridge is 0x%08lx; clearing saved state",
+                         (unsigned long)status.cartridge_checksum,
+                         (unsigned long)metadata->checksum);
+                player_service_clear_saved_playback_status();
+                return false;
+            }
+
+            ESP_LOGW(TAG, "discarding invalid RTC resume state");
+        }
+
+        player_service_clear_rtc_playback_status();
     }
 
     err = nvs_open(PLAYER_SVC_NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -865,6 +1051,7 @@ static bool player_service_load_saved_playback_status(size_t *track_index, size_
     if (err != ESP_OK || status_size != sizeof(status))
     {
         ESP_LOGW(TAG, "discarding malformed resume state from NVS");
+        player_service_clear_rtc_playback_status();
         (void)player_service_erase_saved_playback_status_locked(handle);
         nvs_close(handle);
         return false;
@@ -874,6 +1061,7 @@ static bool player_service_load_saved_playback_status(size_t *track_index, size_
     {
         ESP_LOGW(TAG, "discarding resume state with unsupported version %lu",
                  (unsigned long)status.version);
+        player_service_clear_rtc_playback_status();
         (void)player_service_erase_saved_playback_status_locked(handle);
         nvs_close(handle);
         return false;
@@ -885,29 +1073,27 @@ static bool player_service_load_saved_playback_status(size_t *track_index, size_
                  "stored resume belongs to cartridge checksum 0x%08lx, current cartridge is 0x%08lx; clearing saved state",
                  (unsigned long)status.cartridge_checksum,
                  (unsigned long)metadata->checksum);
+        player_service_clear_rtc_playback_status();
         (void)player_service_erase_saved_playback_status_locked(handle);
         nvs_close(handle);
         return false;
     }
 
-    if (status.track_count != metadata->track_count ||
-        (size_t)status.current_track_num >= metadata_track_count ||
-        (size_t)status.current_track_num >= s_playlist_count)
+    if (!player_service_validate_resume_state(&status, track_index, start_chunk, paused))
     {
         ESP_LOGW(TAG,
                  "discarding resume state with invalid track index %lu for metadata=%lu playlist=%u",
                  (unsigned long)status.current_track_num,
-                 (unsigned long)metadata_track_count,
+                 (unsigned long)cartridge_service_get_metadata_track_count(),
                  (unsigned)s_playlist_count);
+        player_service_clear_rtc_playback_status();
         (void)player_service_erase_saved_playback_status_locked(handle);
         nvs_close(handle);
         return false;
     }
 
     nvs_close(handle);
-
-    *track_index = (size_t)status.current_track_num;
-    *start_chunk = (size_t)status.current_sec;
+    player_service_cache_rtc_playback_status(&status);
     return true;
 }
 
@@ -1781,6 +1967,7 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
              (unsigned)(index + 1),
              (unsigned)s_playlist_count,
              s_current_track);
+    player_service_cache_current_playback_status();
     {
         player_service_track_event_t event_data;
         bool have_event_data = player_service_fill_current_track_event(&event_data);
@@ -1792,11 +1979,79 @@ static esp_err_t player_service_start_track(size_t index, size_t start_chunk)
     return ESP_OK;
 }
 
+static esp_err_t player_service_restore_paused_track(size_t index, size_t start_chunk)
+{
+    esp_err_t err;
+
+    if (index >= s_playlist_count)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!player_service_pipeline_idle())
+    {
+        ESP_LOGW(TAG, "cannot restore paused track while pipeline is still active");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = player_service_ensure_track_loaded(index);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    start_chunk = player_service_clamp_chunk_index(start_chunk);
+    s_countable_play_emitted = false;
+
+    {
+        const char *title = player_service_playlist_title(index);
+
+        if (title && title[0] != '\0')
+        {
+            strncpy(s_current_track, title, sizeof(s_current_track) - 1);
+            s_current_track[sizeof(s_current_track) - 1] = '\0';
+        }
+        else if (!player_service_playlist_filename(index, s_current_track, sizeof(s_current_track)))
+        {
+            s_current_track[0] = '\0';
+        }
+    }
+    s_playlist_index = index;
+
+    if (s_playback_mode == PLAYER_SVC_MODE_SHUFFLE && s_shuffle_order)
+    {
+        for (size_t i = 0; i < s_playlist_count; i++)
+        {
+            if (s_shuffle_order[i] == index)
+            {
+                s_shuffle_position = i;
+                break;
+            }
+        }
+    }
+
+    s_playing = true;
+    s_paused = true;
+    s_stop_requested = false;
+    s_resume_chunk = start_chunk;
+    s_current_chunk = start_chunk;
+    s_track_started_unix = player_service_resolve_track_started_unix(start_chunk);
+    player_service_reset_pipeline();
+    player_service_cache_current_playback_status();
+
+    ESP_LOGI(TAG, "restored paused track %u/%u: %s",
+             (unsigned)(index + 1),
+             (unsigned)s_playlist_count,
+             s_current_track);
+    return ESP_OK;
+}
+
 static void player_service_handle_cartridge_inserted(void)
 {
     cartridge_status_t cartridge_status;
     size_t start_index = 0;
     size_t start_chunk = 0;
+    bool start_paused = false;
 
     player_service_stop_playback(true);
     player_service_free_track_info();
@@ -1827,14 +2082,16 @@ static void player_service_handle_cartridge_inserted(void)
         return;
     }
 
-    if (player_service_load_saved_playback_status(&start_index, &start_chunk))
+    if (player_service_load_saved_playback_status(&start_index, &start_chunk, &start_paused))
     {
-        ESP_LOGI(TAG, "resuming from saved playback status: track=%u sec=%u",
+        ESP_LOGI(TAG, "resuming from saved playback status: track=%u sec=%u paused=%s",
                  (unsigned)start_index,
-                 (unsigned)start_chunk);
+                 (unsigned)start_chunk,
+                 start_paused ? "true" : "false");
     }
 
-    if (player_service_start_track(start_index, start_chunk) != ESP_OK)
+    if ((start_paused ? player_service_restore_paused_track(start_index, start_chunk)
+                      : player_service_start_track(start_index, start_chunk)) != ESP_OK)
     {
         s_playing = false;
     }
@@ -2041,6 +2298,10 @@ static void player_service_handle_control(player_service_control_t control)
                 s_playing = false;
             }
         }
+        else
+        {
+            player_service_cache_current_playback_status();
+        }
         break;
     case PLAYER_SVC_CONTROL_VOLUME_UP:
         if (s_volume_level + 1U < PLAYER_SVC_VOLUME_LEVEL_COUNT)
@@ -2075,6 +2336,7 @@ static void player_service_handle_control(player_service_control_t control)
             have_event_data = player_service_fill_current_track_event(&event_data);
             player_service_stop_playback(true);
             s_paused = true;
+            player_service_cache_current_playback_status();
             player_service_post_event(PLAYER_SVC_EVENT_TRACK_PAUSED,
                                       have_event_data ? &event_data : NULL,
                                       have_event_data ? sizeof(event_data) : 0);
@@ -2126,6 +2388,10 @@ static void player_service_handle_seek_absolute(uint32_t seconds)
         {
             s_playing = false;
         }
+    }
+    else
+    {
+        player_service_cache_current_playback_status();
     }
 }
 
@@ -2278,7 +2544,7 @@ esp_err_t player_service_init(void)
     {
         s_decoder_task_stack = heap_caps_calloc(PLAYER_SVC_DECODER_TASK_STACK,
                                                 sizeof(StackType_t),
-                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                                                MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
         if (s_decoder_task_stack == NULL)
         {
             ESP_LOGE(TAG, "failed to allocate player decoder stack in PSRAM");
@@ -2437,6 +2703,37 @@ esp_err_t player_service_get_snapshot(player_service_snapshot_t *snapshot)
     return ESP_OK;
 }
 
+uint32_t player_service_get_playlist_track_count(void)
+{
+    return (uint32_t)s_playlist_count;
+}
+
+esp_err_t player_service_get_playlist_track_info(uint32_t track_index,
+                                                 player_service_playlist_track_info_t *track_info)
+{
+    if (!track_info)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_initialised)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if ((size_t)track_index >= s_playlist_count)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!player_service_fill_playlist_track_info((size_t)track_index, track_info))
+    {
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
 bool player_service_is_paused(void)
 {
     return s_paused;
@@ -2562,5 +2859,5 @@ int32_t player_service_qemu_pcm_provider(uint8_t *data, int32_t len, void *user_
     }
 
     player_service_apply_volume(data, received);
-    return (int32_t)received;
+    return (int32_t)target;
 }

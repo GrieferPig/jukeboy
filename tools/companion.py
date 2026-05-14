@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
 import secrets
+import shlex
 import socket
 import struct
 import sys
@@ -142,6 +144,10 @@ TLV_NAME = {
     0x040A: "offset",
     0x040B: "count",
     0x040C: "returned_count",
+    0x040D: "total_size",
+    0x040E: "binary_data",
+    0x040F: "mime_type",
+    0x0410: "album_has_cover",
     0x0500: "wifi_state",
     0x0501: "wifi_internet",
     0x0502: "wifi_autoreconnect",
@@ -200,6 +206,7 @@ class Opcode(IntEnum):
     PLAYBACK_CONTROL = 0x0102
     LIBRARY_ALBUM = 0x0110
     LIBRARY_TRACK_PAGE = 0x0111
+    LIBRARY_COVER = 0x0112
     WIFI_STATUS = 0x0200
     WIFI_SCAN_START = 0x0201
     WIFI_SCAN_RESULTS = 0x0202
@@ -269,6 +276,10 @@ class TlvType(IntEnum):
     OFFSET = 0x040A
     COUNT = 0x040B
     RETURNED_COUNT = 0x040C
+    TOTAL_SIZE = 0x040D
+    BINARY_DATA = 0x040E
+    MIME_TYPE = 0x040F
+    ALBUM_HAS_COVER = 0x0410
     WIFI_STATE = 0x0500
     WIFI_INTERNET = 0x0501
     WIFI_AUTORECONNECT = 0x0502
@@ -606,6 +617,12 @@ class CompanionBleClient:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.disconnect()
 
+    @property
+    def is_connected(self) -> bool:
+        return bool(
+            self.client is not None and getattr(self.client, "is_connected", False)
+        )
+
     async def connect(self) -> None:
         self._loop = asyncio.get_running_loop()
         self.device = await self._resolve_device()
@@ -911,6 +928,49 @@ class CompanionBleClient:
                 tlvs=[tlv_u32(TlvType.OFFSET, offset), tlv_u32(TlvType.COUNT, count)],
             )
         )
+
+    async def library_cover_page(self, offset: int, count: int) -> dict[str, Any]:
+        return decode_cover_page(
+            await self.request(
+                Opcode.LIBRARY_COVER,
+                tlvs=[tlv_u32(TlvType.OFFSET, offset), tlv_u32(TlvType.COUNT, count)],
+            )
+        )
+
+    async def library_cover(self, chunk_size: int = 1024) -> dict[str, Any]:
+        offset = 0
+        total_size: int | None = None
+        mime_type = ""
+        data = bytearray()
+
+        while True:
+            page = await self.library_cover_page(offset, chunk_size)
+            page_offset = int(page.get("offset", offset))
+            returned_count = int(page.get("returned_count", 0))
+            chunk = page.get("data", b"")
+            if not isinstance(chunk, (bytes, bytearray)):
+                raise ValueError("cover page data must be bytes")
+            if total_size is None:
+                total_size = int(page.get("total_size", 0))
+            if not mime_type:
+                mime_type = str(page.get("mime_type", ""))
+            if page_offset < len(data):
+                raise ValueError("cover page offset moved backwards")
+            if page_offset > len(data):
+                data.extend(b"\x00" * (page_offset - len(data)))
+            data.extend(chunk)
+            if returned_count == 0:
+                break
+            offset = page_offset + returned_count
+            if total_size is not None and offset >= total_size:
+                break
+
+        final_total = total_size if total_size is not None else len(data)
+        return {
+            "mime_type": mime_type,
+            "total_size": final_total,
+            "data": bytes(data[:final_total]),
+        }
 
     async def wifi_status(self) -> dict[str, Any]:
         return decode_snapshot(await self.request(Opcode.WIFI_STATUS))
@@ -1365,6 +1425,7 @@ def decode_album(frame: Frame) -> dict[str, Any]:
             "year": None,
             "duration_sec": None,
             "genre": "",
+            "has_cover": False,
         },
     }
     for tlv in frame.tlvs or []:
@@ -1391,6 +1452,8 @@ def decode_album(frame: Frame) -> dict[str, Any]:
             result["album"]["duration_sec"] = tlv_value_u32(tlv)
         elif tlv.tlv_type == TlvType.ALBUM_GENRE:
             result["album"]["genre"] = tlv_value_string(tlv)
+        elif tlv.tlv_type == TlvType.ALBUM_HAS_COVER:
+            result["album"]["has_cover"] = tlv_value_bool(tlv)
     return result
 
 
@@ -1431,6 +1494,30 @@ def decode_track_page(frame: Frame) -> dict[str, Any]:
             result["returned_count"] = tlv_value_u32(tlv)
     if current is not None:
         result["tracks"].append(current)
+    return result
+
+
+def decode_cover_page(frame: Frame) -> dict[str, Any]:
+    result = {
+        "opcode": opcode_name(frame.opcode),
+        "request_id": frame.request_id,
+        "offset": 0,
+        "returned_count": 0,
+        "total_size": 0,
+        "mime_type": "",
+        "data": b"",
+    }
+    for tlv in frame.tlvs or []:
+        if tlv.tlv_type == TlvType.OFFSET:
+            result["offset"] = tlv_value_u32(tlv)
+        elif tlv.tlv_type == TlvType.RETURNED_COUNT:
+            result["returned_count"] = tlv_value_u32(tlv)
+        elif tlv.tlv_type == TlvType.TOTAL_SIZE:
+            result["total_size"] = tlv_value_u32(tlv)
+        elif tlv.tlv_type == TlvType.MIME_TYPE:
+            result["mime_type"] = tlv_value_string(tlv)
+        elif tlv.tlv_type == TlvType.BINARY_DATA:
+            result["data"] = tlv.value
     return result
 
 
@@ -1583,6 +1670,18 @@ def decode_frame(frame: Frame) -> dict[str, Any]:
     return decode_generic_tlvs(frame)
 
 
+async def authenticate_with_credentials(
+    client: CompanionBleClient, credentials: CompanionCredentials
+) -> dict[str, Any]:
+    challenge = await client.auth_challenge(credentials.client_id)
+    nonce_hex = challenge.get("nonce_hex")
+    if not isinstance(nonce_hex, str) or len(nonce_hex) != AUTH_NONCE_LEN * 2:
+        raise RuntimeError("Auth challenge returned an invalid nonce")
+    return await client.auth_proof(
+        credentials.client_id, credentials.secret, bytes.fromhex(nonce_hex)
+    )
+
+
 async def ensure_authenticated(
     client: CompanionBleClient,
     state_store: StateStore,
@@ -1593,20 +1692,21 @@ async def ensure_authenticated(
     if capabilities.get("authenticated"):
         return capabilities
 
+    credentials = require_resolved_credentials(args, state_store, profile)
+    return await authenticate_with_credentials(client, credentials)
+
+
+def require_resolved_credentials(
+    args: argparse.Namespace,
+    state_store: StateStore,
+    profile: str,
+) -> CompanionCredentials:
     credentials = resolve_credentials(args, state_store, profile)
     if credentials is None:
-        raise SystemExit(
-            "This command requires auth, but no credentials were found. "
-            "Pair first with `pair begin` or pass --client-id and --secret-hex."
+        raise RuntimeError(
+            "No credentials were found. Pair first or supply --client-id and --secret-hex."
         )
-
-    challenge = await client.auth_challenge(credentials.client_id)
-    nonce_hex = challenge.get("nonce_hex")
-    if not isinstance(nonce_hex, str) or len(nonce_hex) != AUTH_NONCE_LEN * 2:
-        raise RuntimeError("Auth challenge returned an invalid nonce")
-    return await client.auth_proof(
-        credentials.client_id, credentials.secret, bytes.fromhex(nonce_hex)
-    )
+    return credentials
 
 
 def resolve_profile(args: argparse.Namespace) -> str:
@@ -1632,10 +1732,23 @@ def resolve_credentials(
     return state_store.get_credentials(profile)
 
 
-def generate_pairing_credentials(args: argparse.Namespace) -> CompanionCredentials:
-    client_id = args.client_id or str(uuid.uuid4())
-    app_name = args.app_name or "jukeboy-companion-test"
-    secret_hex = args.secret_hex or secrets.token_hex(PAIR_SECRET_LEN)
+def generate_pairing_credentials(
+    args: argparse.Namespace,
+    fallback_args: argparse.Namespace | None = None,
+) -> CompanionCredentials:
+    client_id = getattr(args, "client_id", None) or getattr(
+        fallback_args, "client_id", None
+    )
+    app_name = getattr(args, "app_name", None) or getattr(
+        fallback_args, "app_name", None
+    )
+    secret_hex = getattr(args, "secret_hex", None) or getattr(
+        fallback_args, "secret_hex", None
+    )
+
+    client_id = client_id or str(uuid.uuid4())
+    app_name = app_name or "jukeboy-companion-test"
+    secret_hex = secret_hex or secrets.token_hex(PAIR_SECRET_LEN)
     return CompanionCredentials(
         client_id=client_id, app_name=app_name, secret_hex=secret_hex
     )
@@ -1646,13 +1759,13 @@ def parse_button_sequence(value: str | None) -> list[int]:
         return [secrets.randbelow(len(BUTTON_NAME_TO_ID)) for _ in range(4)]
     names = [part.strip().lower() for part in value.split(",") if part.strip()]
     if len(names) != 4:
-        raise SystemExit(
+        raise ValueError(
             "Button sequence must contain exactly four comma-separated button names"
         )
     try:
         return [BUTTON_NAME_TO_ID[name] for name in names]
     except KeyError as exc:
-        raise SystemExit(f"Unknown button in sequence: {exc.args[0]}") from exc
+        raise ValueError(f"Unknown button in sequence: {exc.args[0]}") from exc
 
 
 async def print_scan(timeout: float) -> None:
@@ -1660,12 +1773,16 @@ async def print_scan(timeout: float) -> None:
     results = []
     for device, advertisement in discovered_devices_with_advertisements(discovered):
         uuids = sorted(advertised_service_uuids(device, advertisement))
+        service_match = SERVICE_UUID.lower() in uuids
+        name_match = bool(device.name and device.name == DEFAULT_DEVICE_NAME)
+        if not (service_match or name_match):
+            continue
         results.append(
             {
                 "address": device.address,
                 "name": device.name or "",
-                "service_match": SERVICE_UUID.lower()
-                in [uuid_value.lower() for uuid_value in uuids],
+                "service_match": service_match,
+                "name_match": name_match,
                 "uuids": uuids,
             }
         )
@@ -1673,7 +1790,17 @@ async def print_scan(timeout: float) -> None:
 
 
 def command_requires_auth(args: argparse.Namespace) -> bool:
-    if args.command in {"scan", "hello", "capabilities", "ping", "auth", "watch"}:
+    if args.command in {
+        "scan",
+        "connect",
+        "disconnect",
+        "reconnect",
+        "hello",
+        "capabilities",
+        "ping",
+        "auth",
+        "watch",
+    }:
         return False
     if args.command == "pair":
         return False
@@ -1681,17 +1808,16 @@ def command_requires_auth(args: argparse.Namespace) -> bool:
 
 
 def command_should_auto_auth(args: argparse.Namespace) -> bool:
-    return command_requires_auth(args) and not args.no_auto_auth
+    return command_requires_auth(args) and not getattr(args, "no_auto_auth", False)
 
 
 async def handle_pair_command(
     client: CompanionBleClient,
     args: argparse.Namespace,
-    state_store: StateStore,
-    profile: str,
-) -> Any:
+    fallback_args: argparse.Namespace | None = None,
+) -> tuple[Any, CompanionCredentials | None]:
     if args.pair_command == "begin":
-        credentials = generate_pairing_credentials(args)
+        credentials = generate_pairing_credentials(args, fallback_args)
         sequence = parse_button_sequence(args.sequence)
         response = await client.pair_begin(
             credentials.client_id,
@@ -1699,11 +1825,8 @@ async def handle_pair_command(
             credentials.secret,
             sequence,
         )
-        state_store.put_credentials(profile, credentials)
 
         result = {
-            "credentials_saved_to": str(state_store.path),
-            "profile": profile,
             "client_id": credentials.client_id,
             "app_name": credentials.app_name,
             "secret_hex": credentials.secret_hex,
@@ -1728,13 +1851,13 @@ async def handle_pair_command(
                 except asyncio.TimeoutError:
                     continue
                 result["last_event"] = decode_frame(event)
-        return result
+        return result, credentials
 
     if args.pair_command == "status":
-        return await client.pair_status()
+        return await client.pair_status(), None
 
     if args.pair_command == "cancel":
-        return await client.pair_cancel()
+        return await client.pair_cancel(), None
 
     raise AssertionError(f"unexpected pair command {args.pair_command!r}")
 
@@ -1794,6 +1917,16 @@ async def handle_library_command(
         return await client.library_album()
     if args.library_command == "tracks":
         return await client.library_track_page(args.offset, args.count)
+    if args.library_command == "cover":
+        cover = await client.library_cover(args.chunk_size)
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(cover["data"])
+        return {
+            "output": str(output_path),
+            "mime_type": cover["mime_type"],
+            "total_size": cover["total_size"],
+        }
     raise AssertionError(f"unexpected library command {args.library_command!r}")
 
 
@@ -1869,11 +2002,54 @@ async def handle_bt_command(
     raise AssertionError(f"unexpected bt command {args.bt_command!r}")
 
 
-async def watch_events(client: CompanionBleClient) -> None:
-    print("Watching companion API events and heartbeats. Press Ctrl+C to stop.")
-    while True:
-        frame = await client.next_event()
-        json_dump(decode_frame(frame))
+async def watch_events(
+    client: CompanionBleClient,
+    *,
+    count: int | None = None,
+    timeout: float | None = None,
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = None if timeout is None else loop.time() + timeout
+    stop_task: asyncio.Task[str] | None = None
+    seen = 0
+
+    if count is None and timeout is None:
+        print("Watching companion API events and heartbeats. Press Enter to stop.")
+        stop_task = asyncio.create_task(asyncio.to_thread(input, ""))
+
+    try:
+        while True:
+            wait_timeout = None
+            if deadline is not None:
+                wait_timeout = deadline - loop.time()
+                if wait_timeout <= 0:
+                    return
+
+            event_task = asyncio.create_task(client.next_event(timeout=wait_timeout))
+            wait_set: set[asyncio.Task[Any]] = {event_task}
+            if stop_task is not None:
+                wait_set.add(stop_task)
+
+            done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+
+            if stop_task is not None and stop_task in done:
+                event_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await event_task
+                return
+
+            frame = await event_task
+            json_dump(decode_frame(frame))
+            seen += 1
+            if count is not None and seen >= count:
+                return
+    except asyncio.TimeoutError:
+        return
+    finally:
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
 
 
 def add_common_connection_args(parser: argparse.ArgumentParser) -> None:
@@ -1896,12 +2072,33 @@ def add_common_connection_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="BLE test client for the Jukeboy companion API v1"
+class ReplParserExit(Exception):
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+
+class ReplArgumentParser(argparse.ArgumentParser):
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        if message:
+            stream = sys.stderr if status else sys.stdout
+            print(message, end="" if message.endswith("\n") else "\n", file=stream)
+        raise ReplParserExit(status)
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        raise ValueError(message)
+
+
+def build_command_parser() -> ReplArgumentParser:
+    parser = ReplArgumentParser(
+        prog="companion",
+        description="Interactive commands for the Jukeboy companion API v1",
     )
-    add_common_connection_args(parser)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("connect", help="Connect to the BLE device")
+    subparsers.add_parser("disconnect", help="Disconnect from the BLE device")
+    subparsers.add_parser("reconnect", help="Reconnect to the BLE device")
 
     scan_parser = subparsers.add_parser(
         "scan", help="Scan for BLE devices and print candidates"
@@ -1951,6 +2148,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Authenticate before watching if credentials exist",
     )
+    watch_parser.add_argument(
+        "--count", type=int, help="Stop after this many frames are printed"
+    )
+    watch_parser.add_argument(
+        "--timeout", type=float, help="Stop watching after this many seconds"
+    )
 
     playback_parser = subparsers.add_parser("playback", help="Playback commands")
     playback_subparsers = playback_parser.add_subparsers(
@@ -1981,6 +2184,9 @@ def parse_args() -> argparse.Namespace:
     library_tracks = library_subparsers.add_parser("tracks")
     library_tracks.add_argument("--offset", type=int, default=0)
     library_tracks.add_argument("--count", type=int, default=8)
+    library_cover = library_subparsers.add_parser("cover")
+    library_cover.add_argument("--output", default="cover.png")
+    library_cover.add_argument("--chunk-size", type=int, default=1024)
 
     wifi_parser = subparsers.add_parser("wifi", help="Wi-Fi commands")
     wifi_subparsers = wifi_parser.add_subparsers(dest="wifi_command", required=True)
@@ -2031,109 +2237,292 @@ def parse_args() -> argparse.Namespace:
     bt_subparsers.add_parser("pair-best")
     bt_subparsers.add_parser("disconnect")
 
+    return parser
+
+
+def parse_startup_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Interactive BLE REPL for the Jukeboy companion API v1"
+    )
+    add_common_connection_args(parser)
+    parser.add_argument(
+        "--no-connect",
+        action="store_true",
+        help="Start the REPL without connecting until a command needs it",
+    )
     return parser.parse_args()
 
 
-async def main_async(args: argparse.Namespace) -> int:
-    if args.command == "scan":
-        await print_scan(args.scan_timeout)
-        return 0
+class CompanionRepl:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.state_store = StateStore(args.state_file)
+        self.profile = resolve_profile(args)
+        self.client = CompanionBleClient(
+            address=args.address,
+            name=args.name,
+            scan_timeout=args.scan_timeout,
+            timeout=args.timeout,
+            verbose=args.verbose,
+        )
+        self.command_parser = build_command_parser()
+        self.pending_pairing: CompanionCredentials | None = None
 
-    state_store = StateStore(args.state_file)
-    profile = resolve_profile(args)
+    def prompt(self) -> str:
+        connection_state = "online" if self.client.is_connected else "offline"
+        pairing_state = "*" if self.pending_pairing is not None else ""
+        return f"companion[{self.profile}:{connection_state}{pairing_state}]> "
 
-    async with CompanionBleClient(
-        address=args.address,
-        name=args.name,
-        scan_timeout=args.scan_timeout,
-        timeout=args.timeout,
-        verbose=args.verbose,
-    ) as client:
+    def parse_command(self, line: str) -> argparse.Namespace | None:
+        stripped = line.strip()
+        if not stripped:
+            return None
+
+        try:
+            tokens = shlex.split(stripped)
+        except ValueError as exc:
+            print(f"Parse error: {exc}", file=sys.stderr)
+            return None
+
+        if not tokens:
+            return None
+
+        head = tokens[0].lower()
+        if head in {"quit", "exit"}:
+            return argparse.Namespace(command="quit")
+
+        if head in {"help", "?"}:
+            if len(tokens) == 1:
+                self.command_parser.print_help()
+                return None
+            tokens = [*tokens[1:], "--help"]
+
+        try:
+            return self.command_parser.parse_args(tokens)
+        except ReplParserExit:
+            return None
+        except ValueError as exc:
+            print(f"Parse error: {exc}", file=sys.stderr)
+            return None
+
+    async def connect(self) -> None:
+        if self.client.is_connected:
+            return
+
+        await self.client.connect()
+        target_name = (
+            self.client.device.name if self.client.device is not None else None
+        )
+        target_address = (
+            self.client.device.address
+            if self.client.device is not None
+            else "<unknown>"
+        )
+        print(f"Connected to {target_name or '<unnamed>'} @ {target_address}")
+
+        if self.args.no_auto_auth:
+            return
+
+        credentials = resolve_credentials(self.args, self.state_store, self.profile)
+        if credentials is None:
+            return
+
+        try:
+            auth_status = await authenticate_with_credentials(self.client, credentials)
+        except CompanionApiError as exc:
+            print(f"Auto-auth failed: {exc}", file=sys.stderr)
+            return
+
+        if auth_status.get("authenticated"):
+            client_id = auth_status.get("client_id") or credentials.client_id
+            print(f"Authenticated as {client_id}")
+
+    async def disconnect(self) -> None:
+        await self.sync_pending_pairing()
+        if self.pending_pairing is not None:
+            print(
+                "Discarding incomplete pairing; credentials were not saved.",
+                file=sys.stderr,
+            )
+            self.pending_pairing = None
+
+        if not self.client.is_connected:
+            return
+
+        await self.client.disconnect()
+        print("Disconnected")
+
+    async def reconnect(self) -> None:
+        await self.disconnect()
+        await self.connect()
+
+    async def sync_pending_pairing(self) -> bool:
+        if self.pending_pairing is None or not self.client.is_connected:
+            return False
+
+        capabilities = await self.client.capabilities()
+        if not capabilities.get("authenticated"):
+            return False
+        if capabilities.get("client_id") != self.pending_pairing.client_id:
+            return False
+
+        self.state_store.put_credentials(self.profile, self.pending_pairing)
+        print(
+            f"Saved pairing credentials for profile {self.profile!r} to {self.state_store.path}"
+        )
+        self.pending_pairing = None
+        return True
+
+    async def authenticate(self) -> dict[str, Any]:
+        credentials = require_resolved_credentials(
+            self.args, self.state_store, self.profile
+        )
+        return await authenticate_with_credentials(self.client, credentials)
+
+    async def run_pair_command(self, args: argparse.Namespace) -> Any:
+        result, credentials = await handle_pair_command(self.client, args, self.args)
+
+        if args.pair_command == "cancel":
+            self.pending_pairing = None
+
+        if credentials is not None:
+            self.pending_pairing = credentials
+            result["profile"] = self.profile
+            result["state_file"] = str(self.state_store.path)
+            if result.get("authenticated") and await self.sync_pending_pairing():
+                result["credentials_saved"] = True
+            else:
+                result["credentials_saved"] = False
+
+        return result
+
+    async def run_command(self, args: argparse.Namespace) -> bool:
+        if args.command == "quit":
+            return True
+
+        if args.command == "scan":
+            await print_scan(args.scan_timeout)
+            return False
+
+        if args.command == "connect":
+            await self.connect()
+            return False
+
+        if args.command == "disconnect":
+            await self.disconnect()
+            return False
+
+        if args.command == "reconnect":
+            await self.reconnect()
+            return False
+
+        if not self.client.is_connected:
+            await self.connect()
+
         if args.command == "hello":
-            json_dump(await client.hello())
-            return 0
+            json_dump(await self.client.hello())
+            await self.sync_pending_pairing()
+            return False
 
         if args.command == "capabilities":
-            json_dump(await client.capabilities())
-            return 0
+            json_dump(await self.client.capabilities())
+            await self.sync_pending_pairing()
+            return False
 
         if args.command == "ping":
-            json_dump(await client.ping(args.text))
-            return 0
+            json_dump(await self.client.ping(args.text))
+            await self.sync_pending_pairing()
+            return False
 
         if args.command == "pair":
-            json_dump(await handle_pair_command(client, args, state_store, profile))
-            return 0
+            json_dump(await self.run_pair_command(args))
+            await self.sync_pending_pairing()
+            return False
 
         if args.command == "auth":
-            credentials = resolve_credentials(args, state_store, profile)
-            if credentials is None:
-                raise SystemExit(
-                    "No credentials were found. Pair first or supply --client-id and --secret-hex."
-                )
-            challenge = await client.auth_challenge(credentials.client_id)
-            nonce_hex = challenge.get("nonce_hex")
-            if not isinstance(nonce_hex, str):
-                raise RuntimeError("Auth challenge response did not include a nonce")
-            json_dump(
-                await client.auth_proof(
-                    credentials.client_id, credentials.secret, bytes.fromhex(nonce_hex)
-                )
-            )
-            return 0
+            json_dump(await self.authenticate())
+            await self.sync_pending_pairing()
+            return False
 
         if args.command == "watch":
-            if args.auth and not args.no_auto_auth:
-                await ensure_authenticated(client, state_store, profile, args)
-            await watch_events(client)
-            return 0
+            if args.auth and not self.args.no_auto_auth:
+                await ensure_authenticated(
+                    self.client, self.state_store, self.profile, self.args
+                )
+            await watch_events(self.client, count=args.count, timeout=args.timeout)
+            await self.sync_pending_pairing()
+            return False
 
-        if command_should_auto_auth(args):
-            await ensure_authenticated(client, state_store, profile, args)
+        if command_should_auto_auth(args) and not self.args.no_auto_auth:
+            await ensure_authenticated(
+                self.client, self.state_store, self.profile, self.args
+            )
 
         if args.command == "trusted":
-            json_dump(await handle_trusted_command(client, args))
-            return 0
-
-        if args.command == "snapshot":
-            json_dump(await client.snapshot())
-            return 0
-
-        if args.command == "playback":
-            json_dump(await handle_playback_command(client, args))
-            return 0
-
-        if args.command == "library":
-            json_dump(await handle_library_command(client, args))
-            return 0
-
-        if args.command == "wifi":
+            json_dump(await handle_trusted_command(self.client, args))
+        elif args.command == "snapshot":
+            json_dump(await self.client.snapshot())
+        elif args.command == "playback":
+            json_dump(await handle_playback_command(self.client, args))
+        elif args.command == "library":
+            json_dump(await handle_library_command(self.client, args))
+        elif args.command == "wifi":
             if hasattr(args, "enabled") and isinstance(args.enabled, str):
                 args.enabled = args.enabled == "on"
-            json_dump(await handle_wifi_command(client, args))
-            return 0
-
-        if args.command == "lastfm":
+            json_dump(await handle_wifi_command(self.client, args))
+        elif args.command == "lastfm":
             if hasattr(args, "enabled") and isinstance(args.enabled, str):
                 args.enabled = args.enabled == "on"
-            json_dump(await handle_lastfm_command(client, args))
-            return 0
+            json_dump(await handle_lastfm_command(self.client, args))
+        elif args.command == "history":
+            json_dump(await handle_history_command(self.client, args))
+        elif args.command == "bt":
+            json_dump(await handle_bt_command(self.client, args))
+        else:
+            raise AssertionError(f"Unhandled command {args.command!r}")
 
-        if args.command == "history":
-            json_dump(await handle_history_command(client, args))
-            return 0
+        await self.sync_pending_pairing()
+        return False
 
-        if args.command == "bt":
-            json_dump(await handle_bt_command(client, args))
-            return 0
+    async def run(self) -> int:
+        print("Jukeboy companion REPL")
+        print(f"Profile: {self.profile}")
+        print(f"State file: {self.state_store.path}")
+        print("Type 'help' for commands and 'quit' to exit.")
 
-    raise AssertionError(f"Unhandled command {args.command!r}")
+        if not self.args.no_connect:
+            try:
+                await self.connect()
+            except Exception as exc:
+                print(f"Initial connect failed: {exc}", file=sys.stderr)
+
+        while True:
+            try:
+                line = await asyncio.to_thread(input, self.prompt())
+            except EOFError:
+                print()
+                break
+
+            command_args = self.parse_command(line)
+            if command_args is None:
+                continue
+
+            try:
+                if await self.run_command(command_args):
+                    break
+            except CompanionApiError as exc:
+                print(str(exc), file=sys.stderr)
+            except Exception as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+
+        await self.disconnect()
+        return 0
 
 
 def main() -> int:
-    args = parse_args()
+    args = parse_startup_args()
     try:
-        return asyncio.run(main_async(args))
+        return asyncio.run(CompanionRepl(args).run())
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
         return 130

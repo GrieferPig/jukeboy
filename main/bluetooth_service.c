@@ -104,7 +104,7 @@ static const uint16_t s_ble_spp_character_client_config_uuid = ESP_GATT_UUID_CHA
 static const uint8_t s_ble_spp_char_prop_read_write =
     ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE_NR;
 static const uint8_t s_ble_spp_char_prop_read_notify =
-    ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY | ESP_GATT_CHAR_PROP_BIT_INDICATE;
+    ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
 static const uint16_t s_ble_spp_service_uuid = BT_SVC_BLE_SPP_SERVICE_UUID;
 static const uint16_t s_ble_spp_data_receive_uuid = BT_SVC_BLE_SPP_DATA_RECEIVE_UUID;
 static const uint16_t s_ble_spp_data_notify_uuid = BT_SVC_BLE_SPP_DATA_NOTIFY_UUID;
@@ -213,6 +213,7 @@ ESP_EVENT_DEFINE_BASE(BLUETOOTH_SERVICE_EVENT);
 typedef enum
 {
     BT_SVC_CMD_PAIR_BEST,
+    BT_SVC_CMD_START_DISCOVERY,
     BT_SVC_CMD_CONNECT_LAST_BONDED,
     BT_SVC_CMD_PAIRING_CONFIRM_REQUEST,
     BT_SVC_CMD_PAIRING_CONFIRM_REPLY,
@@ -1040,7 +1041,7 @@ static void bt_svc_spp_gatts_cb(esp_gatts_cb_event_t event,
                     else if (value[0] == 0x02 && value[1] == 0x00)
                     {
                         s_spp_data_notifications_enabled = true;
-                        s_spp_data_indications_enabled = true;
+                        s_spp_data_indications_enabled = false;
                     }
                     else if (value[0] == 0x00 && value[1] == 0x00)
                     {
@@ -1207,6 +1208,20 @@ static void bt_svc_process_msg(const bluetooth_service_msg_t *msg)
             esp_bt_gap_cancel_discovery();
         }
         ESP_LOGI(TAG, "starting discovery for A2DP sink pairing");
+        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY,
+                                   BT_SVC_DISCOVERY_LENGTH,
+                                   0);
+        break;
+    }
+    case BT_SVC_CMD_START_DISCOVERY:
+    {
+        bt_svc_reset_discovery_results();
+        s_pair_request_pending = false;
+        if (s_discovery_running)
+        {
+            esp_bt_gap_cancel_discovery();
+        }
+        ESP_LOGI(TAG, "starting discovery (passive)");
         esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY,
                                    BT_SVC_DISCOVERY_LENGTH,
                                    0);
@@ -1722,6 +1737,67 @@ esp_err_t bluetooth_service_get_bonded_devices(size_t *count, esp_bd_addr_t *dev
     esp_err_t err = esp_bt_gap_get_bond_device_list(&device_count, devices);
     *count = device_count > 0 ? (size_t)device_count : 0;
     return err;
+}
+
+esp_err_t bluetooth_service_start_discovery(void)
+{
+    bluetooth_service_msg_t msg = {.cmd = BT_SVC_CMD_START_DISCOVERY};
+    if (!s_cmd_queue)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return xQueueSend(s_cmd_queue, &msg, bt_svc_queue_timeout_ticks()) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+bool bluetooth_service_is_discovery_running(void)
+{
+    return s_discovery_running;
+}
+
+esp_err_t bluetooth_service_get_discovery_results(bluetooth_service_scan_entry_t *out_entries,
+                                                  size_t *count)
+{
+    size_t capacity;
+    size_t copied = 0;
+
+    if (!out_entries || !count)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    capacity = *count;
+    if (capacity == 0)
+    {
+        *count = 0;
+        return ESP_OK;
+    }
+
+    taskENTER_CRITICAL(&s_state_lock);
+    for (size_t index = 0; index < s_discovered_count && copied < capacity; index++)
+    {
+        if (!s_discovered[index].valid)
+        {
+            continue;
+        }
+        memcpy(out_entries[copied].bda, s_discovered[index].bda, ESP_BD_ADDR_LEN);
+        out_entries[copied].rssi = s_discovered[index].rssi;
+        out_entries[copied].cod = s_discovered[index].cod;
+        memcpy(out_entries[copied].name, s_discovered[index].name, sizeof(out_entries[copied].name));
+        copied++;
+    }
+    taskEXIT_CRITICAL(&s_state_lock);
+
+    *count = copied;
+    return ESP_OK;
+}
+
+esp_err_t bluetooth_service_unbond(const esp_bd_addr_t addr)
+{
+    if (!addr)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return esp_bt_gap_remove_bond_device((uint8_t *)addr);
 }
 
 esp_err_t bluetooth_service_shutdown(void)

@@ -8,7 +8,7 @@
     "IDF_TARGET": "esp32"
   },
   "idf.qemuExtraArgs": [
-    "--qemu-extra-args=\"-monitor none -drive file=build/sd_image.bin,if=sd,format=raw\"",
+    "--qemu-extra-args=\"-monitor none -drive file=build/sd_image.bin,if=sd,format=raw\""
   ],
   "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
@@ -17,6 +17,6 @@
     "--compile-commands-dir=c:\\Users\\GrieferPig\\bttest\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM10",
-  "idf.enableCCache": true,
+  "idf.portWin": "COM7",
+  "idf.enableCCache": true
 }
