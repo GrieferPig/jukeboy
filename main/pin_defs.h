@@ -7,6 +7,10 @@
 #define HAL_I2S_WS_PIN GPIO_NUM_21
 #define HAL_I2S_DATA_PIN GPIO_NUM_20
 
+/* ESP32 A2DP coprocessor control UART */
+#define HAL_A2DP_UART_TX_PIN GPIO_NUM_6
+#define HAL_A2DP_UART_RX_PIN GPIO_NUM_7
+
 /* Power gating and LED assignments */
 #define HAL_DAC_POWER_GATE_PIN GPIO_NUM_NC
 #define HAL_DAC_MUTE_PIN GPIO_NUM_NC

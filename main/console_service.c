@@ -20,6 +20,7 @@
 #include "esp_wifi.h"
 #include "argtable3/argtable3.h"
 
+#include "a2dp_coprocessor_service.h"
 #include "bluetooth_service.h"
 #include "wifi_service.h"
 #include "companion_api_service.h"
@@ -543,11 +544,487 @@ static int bt_status_handler(int argc, char **argv)
     (void)argc;
     (void)argv;
 
+    a2dp_coprocessor_status_t a2dp_status = {0};
+    esp_err_t refresh_err = a2dp_coprocessor_service_refresh_status();
+    a2dp_coprocessor_service_get_status(&a2dp_status);
+
+    printf("A2DP coprocessor: %s", a2dp_status.initialised ? "started" : "stopped");
+    if (refresh_err != ESP_OK)
+    {
+        printf(" (status refresh: %s)", esp_err_to_name(refresh_err));
+    }
+    printf("\n");
+    printf("Coprocessor link: %s\n", a2dp_status.coprocessor_seen ? "seen" : "not seen");
+    printf("Discovery:        %s\n", a2dp_status.discovery_running ? "running" : "idle");
+    printf("A2DP connected:   %s\n", a2dp_status.a2dp_connected ? "yes" : "no");
+    printf("I2S mirror:       %s\n", a2dp_status.i2s_running ? "running" : "stopped");
+    printf("Audio state:      %u\n", (unsigned)a2dp_status.audio_state);
+    printf("Volume:           %u/127\n", (unsigned)a2dp_status.local_volume);
+    printf("Connected sink:   %02x:%02x:%02x:%02x:%02x:%02x\n",
+           a2dp_status.connected_bda[0],
+           a2dp_status.connected_bda[1],
+           a2dp_status.connected_bda[2],
+           a2dp_status.connected_bda[3],
+           a2dp_status.connected_bda[4],
+           a2dp_status.connected_bda[5]);
+    printf("PCM tap:          %lu/%lu bytes, underruns=%lu overruns=%lu, %lu Hz %u-bit x%u\n",
+           (unsigned long)a2dp_status.buffered_bytes,
+           (unsigned long)a2dp_status.capacity_bytes,
+           (unsigned long)a2dp_status.underrun_count,
+           (unsigned long)a2dp_status.overrun_count,
+           (unsigned long)a2dp_status.sample_rate_hz,
+           (unsigned)a2dp_status.bits_per_sample,
+           (unsigned)a2dp_status.channel_count);
+    printf("UART frames:      rx=%lu tx=%lu crc_errors=%lu timeouts=%lu\n",
+           (unsigned long)a2dp_status.rx_frames,
+           (unsigned long)a2dp_status.tx_frames,
+           (unsigned long)a2dp_status.crc_errors,
+           (unsigned long)a2dp_status.command_timeouts);
     printf("BLE companion service: %s\n", bluetooth_service_is_initialised() ? "started" : "stopped");
     printf("SPP connected: %s\n", bluetooth_service_is_spp_connected() ? "yes" : "no");
     printf("SPP notifications: %s\n", bluetooth_service_spp_notifications_enabled() ? "yes" : "no");
     printf("MTU: %u\n", (unsigned int)bluetooth_service_spp_get_mtu());
     printf("Max payload: %u\n", (unsigned int)bluetooth_service_spp_get_max_payload());
+    return 0;
+}
+
+static const char *bt_media_key_name(uint8_t key_code)
+{
+    switch (key_code)
+    {
+    case A2DP_COPROCESSOR_MEDIA_KEY_PLAY:
+        return "play";
+    case A2DP_COPROCESSOR_MEDIA_KEY_STOP:
+        return "stop";
+    case A2DP_COPROCESSOR_MEDIA_KEY_PAUSE:
+        return "pause";
+    case A2DP_COPROCESSOR_MEDIA_KEY_FORWARD:
+        return "next";
+    case A2DP_COPROCESSOR_MEDIA_KEY_BACKWARD:
+        return "prev";
+    case A2DP_COPROCESSOR_MEDIA_KEY_FAST_FORWARD:
+        return "ff";
+    case A2DP_COPROCESSOR_MEDIA_KEY_REWIND:
+        return "rewind";
+    case A2DP_COPROCESSOR_MEDIA_KEY_VOL_UP:
+        return "vol_up";
+    case A2DP_COPROCESSOR_MEDIA_KEY_VOL_DOWN:
+        return "vol_down";
+    case A2DP_COPROCESSOR_MEDIA_KEY_MUTE:
+        return "mute";
+    default:
+        return "custom";
+    }
+}
+
+static bool bt_parse_media_key(const char *value, uint8_t *key_code)
+{
+    char *end = NULL;
+    unsigned long numeric_value;
+
+    if (!value || !key_code)
+    {
+        return false;
+    }
+
+    if (strcmp(value, "play") == 0)
+    {
+        *key_code = A2DP_COPROCESSOR_MEDIA_KEY_PLAY;
+    }
+    else if (strcmp(value, "pause") == 0)
+    {
+        *key_code = A2DP_COPROCESSOR_MEDIA_KEY_PAUSE;
+    }
+    else if (strcmp(value, "stop") == 0)
+    {
+        *key_code = A2DP_COPROCESSOR_MEDIA_KEY_STOP;
+    }
+    else if (strcmp(value, "next") == 0 || strcmp(value, "forward") == 0)
+    {
+        *key_code = A2DP_COPROCESSOR_MEDIA_KEY_FORWARD;
+    }
+    else if (strcmp(value, "prev") == 0 || strcmp(value, "previous") == 0 || strcmp(value, "back") == 0)
+    {
+        *key_code = A2DP_COPROCESSOR_MEDIA_KEY_BACKWARD;
+    }
+    else if (strcmp(value, "ff") == 0 || strcmp(value, "fast_forward") == 0)
+    {
+        *key_code = A2DP_COPROCESSOR_MEDIA_KEY_FAST_FORWARD;
+    }
+    else if (strcmp(value, "rewind") == 0)
+    {
+        *key_code = A2DP_COPROCESSOR_MEDIA_KEY_REWIND;
+    }
+    else if (strcmp(value, "vol_up") == 0 || strcmp(value, "volume_up") == 0)
+    {
+        *key_code = A2DP_COPROCESSOR_MEDIA_KEY_VOL_UP;
+    }
+    else if (strcmp(value, "vol_down") == 0 || strcmp(value, "volume_down") == 0)
+    {
+        *key_code = A2DP_COPROCESSOR_MEDIA_KEY_VOL_DOWN;
+    }
+    else if (strcmp(value, "mute") == 0)
+    {
+        *key_code = A2DP_COPROCESSOR_MEDIA_KEY_MUTE;
+    }
+    else
+    {
+        numeric_value = strtoul(value, &end, 0);
+        if (!end || *end != '\0' || numeric_value > UINT8_MAX)
+        {
+            return false;
+        }
+        *key_code = (uint8_t)numeric_value;
+    }
+
+    return true;
+}
+
+static void bt_print_bda(const a2dp_coprocessor_addr_t bda)
+{
+    printf("%02x:%02x:%02x:%02x:%02x:%02x",
+           bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+}
+
+static bool bt_parse_bda(const char *value, a2dp_coprocessor_addr_t bda)
+{
+    unsigned int octets[A2DP_COPROCESSOR_ADDR_LEN];
+
+    if (!value || !bda)
+    {
+        return false;
+    }
+
+    if (sscanf(value,
+               "%02x:%02x:%02x:%02x:%02x:%02x",
+               &octets[0],
+               &octets[1],
+               &octets[2],
+               &octets[3],
+               &octets[4],
+               &octets[5]) != A2DP_COPROCESSOR_ADDR_LEN)
+    {
+        return false;
+    }
+
+    for (size_t index = 0; index < A2DP_COPROCESSOR_ADDR_LEN; index++)
+    {
+        if (octets[index] > UINT8_MAX)
+        {
+            return false;
+        }
+        bda[index] = (uint8_t)octets[index];
+    }
+    return true;
+}
+
+static int bt_pair_handler(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    esp_err_t err = a2dp_coprocessor_service_pair_best_a2dp_sink();
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Starting Bluetooth discovery and best-sink pairing...\n");
+    return 0;
+}
+
+static int bt_connect_handler(int argc, char **argv)
+{
+    esp_err_t err;
+
+    if (argc >= 2)
+    {
+        a2dp_coprocessor_addr_t bda;
+        if (!bt_parse_bda(argv[1], bda))
+        {
+            printf("Usage: bt connect [aa:bb:cc:dd:ee:ff]\n");
+            return 1;
+        }
+        err = a2dp_coprocessor_service_connect_a2dp(bda);
+    }
+    else
+    {
+        err = a2dp_coprocessor_service_connect_last_bonded_a2dp_device();
+    }
+
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Connect request sent.\n");
+    return 0;
+}
+
+static int bt_disconnect_handler(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    esp_err_t err = a2dp_coprocessor_service_disconnect_a2dp();
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Disconnect request sent.\n");
+    return 0;
+}
+
+static int bt_confirm_handler(int argc, char **argv)
+{
+    a2dp_coprocessor_pairing_confirm_t confirm = {0};
+    const char *action = argc >= 2 ? argv[1] : NULL;
+
+    esp_err_t err = a2dp_coprocessor_service_get_pending_pairing_confirm(&confirm);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    if (!confirm.pending)
+    {
+        printf("No Bluetooth pairing confirmation is pending.\n");
+        return 1;
+    }
+
+    if (!action)
+    {
+        printf("Pending pairing confirmation for ");
+        bt_print_bda(confirm.remote_bda);
+        printf(" passkey=%06lu\n", (unsigned long)confirm.numeric_value);
+        printf("Usage: bt confirm <accept|reject>\n");
+        return 0;
+    }
+
+    if (strcmp(action, "accept") != 0 && strcmp(action, "reject") != 0)
+    {
+        printf("Usage: bt confirm <accept|reject>\n");
+        return 1;
+    }
+
+    err = a2dp_coprocessor_service_reply_pairing_confirm(strcmp(action, "accept") == 0);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Bluetooth pairing confirmation %s for ", action);
+    bt_print_bda(confirm.remote_bda);
+    printf(" passkey=%06lu\n", (unsigned long)confirm.numeric_value);
+    return 0;
+}
+
+static struct
+{
+    struct arg_str *action;
+    struct arg_end *end;
+} s_bt_audio_args;
+
+static int bt_audio_handler(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&s_bt_audio_args);
+    esp_err_t err;
+
+    if (nerrors)
+    {
+        arg_print_errors(stderr, s_bt_audio_args.end, argv[0]);
+        return 1;
+    }
+
+    if (s_bt_audio_args.action->count == 0)
+    {
+        printf("Usage: bt audio <start|suspend>\n");
+        return 1;
+    }
+
+    if (strcmp(s_bt_audio_args.action->sval[0], "start") == 0)
+    {
+        err = a2dp_coprocessor_service_start_audio();
+    }
+    else if (strcmp(s_bt_audio_args.action->sval[0], "suspend") == 0)
+    {
+        err = a2dp_coprocessor_service_suspend_audio();
+    }
+    else
+    {
+        printf("Usage: bt audio <start|suspend>\n");
+        return 1;
+    }
+
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Audio command sent: %s\n", s_bt_audio_args.action->sval[0]);
+    return 0;
+}
+
+static struct
+{
+    struct arg_str *key;
+    struct arg_end *end;
+} s_bt_media_key_args;
+
+static int bt_media_key_handler(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&s_bt_media_key_args);
+    uint8_t key_code;
+    esp_err_t err;
+
+    if (nerrors)
+    {
+        arg_print_errors(stderr, s_bt_media_key_args.end, argv[0]);
+        return 1;
+    }
+
+    if (!bt_parse_media_key(s_bt_media_key_args.key->sval[0], &key_code))
+    {
+        printf("Unknown media key. Use play, pause, stop, next, prev, ff, rewind, vol_up, vol_down, mute, or a numeric key code.\n");
+        return 1;
+    }
+
+    err = a2dp_coprocessor_service_send_media_key(key_code);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Sent media key %s (%u).\n", bt_media_key_name(key_code), (unsigned int)key_code);
+    return 0;
+}
+
+static int bt_bonded_handler(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    esp_err_t err = a2dp_coprocessor_service_refresh_bonded_devices();
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    size_t count = a2dp_coprocessor_service_get_bonded_device_count();
+    a2dp_coprocessor_addr_t *devices = NULL;
+
+    printf("Bonded device count: %u\n", (unsigned int)count);
+    if (count == 0)
+    {
+        return 0;
+    }
+
+    devices = calloc(count, sizeof(*devices));
+    if (!devices)
+    {
+        printf("Error: out of memory\n");
+        return 1;
+    }
+
+    err = a2dp_coprocessor_service_get_bonded_devices(&count, devices);
+    if (err != ESP_OK)
+    {
+        free(devices);
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    for (size_t index = 0; index < count; index++)
+    {
+        printf("%u. ", (unsigned int)(index + 1));
+        bt_print_bda(devices[index]);
+        printf("\n");
+    }
+
+    free(devices);
+    return 0;
+}
+
+static int bt_scan_handler(int argc, char **argv)
+{
+    const char *action = argc >= 2 ? argv[1] : "results";
+
+    if (strcmp(action, "start") == 0)
+    {
+        esp_err_t err = a2dp_coprocessor_service_start_discovery();
+        if (err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("Bluetooth discovery started.\n");
+        return 0;
+    }
+
+    if (strcmp(action, "results") != 0)
+    {
+        printf("Usage: bt scan [start|results]\n");
+        return 1;
+    }
+
+    esp_err_t err = a2dp_coprocessor_service_refresh_discovery_results();
+    if (err != ESP_OK && err != ESP_ERR_TIMEOUT)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    a2dp_coprocessor_scan_entry_t entries[A2DP_COPROCESSOR_MAX_LIST_ITEMS];
+    size_t count = A2DP_COPROCESSOR_MAX_LIST_ITEMS;
+    err = a2dp_coprocessor_service_get_discovery_results(entries, &count);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Discovered device count: %u\n", (unsigned int)count);
+    for (size_t index = 0; index < count; index++)
+    {
+        printf("%u. ", (unsigned int)(index + 1));
+        bt_print_bda(entries[index].bda);
+        printf(" RSSI=%d COD=0x%08lx %s\n",
+               (int)entries[index].rssi,
+               (unsigned long)entries[index].cod,
+               entries[index].name[0] ? entries[index].name : "");
+    }
+    return 0;
+}
+
+static int bt_unbond_handler(int argc, char **argv)
+{
+    a2dp_coprocessor_addr_t bda;
+
+    if (argc < 2 || !bt_parse_bda(argv[1], bda))
+    {
+        printf("Usage: bt unbond <aa:bb:cc:dd:ee:ff>\n");
+        return 1;
+    }
+
+    esp_err_t err = a2dp_coprocessor_service_unbond(bda);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Unbond request sent for ");
+    bt_print_bda(bda);
+    printf(".\n");
     return 0;
 }
 
@@ -896,7 +1373,16 @@ static int cmd_bt(int argc, char **argv)
 {
     static const char *usage =
         "Usage: bt <subcommand> [args]\n"
-        "  status                   Show BLE companion transport status\n";
+        "  status                   Show A2DP coprocessor and BLE companion status\n"
+        "  pair                     Discover and pair the best A2DP sink\n"
+        "  connect [addr]           Reconnect last bonded sink or connect an address\n"
+        "  confirm <accept|reject>  Reply to pending SSP pairing confirmation\n"
+        "  disconnect               Disconnect current A2DP link\n"
+        "  audio <start|suspend>    Control A2DP audio streaming\n"
+        "  media_key <key>          Send AVRCP media key (play/pause/stop/next/prev/...)\n"
+        "  scan [start|results]     Start discovery or list cached results\n"
+        "  bonded                   List bonded device addresses\n"
+        "  unbond <addr>            Remove one bonded sink\n";
 
     if (argc < 2)
     {
@@ -907,6 +1393,24 @@ static int cmd_bt(int argc, char **argv)
     const char *sub = argv[1];
     if (strcmp(sub, "status") == 0)
         return bt_status_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "pair") == 0)
+        return bt_pair_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "connect") == 0)
+        return bt_connect_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "confirm") == 0)
+        return bt_confirm_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "disconnect") == 0)
+        return bt_disconnect_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "audio") == 0)
+        return bt_audio_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "media_key") == 0)
+        return bt_media_key_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "scan") == 0)
+        return bt_scan_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "bonded") == 0)
+        return bt_bonded_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "unbond") == 0)
+        return bt_unbond_handler(argc - 1, argv + 1);
 
     printf("Unknown subcommand '%s'.\n%s", sub, usage);
     return 1;
@@ -2738,6 +3242,10 @@ esp_err_t console_service_init(void)
     esp_console_register_help_command();
 
     /* Initialise argtables */
+    s_bt_audio_args.action = arg_str1(NULL, NULL, "<start|suspend>", "A2DP media control action");
+    s_bt_audio_args.end = arg_end(1);
+    s_bt_media_key_args.key = arg_str1(NULL, NULL, "<key>", "Media key name or AVRCP passthrough code");
+    s_bt_media_key_args.end = arg_end(1);
     s_autoreconnect_args.action = arg_str0(NULL, NULL, "<on|off>", "Enable or disable");
     s_autoreconnect_args.end = arg_end(1);
     s_audio_output_args.target = arg_str0(NULL, NULL, "<status|i2s>", "Report the fixed i2s audio output");
@@ -2751,7 +3259,7 @@ esp_err_t console_service_init(void)
     /* Bluetooth command group */
     const esp_console_cmd_t bt_cmd = {
         .command = "bt",
-        .help = "Bluetooth: bt <status>",
+        .help = "Bluetooth: bt <status|pair|connect|confirm|disconnect|audio|media_key|scan|bonded|unbond> [args]",
         .hint = NULL,
         .func = cmd_bt,
     };

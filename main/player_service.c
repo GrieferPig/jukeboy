@@ -25,6 +25,7 @@
 #include "decoder/impl/esp_opus_dec.h"
 #include "esp_audio_types.h"
 
+#include "a2dp_coprocessor_service.h"
 #include "cartridge_service.h"
 #include "hid_service.h"
 #include "i2s_service.h"
@@ -112,6 +113,9 @@ typedef enum
     PLAYER_SVC_CMD_CONTROL,
     PLAYER_SVC_CMD_PLAY_INDEX,
     PLAYER_SVC_CMD_SEEK_ABSOLUTE,
+    PLAYER_SVC_CMD_A2DP_CONNECTION_STATE,
+    PLAYER_SVC_CMD_A2DP_REMOTE_COMMAND,
+    PLAYER_SVC_CMD_A2DP_VOLUME,
     PLAYER_SVC_CMD_PERSIST_FOR_SHUTDOWN,
 } player_service_cmd_t;
 
@@ -122,6 +126,11 @@ typedef struct
     uint32_t track_index;
     uint32_t seek_seconds;
     uint32_t generation;
+    bool a2dp_connected;
+    uint8_t a2dp_key_code;
+    uint8_t a2dp_key_state;
+    uint8_t a2dp_volume;
+    bool a2dp_volume_from_remote_target;
     SemaphoreHandle_t completion_semaphore;
     esp_err_t *result_out;
 } player_service_msg_t;
@@ -205,6 +214,10 @@ static volatile bool s_stop_requested;
 static uint32_t s_active_generation;
 static uint32_t s_cancelled_generation;
 static uint8_t s_volume_level = PLAYER_SVC_DEFAULT_VOLUME_LEVEL;
+static bool s_a2dp_connected;
+static bool s_a2dp_audio_output_active;
+static bool s_a2dp_volume_override_active;
+static uint8_t s_a2dp_saved_volume_level = PLAYER_SVC_DEFAULT_VOLUME_LEVEL;
 static player_service_playback_mode_t s_playback_mode = PLAYER_SVC_MODE_SEQUENTIAL;
 static size_t *s_shuffle_order = NULL; /* PSRAM array; length == s_playlist_count */
 static size_t s_shuffle_position = 0;  /* position of current track in s_shuffle_order; SIZE_MAX = not started */
@@ -322,6 +335,117 @@ static bool player_service_queue_track_complete(uint32_t generation)
         .generation = generation,
     };
     return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
+}
+
+static bool player_service_queue_a2dp_connection_state(bool connected)
+{
+    player_service_msg_t msg = {
+        .cmd = PLAYER_SVC_CMD_A2DP_CONNECTION_STATE,
+        .a2dp_connected = connected,
+    };
+    return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
+}
+
+static bool player_service_queue_a2dp_remote_command(uint8_t key_code, uint8_t key_state)
+{
+    player_service_msg_t msg = {
+        .cmd = PLAYER_SVC_CMD_A2DP_REMOTE_COMMAND,
+        .a2dp_key_code = key_code,
+        .a2dp_key_state = key_state,
+    };
+    return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
+}
+
+static bool player_service_queue_a2dp_volume(uint8_t volume, bool from_remote_target)
+{
+    player_service_msg_t msg = {
+        .cmd = PLAYER_SVC_CMD_A2DP_VOLUME,
+        .a2dp_volume = volume,
+        .a2dp_volume_from_remote_target = from_remote_target,
+    };
+    return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
+}
+
+static bool player_service_control_from_avrcp_key(uint8_t key_code, player_service_control_t *control)
+{
+    if (!control)
+    {
+        return false;
+    }
+
+    switch (key_code)
+    {
+    case A2DP_COPROCESSOR_MEDIA_KEY_FORWARD:
+        *control = PLAYER_SVC_CONTROL_NEXT;
+        return true;
+    case A2DP_COPROCESSOR_MEDIA_KEY_BACKWARD:
+        *control = PLAYER_SVC_CONTROL_PREVIOUS;
+        return true;
+    case A2DP_COPROCESSOR_MEDIA_KEY_FAST_FORWARD:
+        *control = PLAYER_SVC_CONTROL_FAST_FORWARD;
+        return true;
+    case A2DP_COPROCESSOR_MEDIA_KEY_REWIND:
+        *control = PLAYER_SVC_CONTROL_FAST_BACKWARD;
+        return true;
+    case A2DP_COPROCESSOR_MEDIA_KEY_VOL_UP:
+        *control = PLAYER_SVC_CONTROL_VOLUME_UP;
+        return true;
+    case A2DP_COPROCESSOR_MEDIA_KEY_VOL_DOWN:
+        *control = PLAYER_SVC_CONTROL_VOLUME_DOWN;
+        return true;
+    case A2DP_COPROCESSOR_MEDIA_KEY_PAUSE:
+    case A2DP_COPROCESSOR_MEDIA_KEY_PLAY:
+    case A2DP_COPROCESSOR_MEDIA_KEY_STOP:
+        *control = PLAYER_SVC_CONTROL_PAUSE;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void player_service_on_a2dp_coprocessor_event(a2dp_coprocessor_event_t event,
+                                                     const a2dp_coprocessor_event_data_t *data,
+                                                     void *user_ctx)
+{
+    (void)user_ctx;
+
+    if (!data)
+    {
+        return;
+    }
+
+    switch (event)
+    {
+    case A2DP_COPROCESSOR_EVENT_STATUS:
+        if (!player_service_queue_a2dp_connection_state(data->data.status.a2dp_connected))
+        {
+            ESP_LOGW(TAG, "dropped A2DP status event");
+        }
+        break;
+    case A2DP_COPROCESSOR_EVENT_A2DP_CONNECTION_STATE:
+        if (!player_service_queue_a2dp_connection_state(
+                data->data.a2dp_connection.state == A2DP_COPROCESSOR_CONNECTION_STATE_CONNECTED))
+        {
+            ESP_LOGW(TAG, "dropped A2DP connection event");
+        }
+        break;
+    case A2DP_COPROCESSOR_EVENT_AVRCP_REMOTE_COMMAND:
+        if (!player_service_queue_a2dp_remote_command(data->data.avrc_remote_command.key_code,
+                                                      data->data.avrc_remote_command.key_state))
+        {
+            ESP_LOGW(TAG, "dropped A2DP AVRCP command event");
+        }
+        break;
+    case A2DP_COPROCESSOR_EVENT_AVRCP_VOLUME:
+        if (!player_service_queue_a2dp_volume(data->data.avrc_volume.volume,
+                                              data->data.avrc_volume.from_remote_target))
+        {
+            ESP_LOGW(TAG, "dropped A2DP AVRCP volume event");
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 static StreamBufferHandle_t player_service_create_pcm_stream(void)
@@ -1070,6 +1194,7 @@ static esp_err_t player_service_load_saved_volume_level(void)
 static esp_err_t player_service_write_volume_level(void)
 {
     nvs_handle_t handle;
+    uint8_t volume_level = s_a2dp_volume_override_active ? s_a2dp_saved_volume_level : s_volume_level;
     esp_err_t err = nvs_open(PLAYER_SVC_NVS_NAMESPACE, NVS_READWRITE, &handle);
 
     if (err != ESP_OK)
@@ -1080,7 +1205,7 @@ static esp_err_t player_service_write_volume_level(void)
         return err;
     }
 
-    err = nvs_set_u8(handle, PLAYER_SVC_NVS_KEY_VOLUME, s_volume_level);
+    err = nvs_set_u8(handle, PLAYER_SVC_NVS_KEY_VOLUME, volume_level);
     if (err == ESP_OK)
     {
         err = nvs_commit(handle);
@@ -1526,6 +1651,90 @@ static void player_service_stop_playback(bool cancelled)
 
     s_stop_requested = true;
     player_service_wait_for_playback_stop();
+}
+
+static uint8_t player_service_volume_level_from_absolute(uint8_t volume_127)
+{
+    uint8_t level = (uint8_t)((uint32_t)volume_127 * (PLAYER_SVC_VOLUME_LEVEL_COUNT - 1U) / 127U);
+    if (level >= PLAYER_SVC_VOLUME_LEVEL_COUNT)
+    {
+        level = PLAYER_SVC_VOLUME_LEVEL_COUNT - 1U;
+    }
+    return level;
+}
+
+static void player_service_set_volume_absolute_internal(uint8_t volume_127)
+{
+    if (s_a2dp_volume_override_active)
+    {
+        ESP_LOGI(TAG, "ignoring volume change %u/127 while A2DP output override is active", (unsigned)volume_127);
+        return;
+    }
+
+    s_volume_level = player_service_volume_level_from_absolute(volume_127);
+    ESP_LOGI(TAG, "volume set to %u%% (absolute %u/127)", player_service_get_volume_percent(), volume_127);
+}
+
+static void player_service_enable_a2dp_volume_override(void)
+{
+    if (s_a2dp_volume_override_active)
+    {
+        return;
+    }
+
+    s_a2dp_saved_volume_level = s_volume_level;
+    s_a2dp_volume_override_active = true;
+    s_volume_level = PLAYER_SVC_VOLUME_LEVEL_COUNT - 1U;
+    ESP_LOGI(TAG, "A2DP output active, temporarily forcing I2S volume to 100%%");
+}
+
+static void player_service_disable_a2dp_volume_override(void)
+{
+    if (!s_a2dp_volume_override_active)
+    {
+        return;
+    }
+
+    s_volume_level = s_a2dp_saved_volume_level;
+    s_a2dp_volume_override_active = false;
+    ESP_LOGI(TAG, "A2DP output inactive, restored I2S volume to %u%%", player_service_get_volume_percent());
+}
+
+static bool player_service_should_run_a2dp_output(void)
+{
+    return s_a2dp_connected && s_playing && !s_paused;
+}
+
+static void player_service_update_a2dp_output(void)
+{
+    bool should_run = player_service_should_run_a2dp_output();
+
+    if (should_run && !s_a2dp_audio_output_active)
+    {
+        player_service_enable_a2dp_volume_override();
+        esp_err_t err = a2dp_coprocessor_service_start_audio();
+        if (err == ESP_OK)
+        {
+            s_a2dp_audio_output_active = true;
+            ESP_LOGI(TAG, "A2DP audio output enabled");
+        }
+        else
+        {
+            player_service_disable_a2dp_volume_override();
+            ESP_LOGW(TAG, "failed to enable A2DP audio output: %s", esp_err_to_name(err));
+        }
+    }
+    else if (!should_run && s_a2dp_audio_output_active)
+    {
+        esp_err_t err = a2dp_coprocessor_service_suspend_audio();
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "failed to disable A2DP audio output: %s", esp_err_to_name(err));
+        }
+        s_a2dp_audio_output_active = false;
+        player_service_disable_a2dp_volume_override();
+        ESP_LOGI(TAG, "A2DP audio output disabled");
+    }
 }
 
 static inline int16_t player_service_scale_sample(int16_t sample, uint16_t gain_q8)
@@ -2508,12 +2717,22 @@ static void player_service_handle_control(player_service_control_t control)
         }
         break;
     case PLAYER_SVC_CONTROL_VOLUME_UP:
+        if (s_a2dp_volume_override_active)
+        {
+            ESP_LOGI(TAG, "ignoring volume up while A2DP output override is active");
+            break;
+        }
         if (s_volume_level + 1U < PLAYER_SVC_VOLUME_LEVEL_COUNT)
         {
             s_volume_level++;
         }
         break;
     case PLAYER_SVC_CONTROL_VOLUME_DOWN:
+        if (s_a2dp_volume_override_active)
+        {
+            ESP_LOGI(TAG, "ignoring volume down while A2DP output override is active");
+            break;
+        }
         if (s_volume_level > 0)
         {
             s_volume_level--;
@@ -2549,6 +2768,45 @@ static void player_service_handle_control(player_service_control_t control)
     default:
         break;
     }
+}
+
+static void player_service_handle_a2dp_connection_state(bool connected)
+{
+    if (s_a2dp_connected == connected)
+    {
+        return;
+    }
+
+    s_a2dp_connected = connected;
+    ESP_LOGI(TAG, "A2DP sink %s", connected ? "connected" : "disconnected");
+}
+
+static void player_service_handle_a2dp_remote_command(uint8_t key_code, uint8_t key_state)
+{
+    player_service_control_t control;
+
+    if (key_state != A2DP_COPROCESSOR_MEDIA_KEY_STATE_PRESSED)
+    {
+        return;
+    }
+
+    if (player_service_control_from_avrcp_key(key_code, &control))
+    {
+        player_service_handle_control(control);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "ignoring unsupported A2DP sink AVRCP key %u", (unsigned)key_code);
+    }
+}
+
+static void player_service_handle_a2dp_volume(uint8_t volume, bool from_remote_target)
+{
+    ESP_LOGI(TAG,
+             "A2DP sink AVRCP volume %u/127%s",
+             (unsigned)volume,
+             from_remote_target ? " from remote target" : "");
+    player_service_set_volume_absolute_internal(volume);
 }
 
 static void player_service_handle_play_index(uint32_t track_index)
@@ -2642,6 +2900,15 @@ static void player_service_task(void *param)
         case PLAYER_SVC_CMD_SEEK_ABSOLUTE:
             player_service_handle_seek_absolute(msg.seek_seconds);
             break;
+        case PLAYER_SVC_CMD_A2DP_CONNECTION_STATE:
+            player_service_handle_a2dp_connection_state(msg.a2dp_connected);
+            break;
+        case PLAYER_SVC_CMD_A2DP_REMOTE_COMMAND:
+            player_service_handle_a2dp_remote_command(msg.a2dp_key_code, msg.a2dp_key_state);
+            break;
+        case PLAYER_SVC_CMD_A2DP_VOLUME:
+            player_service_handle_a2dp_volume(msg.a2dp_volume, msg.a2dp_volume_from_remote_target);
+            break;
         case PLAYER_SVC_CMD_PERSIST_FOR_SHUTDOWN:
         {
             esp_err_t err = player_service_persist_shutdown_state();
@@ -2662,6 +2929,8 @@ static void player_service_task(void *param)
         default:
             break;
         }
+
+        player_service_update_a2dp_output();
     }
 }
 
@@ -2807,6 +3076,10 @@ esp_err_t player_service_init(void)
     }
 
     s_initialised = true;
+    if (!app_is_running_in_qemu() && a2dp_coprocessor_service_is_initialised())
+    {
+        a2dp_coprocessor_service_register_event_callback(player_service_on_a2dp_coprocessor_event, NULL);
+    }
     ESP_ERROR_CHECK(esp_event_handler_instance_register(HID_SERVICE_EVENT,
                                                         HID_EVENT_BUTTON_DOWN,
                                                         player_service_on_hid_button_event,
@@ -2971,13 +3244,7 @@ uint8_t player_service_get_volume_percent(void)
 
 void player_service_set_volume_absolute(uint8_t volume_127)
 {
-    uint8_t level = (uint8_t)((uint32_t)volume_127 * (PLAYER_SVC_VOLUME_LEVEL_COUNT - 1U) / 127U);
-    if (level >= PLAYER_SVC_VOLUME_LEVEL_COUNT)
-    {
-        level = PLAYER_SVC_VOLUME_LEVEL_COUNT - 1;
-    }
-    s_volume_level = level;
-    ESP_LOGI(TAG, "volume set to %u%% (absolute %u/127)", player_service_get_volume_percent(), volume_127);
+    player_service_set_volume_absolute_internal(volume_127);
 }
 
 esp_err_t player_service_set_playback_mode(player_service_playback_mode_t mode)

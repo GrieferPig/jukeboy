@@ -13,6 +13,7 @@
 #include "esp_pm.h"
 #include "esp_task_wdt.h"
 
+#include "a2dp_coprocessor_service.h"
 #include "bluetooth_service.h"
 #include "cartridge_service.h"
 #include "companion_api_service.h"
@@ -61,8 +62,8 @@ static void app_run_super_loop(bool running_in_qemu)
     }
     else
     {
-        // services[service_count++] = wifi_service_process_once;
-        // services[service_count++] = bluetooth_service_process_once;
+        services[service_count++] = wifi_service_process_once;
+        services[service_count++] = bluetooth_service_process_once;
     }
 
     TickType_t idle_ticks = app_super_loop_idle_ticks();
@@ -125,6 +126,42 @@ static esp_err_t app_init_secure_nvs(void)
     return err;
 }
 
+static esp_err_t app_configure_power_management(bool running_in_qemu)
+{
+    esp_pm_config_t pm_config = {
+        .max_freq_mhz = 240,
+        .min_freq_mhz = running_in_qemu ? 240 : 80,
+        .light_sleep_enable = false,
+    };
+
+    if (running_in_qemu)
+    {
+        ESP_LOGW(TAG,
+                 "detected QEMU runtime from blank factory eFuse MAC; skipping Wi-Fi, Bluetooth, and hardware I2S init");
+        /* Lock CPU at fixed frequency: QEMU does not support dynamic frequency
+         * switching and asserts in pm_impl.c:on_freq_update if it is attempted. */
+        return esp_pm_configure(&pm_config);
+    }
+
+#if CONFIG_FREERTOS_USE_TICKLESS_IDLE
+    pm_config.light_sleep_enable = true;
+#else
+    ESP_LOGW(TAG,
+             "CONFIG_FREERTOS_USE_TICKLESS_IDLE is disabled; enabling DFS without automatic light sleep");
+#endif
+
+    esp_err_t err = esp_pm_configure(&pm_config);
+    if (err == ESP_ERR_NOT_SUPPORTED && pm_config.light_sleep_enable)
+    {
+        ESP_LOGW(TAG,
+                 "automatic light sleep is not supported by this build/runtime; retrying with DFS only");
+        pm_config.light_sleep_enable = false;
+        err = esp_pm_configure(&pm_config);
+    }
+
+    return err;
+}
+
 #include "driver/gpio.h"
 
 void app_main(void)
@@ -137,28 +174,7 @@ void app_main(void)
     };
     const bool running_in_qemu = app_is_running_in_qemu();
 
-    // if (running_in_qemu)
-    // {
-    //     ESP_LOGW(TAG,
-    //              "detected QEMU runtime from blank factory eFuse MAC; skipping Wi-Fi, Bluetooth, and hardware I2S init");
-    //     /* Lock CPU at fixed frequency: QEMU does not support dynamic frequency
-    //      * switching and asserts in pm_impl.c:on_freq_update if it is attempted. */
-    //     esp_pm_config_t pm_config = {
-    //         .max_freq_mhz = 240,
-    //         .min_freq_mhz = 240,
-    //         .light_sleep_enable = false,
-    //     };
-    //     ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
-    // }
-    // else
-    // {
-    //     esp_pm_config_t pm_config = {
-    //         .max_freq_mhz = 240,
-    //         .min_freq_mhz = 80,
-    //         .light_sleep_enable = true,
-    //     };
-    //     ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
-    // }
+    ESP_ERROR_CHECK(app_configure_power_management(running_in_qemu));
 
     ESP_ERROR_CHECK(power_mgmt_service_init());
 
@@ -179,9 +195,10 @@ void app_main(void)
     }
     else
     {
-        // ESP_ERROR_CHECK(bluetooth_service_init());
-        // ESP_ERROR_CHECK(wifi_service_init());
+        ESP_ERROR_CHECK(bluetooth_service_init());
+        ESP_ERROR_CHECK(wifi_service_init());
         ESP_ERROR_CHECK(i2s_service_init());
+        ESP_ERROR_CHECK(a2dp_coprocessor_service_init());
         ESP_ERROR_CHECK(hid_service_init());
     }
 
@@ -197,7 +214,7 @@ void app_main(void)
     }
     if (!running_in_qemu)
     {
-        // ESP_ERROR_CHECK(companion_api_service_init());
+        ESP_ERROR_CHECK(companion_api_service_init());
     }
 
     if (running_in_qemu && QEMU_PCM_SERVICE_ENABLED)
@@ -225,10 +242,10 @@ void app_main(void)
         }
     }
 
-    // if (script_service_init() != ESP_OK)
-    // {
-    //     ESP_LOGW(TAG, "script service init failed; continuing without WASM console support");
-    // }
+    if (script_service_init() != ESP_OK)
+    {
+        ESP_LOGW(TAG, "script service init failed; continuing without WASM console support");
+    }
 
     ESP_ERROR_CHECK(console_service_init());
     app_run_super_loop(running_in_qemu);
