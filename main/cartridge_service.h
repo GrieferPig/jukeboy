@@ -39,17 +39,17 @@ extern "C"
      */
     typedef struct
     {
-        int clk_gpio;            /**< Clock signal GPIO (e.g. 14) */
-        int cmd_gpio;            /**< Command signal GPIO (e.g. 15) */
-        int d0_gpio;             /**< Data-0 signal GPIO (e.g. 2) */
+        int clk_gpio;            /**< Clock signal GPIO (e.g. 12) */
+        int cmd_gpio;            /**< Command signal GPIO (e.g. 11) */
+        int d0_gpio;             /**< Data-0 signal GPIO (e.g. 13) */
         const char *mount_point; /**< VFS mount path, e.g. "/sdcard" */
     } cartridge_service_config_t;
 
 #define CARTRIDGE_SERVICE_CONFIG_DEFAULT() \
     {                                      \
-        .clk_gpio = 14,                    \
-        .cmd_gpio = 15,                    \
-        .d0_gpio = 2,                      \
+        .clk_gpio = 12,                    \
+        .cmd_gpio = 11,                    \
+        .d0_gpio = 13,                     \
         .mount_point = "/sdcard",          \
     }
 
@@ -134,12 +134,12 @@ extern "C"
     uint32_t cartridge_service_get_track_file_num(size_t index);
 
     /**
-    * Start an asynchronous 64KB read from the given file at the specified
+     * Start an asynchronous 64KB read from the given file at the specified
      * byte offset. The service manages file
      * open/close internally: if filename differs from the currently open file,
      * the old file is closed and the new one opened.
      *
-    * Data is read into one of two 64KB PSRAM double-buffers. When the read
+     * Data is read into one of two 64KB PSRAM double-buffers. When the read
      * completes, the task identified by notify_task receives a task
      * notification (xTaskNotifyGive). Call cartridge_service_get_read_result()
      * after the notification to obtain the data pointer and length.

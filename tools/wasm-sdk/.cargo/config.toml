@@ -15,3 +15,4 @@ rustflags = [
 
 [alias]
 build-examples = "build --release -p hello -p google-get -p player-control -p net-echo -p hid-demo"
+test-host = "test --workspace --target x86_64-pc-windows-msvc"

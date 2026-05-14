@@ -25,7 +25,6 @@
 #include "companion_api_service.h"
 #include "console_service.h"
 #include "cartridge_service.h"
-#include "audio_output_switch.h"
 #include "hid_service.h"
 #include "lastfm_service.h"
 #include "pin_defs.h"
@@ -40,12 +39,16 @@ static const char *TAG = "console_svc";
 #define TELEMETRY_MAX_TASKS 32
 #define CONSOLE_REPL_TASK_STACK_SIZE 6144
 #define CONSOLE_PSRAM_ALLOC_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define HID_CALIB_CAPTURE_SAMPLE_COUNT 25U
+#define HID_CALIB_CAPTURE_SAMPLE_PERIOD_MS 10U
 
 static void script_print_output(const char *output);
 static const char *auth_mode_str(wifi_auth_mode_t mode);
 static const char *hid_button_name(hid_button_t button);
 static bool console_parse_hid_button(const char *value, hid_button_t *button_out);
 static bool console_parse_uint_in_range(const char *value, unsigned max_value, unsigned *parsed_out);
+static const char *console_hid_combo_prompt(bool misc_rail, uint8_t state);
+static bool console_read_line(char *buffer, size_t buffer_len);
 
 typedef struct
 {
@@ -178,15 +181,15 @@ static void print_memory_stats(void)
             }
 
             float pct = runtime_delta ? ((float)task_delta * 100.0f) / (float)runtime_delta : 0.0f;
-                 printf("%s\t%lu\t%.1f%%\t%u\n",
+            printf("%s\t%lu\t%.1f%%\t%u\n",
                    s_task_state_buf[index].pcTaskName,
                    (unsigned long)task_delta,
-                     pct,
-                     (unsigned int)s_task_state_buf[index].usStackHighWaterMark);
+                   pct,
+                   (unsigned int)s_task_state_buf[index].usStackHighWaterMark);
         }
     }
 
-            ESP_LOGI(TAG, "--------------------------------------------");
+    ESP_LOGI(TAG, "--------------------------------------------");
 
     uint8_t next_idx = s_snapshot_idx ^ 1;
     for (UBaseType_t index = 0; index < task_count; index++)
@@ -316,6 +319,53 @@ static bool console_parse_hid_button(const char *value, hid_button_t *button_out
     }
 
     return false;
+}
+
+static const char *console_hid_combo_prompt(bool misc_rail, uint8_t state)
+{
+    static const char *const main_prompts[HID_SERVICE_BUTTON_LADDER_STATE_COUNT] = {
+        "release all MAIN buttons and keep all MISC buttons released",
+        "hold MAIN_1 only and keep every other button released",
+        "hold MAIN_2 only and keep every other button released",
+        "hold MAIN_1 + MAIN_2 only and keep every other button released",
+        "hold MAIN_3 only and keep every other button released",
+        "hold MAIN_1 + MAIN_3 only and keep every other button released",
+        "hold MAIN_2 + MAIN_3 only and keep every other button released",
+        "hold MAIN_1 + MAIN_2 + MAIN_3 and keep all MISC buttons released",
+    };
+    static const char *const misc_prompts[HID_SERVICE_BUTTON_LADDER_STATE_COUNT] = {
+        "release all MISC buttons and keep all MAIN buttons released",
+        "hold MISC_1 only and keep every other button released",
+        "hold MISC_2 only and keep every other button released",
+        "hold MISC_1 + MISC_2 only and keep every other button released",
+        "hold MISC_3 only and keep every other button released",
+        "hold MISC_1 + MISC_3 only and keep every other button released",
+        "hold MISC_2 + MISC_3 only and keep every other button released",
+        "hold MISC_1 + MISC_2 + MISC_3 and keep all MAIN buttons released",
+    };
+
+    if (state >= HID_SERVICE_BUTTON_LADDER_STATE_COUNT)
+    {
+        return "invalid HID ladder state";
+    }
+
+    return misc_rail ? misc_prompts[state] : main_prompts[state];
+}
+
+static bool console_read_line(char *buffer, size_t buffer_len)
+{
+    if (buffer == NULL || buffer_len == 0)
+    {
+        return false;
+    }
+
+    if (fgets(buffer, (int)buffer_len, stdin) == NULL)
+    {
+        return false;
+    }
+
+    buffer[strcspn(buffer, "\r\n")] = '\0';
+    return true;
 }
 
 static void console_hid_event_handler(void *handler_arg,
@@ -488,305 +538,16 @@ static int cmd_companion(int argc, char **argv)
  *  Bluetooth commands                                                 *
  * ════════════════════════════════════════════════════════════════════ */
 
-static const char *bt_media_key_name(uint8_t key_code)
+static int bt_status_handler(int argc, char **argv)
 {
-    switch (key_code)
-    {
-    case ESP_AVRC_PT_CMD_PLAY:
-        return "play";
-    case ESP_AVRC_PT_CMD_STOP:
-        return "stop";
-    case ESP_AVRC_PT_CMD_PAUSE:
-        return "pause";
-    case ESP_AVRC_PT_CMD_FORWARD:
-        return "next";
-    case ESP_AVRC_PT_CMD_BACKWARD:
-        return "prev";
-    case ESP_AVRC_PT_CMD_FAST_FORWARD:
-        return "ff";
-    case ESP_AVRC_PT_CMD_REWIND:
-        return "rewind";
-    case ESP_AVRC_PT_CMD_VOL_UP:
-        return "vol_up";
-    case ESP_AVRC_PT_CMD_VOL_DOWN:
-        return "vol_down";
-    case ESP_AVRC_PT_CMD_MUTE:
-        return "mute";
-    default:
-        return "custom";
-    }
-}
+    (void)argc;
+    (void)argv;
 
-static bool bt_parse_media_key(const char *value, uint8_t *key_code)
-{
-    char *end = NULL;
-    unsigned long numeric_value;
-
-    if (!value || !key_code)
-    {
-        return false;
-    }
-
-    if (strcmp(value, "play") == 0)
-    {
-        *key_code = ESP_AVRC_PT_CMD_PLAY;
-    }
-    else if (strcmp(value, "pause") == 0)
-    {
-        *key_code = ESP_AVRC_PT_CMD_PAUSE;
-    }
-    else if (strcmp(value, "stop") == 0)
-    {
-        *key_code = ESP_AVRC_PT_CMD_STOP;
-    }
-    else if (strcmp(value, "next") == 0 || strcmp(value, "forward") == 0)
-    {
-        *key_code = ESP_AVRC_PT_CMD_FORWARD;
-    }
-    else if (strcmp(value, "prev") == 0 || strcmp(value, "previous") == 0 || strcmp(value, "back") == 0)
-    {
-        *key_code = ESP_AVRC_PT_CMD_BACKWARD;
-    }
-    else if (strcmp(value, "ff") == 0 || strcmp(value, "fast_forward") == 0)
-    {
-        *key_code = ESP_AVRC_PT_CMD_FAST_FORWARD;
-    }
-    else if (strcmp(value, "rewind") == 0)
-    {
-        *key_code = ESP_AVRC_PT_CMD_REWIND;
-    }
-    else if (strcmp(value, "vol_up") == 0 || strcmp(value, "volume_up") == 0)
-    {
-        *key_code = ESP_AVRC_PT_CMD_VOL_UP;
-    }
-    else if (strcmp(value, "vol_down") == 0 || strcmp(value, "volume_down") == 0)
-    {
-        *key_code = ESP_AVRC_PT_CMD_VOL_DOWN;
-    }
-    else if (strcmp(value, "mute") == 0)
-    {
-        *key_code = ESP_AVRC_PT_CMD_MUTE;
-    }
-    else
-    {
-        numeric_value = strtoul(value, &end, 0);
-        if (!end || *end != '\0' || numeric_value > UINT8_MAX)
-        {
-            return false;
-        }
-        *key_code = (uint8_t)numeric_value;
-    }
-
-    return true;
-}
-
-static void bt_print_bda(const esp_bd_addr_t bda)
-{
-    printf(ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(bda));
-}
-
-static int bt_pair_handler(int argc, char **argv)
-{
-    esp_err_t err = bluetooth_service_pair_best_a2dp_sink();
-    if (err != ESP_OK)
-    {
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-
-    printf("Starting Bluetooth discovery and best-sink pairing...\n");
-    return 0;
-}
-
-static int bt_connect_handler(int argc, char **argv)
-{
-    esp_err_t err = bluetooth_service_connect_last_bonded_a2dp_device();
-    if (err != ESP_OK)
-    {
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-
-    printf("Connect request sent for the last bonded A2DP device.\n");
-    return 0;
-}
-
-static int bt_disconnect_handler(int argc, char **argv)
-{
-    esp_err_t err = bluetooth_service_disconnect_a2dp();
-    if (err != ESP_OK)
-    {
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-
-    printf("Disconnect request sent.\n");
-    return 0;
-}
-
-static int bt_confirm_handler(int argc, char **argv)
-{
-    bluetooth_service_pairing_confirm_t confirm = {0};
-    const char *action = argc >= 2 ? argv[1] : NULL;
-
-    esp_err_t err = bluetooth_service_get_pending_pairing_confirm(&confirm);
-    if (err != ESP_OK)
-    {
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-
-    if (!confirm.pending)
-    {
-        printf("No Bluetooth pairing confirmation is pending.\n");
-        return 1;
-    }
-
-    if (!action)
-    {
-        printf("Pending pairing confirmation for ");
-        bt_print_bda(confirm.remote_bda);
-        printf(" passkey=%06lu\n", (unsigned long)confirm.numeric_value);
-        printf("Usage: bt confirm <accept|reject>\n");
-        return 0;
-    }
-
-    if (strcmp(action, "accept") != 0 && strcmp(action, "reject") != 0)
-    {
-        printf("Usage: bt confirm <accept|reject>\n");
-        return 1;
-    }
-
-    err = bluetooth_service_reply_pairing_confirm(strcmp(action, "accept") == 0);
-    if (err != ESP_OK)
-    {
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-
-    printf("Bluetooth pairing confirmation %s for ", action);
-    bt_print_bda(confirm.remote_bda);
-    printf(" passkey=%06lu\n", (unsigned long)confirm.numeric_value);
-    return 0;
-}
-
-static struct
-{
-    struct arg_str *action;
-    struct arg_end *end;
-} s_bt_audio_args;
-
-static int bt_audio_handler(int argc, char **argv)
-{
-    int nerrors = arg_parse(argc, argv, (void **)&s_bt_audio_args);
-    esp_err_t err;
-
-    if (nerrors)
-    {
-        arg_print_errors(stderr, s_bt_audio_args.end, argv[0]);
-        return 1;
-    }
-
-    if (s_bt_audio_args.action->count == 0)
-    {
-        printf("Usage: bt audio <start|suspend>\n");
-        return 1;
-    }
-
-    if (strcmp(s_bt_audio_args.action->sval[0], "start") == 0)
-    {
-        err = bluetooth_service_start_audio();
-    }
-    else if (strcmp(s_bt_audio_args.action->sval[0], "suspend") == 0)
-    {
-        err = bluetooth_service_suspend_audio();
-    }
-    else
-    {
-        printf("Usage: bt audio <start|suspend>\n");
-        return 1;
-    }
-
-    if (err != ESP_OK)
-    {
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-
-    printf("Audio command sent: %s\n", s_bt_audio_args.action->sval[0]);
-    return 0;
-}
-
-static struct
-{
-    struct arg_str *key;
-    struct arg_end *end;
-} s_bt_media_key_args;
-
-static int bt_media_key_handler(int argc, char **argv)
-{
-    int nerrors = arg_parse(argc, argv, (void **)&s_bt_media_key_args);
-    uint8_t key_code;
-    esp_err_t err;
-
-    if (nerrors)
-    {
-        arg_print_errors(stderr, s_bt_media_key_args.end, argv[0]);
-        return 1;
-    }
-
-    if (!bt_parse_media_key(s_bt_media_key_args.key->sval[0], &key_code))
-    {
-        printf("Unknown media key. Use play, pause, stop, next, prev, ff, rewind, vol_up, vol_down, mute, or a numeric key code.\n");
-        return 1;
-    }
-
-    err = bluetooth_service_send_media_key(key_code);
-    if (err != ESP_OK)
-    {
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-
-    printf("Sent media key %s (%u).\n", bt_media_key_name(key_code), (unsigned int)key_code);
-    return 0;
-}
-
-static int bt_bonded_handler(int argc, char **argv)
-{
-    size_t count = bluetooth_service_get_bonded_device_count();
-    esp_bd_addr_t *devices = NULL;
-    esp_err_t err;
-
-    printf("Bonded device count: %u\n", (unsigned int)count);
-    if (count == 0)
-    {
-        return 0;
-    }
-
-    devices = calloc(count, sizeof(*devices));
-    if (!devices)
-    {
-        printf("Error: out of memory\n");
-        return 1;
-    }
-
-    err = bluetooth_service_get_bonded_devices(&count, devices);
-    if (err != ESP_OK)
-    {
-        free(devices);
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-
-    for (size_t index = 0; index < count; index++)
-    {
-        printf("%u. ", (unsigned int)(index + 1));
-        bt_print_bda(devices[index]);
-        printf("\n");
-    }
-
-    free(devices);
+    printf("BLE companion service: %s\n", bluetooth_service_is_initialised() ? "started" : "stopped");
+    printf("SPP connected: %s\n", bluetooth_service_is_spp_connected() ? "yes" : "no");
+    printf("SPP notifications: %s\n", bluetooth_service_spp_notifications_enabled() ? "yes" : "no");
+    printf("MTU: %u\n", (unsigned int)bluetooth_service_spp_get_mtu());
+    printf("Max payload: %u\n", (unsigned int)bluetooth_service_spp_get_max_payload());
     return 0;
 }
 
@@ -1135,13 +896,7 @@ static int cmd_bt(int argc, char **argv)
 {
     static const char *usage =
         "Usage: bt <subcommand> [args]\n"
-        "  pair                     Discover and pair the best A2DP sink\n"
-        "  connect                  Reconnect to last bonded A2DP device\n"
-        "  confirm <accept|reject>  Reply to pending SSP pairing confirmation\n"
-        "  disconnect               Disconnect current A2DP link\n"
-        "  audio <start|suspend>    Control A2DP audio streaming\n"
-        "  media_key <key>          Send AVRCP media key (play/pause/stop/next/prev/...)\n"
-        "  bonded                   List bonded device addresses\n";
+        "  status                   Show BLE companion transport status\n";
 
     if (argc < 2)
     {
@@ -1150,20 +905,8 @@ static int cmd_bt(int argc, char **argv)
     }
 
     const char *sub = argv[1];
-    if (strcmp(sub, "pair") == 0)
-        return bt_pair_handler(argc - 1, argv + 1);
-    if (strcmp(sub, "connect") == 0)
-        return bt_connect_handler(argc - 1, argv + 1);
-    if (strcmp(sub, "confirm") == 0)
-        return bt_confirm_handler(argc - 1, argv + 1);
-    if (strcmp(sub, "disconnect") == 0)
-        return bt_disconnect_handler(argc - 1, argv + 1);
-    if (strcmp(sub, "audio") == 0)
-        return bt_audio_handler(argc - 1, argv + 1);
-    if (strcmp(sub, "media_key") == 0)
-        return bt_media_key_handler(argc - 1, argv + 1);
-    if (strcmp(sub, "bonded") == 0)
-        return bt_bonded_handler(argc - 1, argv + 1);
+    if (strcmp(sub, "status") == 0)
+        return bt_status_handler(argc - 1, argv + 1);
 
     printf("Unknown subcommand '%s'.\n%s", sub, usage);
     return 1;
@@ -1355,6 +1098,7 @@ static int wifi_status_handler(int argc, char **argv)
     wifi_svc_state_t st = wifi_service_get_state();
     int active_slot = wifi_service_get_active_slot();
     int preferred_slot = wifi_service_get_preferred_slot();
+    uint8_t sta_mac[6] = {0};
 
     printf("WiFi state: %s\n", state_str(st));
     printf("Auto-reconnect: %s\n",
@@ -1370,6 +1114,16 @@ static int wifi_status_handler(int argc, char **argv)
     if (active_slot >= 0)
     {
         printf("Active slot index: %d\n", active_slot + 1);
+    }
+    if (esp_wifi_get_mac(WIFI_IF_STA, sta_mac) == ESP_OK)
+    {
+        printf("STA MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+               sta_mac[0],
+               sta_mac[1],
+               sta_mac[2],
+               sta_mac[3],
+               sta_mac[4],
+               sta_mac[5]);
     }
 
     if (st == WIFI_SVC_STATE_CONNECTED)
@@ -1747,6 +1501,106 @@ static int hid_buttons_handler(int argc, char **argv)
     return 0;
 }
 
+static int hid_calib_handler(int argc, char **argv)
+{
+    uint16_t main_values[HID_SERVICE_BUTTON_LADDER_STATE_COUNT] = {0};
+    uint16_t misc_values[HID_SERVICE_BUTTON_LADDER_STATE_COUNT] = {0};
+    char line[32];
+    bool calibration_active = false;
+    esp_err_t err;
+
+    (void)argc;
+    (void)argv;
+
+    err = hid_service_set_calibration_active(true);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    calibration_active = true;
+
+    printf("Starting HID calibration.\n");
+    printf("This will capture all 8 ladder states for MAIN, then all 8 ladder states for MISC.\n");
+    printf("Press Enter to capture each step while holding the requested combination. Type q to abort.\n");
+
+    for (uint8_t rail = 0; rail < 2U; rail++)
+    {
+        const bool misc_rail = rail != 0;
+        const char *rail_name = misc_rail ? "misc" : "main";
+        uint16_t *rail_values = misc_rail ? misc_values : main_values;
+
+        for (uint8_t state = 0; state < HID_SERVICE_BUTTON_LADDER_STATE_COUNT; state++)
+        {
+            hid_service_adc_status_t average = {0};
+            uint16_t captured_raw;
+            uint16_t captured_value;
+
+            printf("\n[%u/%u] %s rail: %s\n",
+                   (unsigned)(rail * HID_SERVICE_BUTTON_LADDER_STATE_COUNT + state + 1U),
+                   (unsigned)(2U * HID_SERVICE_BUTTON_LADDER_STATE_COUNT),
+                   rail_name,
+                   console_hid_combo_prompt(misc_rail, state));
+            printf("Press Enter to capture, or q to abort: ");
+            fflush(stdout);
+
+            if (!console_read_line(line, sizeof(line)))
+            {
+                printf("\nCalibration aborted: failed to read console input.\n");
+                err = ESP_FAIL;
+                goto cleanup;
+            }
+
+            if (line[0] == 'q' || line[0] == 'Q')
+            {
+                printf("Calibration aborted.\n");
+                err = ESP_OK;
+                goto cleanup;
+            }
+
+            err = hid_service_capture_adc_average(HID_CALIB_CAPTURE_SAMPLE_COUNT,
+                                                  HID_CALIB_CAPTURE_SAMPLE_PERIOD_MS,
+                                                  &average);
+            if (err != ESP_OK)
+            {
+                printf("Error: %s\n", esp_err_to_name(err));
+                goto cleanup;
+            }
+
+            captured_raw = misc_rail ? average.misc_raw : average.main_raw;
+            captured_value = misc_rail ? average.misc_value : average.main_value;
+            rail_values[state] = captured_value;
+            printf("Captured %s state 0x%02x: raw=%u value=%u\n",
+                   rail_name,
+                   (unsigned)state,
+                   (unsigned)captured_raw,
+                   (unsigned)captured_value);
+        }
+    }
+
+    err = hid_service_store_calibration(main_values, misc_values);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        goto cleanup;
+    }
+
+    printf("HID calibration saved to NVS and applied.\n");
+
+cleanup:
+    if (calibration_active)
+    {
+        esp_err_t exit_err = hid_service_set_calibration_active(false);
+        if (err == ESP_OK && exit_err != ESP_OK)
+        {
+            printf("Error: %s\n", esp_err_to_name(exit_err));
+            err = exit_err;
+        }
+    }
+
+    return err == ESP_OK ? 0 : 1;
+}
+
 static int hid_log_handler(int argc, char **argv)
 {
     static const char *usage =
@@ -1850,6 +1704,7 @@ static int cmd_hid(int argc, char **argv)
         "Usage: hid <subcommand> [args]\n"
         "  buttons                    Show button state bitmap and ladder ADC readings\n"
         "  status                     Alias for buttons\n"
+        "  calib                      Interactively calibrate both HID ladders and save to NVS\n"
         "  log <on|off>               Print a log line on each button press\n"
         "  led <r> <g> <b>           Set the RGB LED\n"
         "  led off                   Turn the RGB LED off\n"
@@ -1868,6 +1723,11 @@ static int cmd_hid(int argc, char **argv)
     if (strcmp(argv[1], "log") == 0)
     {
         return hid_log_handler(argc - 1, argv + 1);
+    }
+
+    if (strcmp(argv[1], "calib") == 0)
+    {
+        return hid_calib_handler(argc - 1, argv + 1);
     }
 
     printf("Unknown subcommand '%s'.\n%s", argv[1], usage);
@@ -2837,36 +2697,19 @@ static int cmd_audio_output(int argc, char **argv)
 
     if (s_audio_output_args.target->count == 0 || strcmp(s_audio_output_args.target->sval[0], "status") == 0)
     {
-        printf("Audio output: %s\n", audio_output_switch_target_name(audio_output_switch_get_target()));
-        printf("A2DP connected: %s\n", bluetooth_service_is_a2dp_connected() ? "yes" : "no");
+        printf("Audio output: i2s\n");
         return 0;
     }
 
     const char *target = s_audio_output_args.target->sval[0];
-    audio_output_target_t next_target;
     if (strcmp(target, "i2s") == 0)
     {
-        next_target = AUDIO_OUTPUT_TARGET_I2S;
-    }
-    else if (strcmp(target, "a2dp") == 0)
-    {
-        next_target = AUDIO_OUTPUT_TARGET_BLUETOOTH;
-    }
-    else
-    {
-        printf("Usage: audio_output [status|i2s|a2dp]\n");
-        return 1;
+        printf("Audio output is fixed to i2s\n");
+        return 0;
     }
 
-    esp_err_t err = audio_output_switch_select(next_target);
-    if (err != ESP_OK)
-    {
-        printf("Error: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-
-    printf("Audio output switched to %s\n", audio_output_switch_target_name(next_target));
-    return 0;
+    printf("Usage: audio_output [status|i2s]\n");
+    return 1;
 }
 
 /* ════════════════════════════════════════════════════════════════════ *
@@ -2878,7 +2721,7 @@ esp_err_t console_service_init(void)
     esp_console_repl_t *repl = NULL;
 
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
-    repl_config.prompt = "esp32> ";
+    repl_config.prompt = "esp32s3> ";
     repl_config.task_stack_size = CONSOLE_REPL_TASK_STACK_SIZE;
     repl_config.max_cmdline_length = 256;
 
@@ -2895,13 +2738,9 @@ esp_err_t console_service_init(void)
     esp_console_register_help_command();
 
     /* Initialise argtables */
-    s_bt_audio_args.action = arg_str1(NULL, NULL, "<start|suspend>", "A2DP media control action");
-    s_bt_audio_args.end = arg_end(1);
-    s_bt_media_key_args.key = arg_str1(NULL, NULL, "<key>", "Media key name or AVRCP passthrough code");
-    s_bt_media_key_args.end = arg_end(1);
     s_autoreconnect_args.action = arg_str0(NULL, NULL, "<on|off>", "Enable or disable");
     s_autoreconnect_args.end = arg_end(1);
-    s_audio_output_args.target = arg_str0(NULL, NULL, "<status|i2s|a2dp>", "Get status or switch audio output target");
+    s_audio_output_args.target = arg_str0(NULL, NULL, "<status|i2s>", "Report the fixed i2s audio output");
     s_audio_output_args.end = arg_end(1);
     s_media_args.action = arg_str0(NULL, NULL, "<action>", "status|next|prev|pause|ff|rewind|vol_up|vol_down|mode");
     s_media_args.value = arg_str0(NULL, NULL, "<value>", "For 'mode': sequential|single_repeat|shuffle");
@@ -2912,7 +2751,7 @@ esp_err_t console_service_init(void)
     /* Bluetooth command group */
     const esp_console_cmd_t bt_cmd = {
         .command = "bt",
-        .help = "Bluetooth: bt <pair|connect|confirm|disconnect|audio|media_key|bonded> [args]",
+        .help = "Bluetooth: bt <status>",
         .hint = NULL,
         .func = cmd_bt,
     };
@@ -2938,7 +2777,7 @@ esp_err_t console_service_init(void)
 
     const esp_console_cmd_t audio_output_cmd = {
         .command = "audio_output",
-        .help = "Audio output: audio_output [status|i2s|a2dp]",
+        .help = "Audio output is fixed to i2s: audio_output [status|i2s]",
         .hint = NULL,
         .func = cmd_audio_output,
         .argtable = &s_audio_output_args,
@@ -2996,7 +2835,7 @@ esp_err_t console_service_init(void)
 
     const esp_console_cmd_t hid_cmd = {
         .command = "hid",
-        .help = "HID and RGB LED: hid <buttons|status|log|led> [args]",
+        .help = "HID and RGB LED: hid <buttons|status|calib|log|led> [args]",
         .hint = NULL,
         .func = cmd_hid,
     };

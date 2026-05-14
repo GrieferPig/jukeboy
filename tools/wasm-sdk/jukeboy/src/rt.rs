@@ -4,7 +4,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 use core::ffi::{c_char, CStr};
+#[cfg(not(test))]
 use core::fmt::{self, Write as _};
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
 use dlmalloc::GlobalDlmalloc;
@@ -12,14 +14,17 @@ use dlmalloc::GlobalDlmalloc;
 #[global_allocator]
 static ALLOCATOR: GlobalDlmalloc = GlobalDlmalloc;
 
+#[cfg(not(test))]
 static PANIC_MESSAGE: &[u8] = b"jukeboy rust panic\0";
 
+#[cfg(not(test))]
 struct FixedLogBuffer<const N: usize>
 {
     bytes: [u8; N],
     len: usize,
 }
 
+#[cfg(not(test))]
 impl<const N: usize> FixedLogBuffer<N>
 {
     const fn new() -> Self
@@ -36,6 +41,7 @@ impl<const N: usize> FixedLogBuffer<N>
     }
 }
 
+#[cfg(not(test))]
 impl<const N: usize> fmt::Write for FixedLogBuffer<N>
 {
     fn write_str(&mut self, text: &str) -> fmt::Result
@@ -54,6 +60,7 @@ impl<const N: usize> fmt::Write for FixedLogBuffer<N>
     }
 }
 
+#[cfg(not(test))]
 fn log_without_alloc(message: &str)
 {
     let mut buffer = [0_u8; 192];
@@ -163,14 +170,14 @@ fn panic(info: &PanicInfo<'_>) -> !
     trap()
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(not(test), target_arch = "wasm32"))]
 #[inline(always)]
 fn trap() -> !
 {
     core::arch::wasm32::unreachable()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
 #[inline(always)]
 fn trap() -> !
 {

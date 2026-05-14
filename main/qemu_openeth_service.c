@@ -307,7 +307,7 @@ esp_err_t qemu_openeth_service_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    esp_eth_phy_t *phy = esp_eth_phy_new_generic(&phy_config);
+    esp_eth_phy_t *phy = esp_eth_phy_new_dp83848(&phy_config);
     if (phy == NULL)
     {
         mac->del(mac);

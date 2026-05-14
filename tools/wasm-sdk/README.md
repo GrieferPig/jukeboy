@@ -31,6 +31,16 @@ cargo build-examples
 
 The resulting modules are written to `target/wasm32-unknown-unknown/release/`.
 
+## Test
+
+Run SDK tests on the host target:
+
+```bash
+cargo test-host
+```
+
+The workspace defaults to `wasm32-unknown-unknown` for firmware module builds, so plain `cargo test` produces raw `.wasm` test binaries that Windows cannot execute directly.
+
 ## Stage into firmware
 
 Copy the rebuilt example modules into their per-script LittleFS directories before rebuilding the firmware image:

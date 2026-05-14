@@ -2056,6 +2056,15 @@ static esp_err_t lastfm_service_process_scrobble_payload(const lastfm_cmd_scrobb
         return ESP_OK;
     }
 
+    if (!has_auth || !has_session)
+    {
+        ESP_LOGI(TAG,
+                 "consumed scrobble without sending checksum=0x%08lx track=%lu because auth URL or session key is missing",
+                 (unsigned long)payload->scrobble.album_checksum,
+                 (unsigned long)payload->scrobble.track_index);
+        return ESP_OK;
+    }
+
     err = lastfm_service_resolve_track_metadata(&payload->scrobble, &artist, &track_name);
     if (err != ESP_OK)
     {

@@ -935,7 +935,7 @@ if(CONFIG_BT_ENABLED)
         endif()
     elseif(CONFIG_IDF_TARGET_ESP32S3)
         target_link_directories(${COMPONENT_LIB} INTERFACE
-                "${CMAKE_CURRENT_LIST_DIR}/controller/lib_esp32c3_family/esp32s3")
+                "$ENV{IDF_PATH}/components/bt/controller/lib_esp32c3_family/esp32s3")
         if(CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY)
             target_link_libraries(${COMPONENT_LIB} PUBLIC btdm_app_flash)
         else()

@@ -26,6 +26,8 @@
 #include "esp_audio_types.h"
 
 #include "cartridge_service.h"
+#include "hid_service.h"
+#include "i2s_service.h"
 #include "jukeboy_formats.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
@@ -33,7 +35,7 @@
 
 #include "esp_random.h"
 
-#define PLAYER_SVC_PCM_STREAM_BUF_SIZE (16 * 1024)
+#define PLAYER_SVC_PCM_STREAM_BUF_SIZE (32 * 1024)
 #define PLAYER_SVC_QEMU_PCM_STREAM_BUF_SIZE (32 * 1024)
 #define PLAYER_SVC_CHUNK_BUF_COUNT 2
 #define PLAYER_SVC_CHUNK_MAX_BYTES (24 * 1024)
@@ -60,10 +62,13 @@
 #define PLAYER_SVC_OPUS_MAX_FRAME_LEN 1275
 #define PLAYER_SVC_NVS_NAMESPACE "player_service"
 #define PLAYER_SVC_NVS_KEY_RESUME "resume"
+#define PLAYER_SVC_NVS_KEY_VOLUME "volume"
 #define PLAYER_SVC_RESUME_STATE_VERSION 2U
 #define PLAYER_SVC_RESUME_RTC_MAGIC 0x4A425254U
 #define PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS 0
 #define PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS 0
+#define PLAYER_SVC_I2S_PCM_INITIAL_WAIT_MS 10
+#define PLAYER_SVC_I2S_PCM_CONTINUE_WAIT_MS 5
 #define PLAYER_SVC_LOOKUP_WINDOW_CHUNKS 50U
 #define PLAYER_SVC_LOOKUP_WINDOW_ENTRIES (PLAYER_SVC_LOOKUP_WINDOW_CHUNKS + 1U)
 #define PLAYER_SVC_MAX_LOOKUP_ENTRIES (24U * 60U * 60U)
@@ -87,6 +92,8 @@ static const uint16_t s_volume_gain_q8[PLAYER_SVC_VOLUME_LEVEL_COUNT] = {
 };
 
 ESP_EVENT_DEFINE_BASE(PLAYER_SERVICE_EVENT);
+
+static int32_t player_service_pcm_provider(uint8_t *data, int32_t len, void *user_ctx);
 
 typedef struct
 {
@@ -206,12 +213,73 @@ static uint32_t s_track_started_unix;
 EXT_RAM_BSS_ATTR static size_t s_shuffle_order_storage[JUKEBOY_MAX_TRACK_FILES];
 RTC_NOINIT_ATTR static uint32_t s_resume_rtc_magic;
 RTC_NOINIT_ATTR static player_service_resume_state_t s_resume_rtc_state;
+static esp_event_handler_instance_t s_hid_button_down_handler;
 
 static bool player_service_format_track_filename(char *buffer, size_t buffer_len, uint32_t file_num);
 
 static void player_service_post_event(player_service_event_id_t event_id, const void *data, size_t len)
 {
     esp_event_post(PLAYER_SERVICE_EVENT, event_id, data, len, 0);
+}
+
+static player_service_playback_mode_t player_service_next_playback_mode(player_service_playback_mode_t mode)
+{
+    switch (mode)
+    {
+    case PLAYER_SVC_MODE_SEQUENTIAL:
+        return PLAYER_SVC_MODE_SINGLE_REPEAT;
+    case PLAYER_SVC_MODE_SINGLE_REPEAT:
+        return PLAYER_SVC_MODE_SHUFFLE;
+    case PLAYER_SVC_MODE_SHUFFLE:
+    default:
+        return PLAYER_SVC_MODE_SEQUENTIAL;
+    }
+}
+
+static void player_service_on_hid_button_event(void *handler_arg,
+                                               esp_event_base_t base,
+                                               int32_t id,
+                                               void *event_data)
+{
+    (void)handler_arg;
+    (void)base;
+
+    if (id != HID_EVENT_BUTTON_DOWN || event_data == NULL)
+    {
+        return;
+    }
+
+    hid_button_t button = *(const hid_button_t *)event_data;
+    esp_err_t err = ESP_OK;
+
+    switch (button)
+    {
+    case HID_BUTTON_MAIN_1:
+        err = player_service_request_control(PLAYER_SVC_CONTROL_NEXT);
+        break;
+    case HID_BUTTON_MAIN_2:
+        err = player_service_request_control(PLAYER_SVC_CONTROL_PAUSE);
+        break;
+    case HID_BUTTON_MAIN_3:
+        err = player_service_request_control(PLAYER_SVC_CONTROL_PREVIOUS);
+        break;
+    case HID_BUTTON_MISC_1:
+        err = player_service_set_playback_mode(player_service_next_playback_mode(player_service_get_playback_mode()));
+        break;
+    case HID_BUTTON_MISC_2:
+        err = player_service_request_control(PLAYER_SVC_CONTROL_VOLUME_UP);
+        break;
+    case HID_BUTTON_MISC_3:
+        err = player_service_request_control(PLAYER_SVC_CONTROL_VOLUME_DOWN);
+        break;
+    default:
+        return;
+    }
+
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGW(TAG, "failed to handle HID button %u: %s", (unsigned)button, esp_err_to_name(err));
+    }
 }
 
 static bool player_service_queue_cmd(player_service_cmd_t cmd)
@@ -260,7 +328,10 @@ static StreamBufferHandle_t player_service_create_pcm_stream(void)
 {
     if (!app_is_running_in_qemu())
     {
-        return xStreamBufferCreate(PLAYER_SVC_PCM_STREAM_BUF_SIZE, 1);
+        ESP_LOGI(TAG,
+                 "using %u-byte hardware PCM stream buffer",
+                 (unsigned)PLAYER_SVC_PCM_STREAM_BUF_SIZE);
+        return xStreamBufferCreate(PLAYER_SVC_PCM_STREAM_BUF_SIZE, PLAYER_SVC_PCM_FRAME_BYTES);
     }
 
     ESP_LOGI(TAG,
@@ -284,6 +355,53 @@ static TickType_t player_service_qemu_pcm_wait_ticks(uint32_t wait_ms)
     }
 
     return wait_ticks;
+}
+
+static size_t player_service_read_pcm_stream(uint8_t *data,
+                                             size_t target,
+                                             TickType_t initial_wait_ticks,
+                                             TickType_t continue_wait_ticks)
+{
+    size_t received = 0;
+
+    while (received < target)
+    {
+        TickType_t wait_ticks = received == 0 ? initial_wait_ticks : continue_wait_ticks;
+        size_t chunk = xStreamBufferReceive(s_pcm_stream,
+                                            data + received,
+                                            target - received,
+                                            wait_ticks);
+        if (chunk == 0)
+        {
+            break;
+        }
+
+        received += chunk;
+    }
+
+    if (received < target)
+    {
+        memset(data + received, 0, target - received);
+    }
+
+    return received;
+}
+
+static esp_err_t player_service_attach_i2s_output(void)
+{
+    esp_err_t err = i2s_service_register_pcm_provider(player_service_pcm_provider, NULL);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = i2s_service_start_audio();
+    if (err != ESP_OK)
+    {
+        (void)i2s_service_register_pcm_provider(NULL, NULL);
+    }
+
+    return err;
 }
 
 static bool player_service_playlist_filename(size_t index, char *buffer, size_t buffer_len)
@@ -905,6 +1023,79 @@ static esp_err_t player_service_write_playback_status(const player_service_resum
     return ESP_OK;
 }
 
+static esp_err_t player_service_load_saved_volume_level(void)
+{
+    nvs_handle_t handle;
+    uint8_t volume_level = PLAYER_SVC_DEFAULT_VOLUME_LEVEL;
+    esp_err_t err = nvs_open(PLAYER_SVC_NVS_NAMESPACE, NVS_READONLY, &handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to open NVS namespace %s while loading volume: %s",
+                 PLAYER_SVC_NVS_NAMESPACE,
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_get_u8(handle, PLAYER_SVC_NVS_KEY_VOLUME, &volume_level);
+    nvs_close(handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to load saved volume from NVS: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    if (volume_level >= PLAYER_SVC_VOLUME_LEVEL_COUNT)
+    {
+        ESP_LOGW(TAG, "discarding invalid saved volume level %u", (unsigned)volume_level);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    s_volume_level = volume_level;
+    ESP_LOGI(TAG, "restored saved volume to %u%%", player_service_get_volume_percent());
+    return ESP_OK;
+}
+
+static esp_err_t player_service_write_volume_level(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(PLAYER_SVC_NVS_NAMESPACE, NVS_READWRITE, &handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to open NVS namespace %s while saving volume: %s",
+                 PLAYER_SVC_NVS_NAMESPACE,
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_u8(handle, PLAYER_SVC_NVS_KEY_VOLUME, s_volume_level);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to save volume to NVS: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
 static esp_err_t player_service_persist_current_playback_status(void)
 {
     player_service_resume_state_t status;
@@ -916,6 +1107,19 @@ static esp_err_t player_service_persist_current_playback_status(void)
 
     player_service_cache_rtc_playback_status(&status);
     return player_service_write_playback_status(&status);
+}
+
+static esp_err_t player_service_persist_shutdown_state(void)
+{
+    esp_err_t volume_err = player_service_write_volume_level();
+    esp_err_t playback_err = player_service_persist_current_playback_status();
+
+    if (volume_err != ESP_OK)
+    {
+        return volume_err;
+    }
+
+    return playback_err;
 }
 
 static esp_err_t player_service_shutdown_callback(void *user_ctx)
@@ -2440,10 +2644,10 @@ static void player_service_task(void *param)
             break;
         case PLAYER_SVC_CMD_PERSIST_FOR_SHUTDOWN:
         {
-            esp_err_t err = player_service_persist_current_playback_status();
+            esp_err_t err = player_service_persist_shutdown_state();
             if (err != ESP_OK)
             {
-                ESP_LOGW(TAG, "failed to persist playback status during shutdown: %s", esp_err_to_name(err));
+                ESP_LOGW(TAG, "failed to persist player state during shutdown: %s", esp_err_to_name(err));
             }
             if (msg.result_out != NULL)
             {
@@ -2498,6 +2702,12 @@ esp_err_t player_service_init(void)
         return err;
     }
 
+    err = player_service_load_saved_volume_level();
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "continuing with default volume after load failure");
+    }
+
     s_pcm_stream = player_service_create_pcm_stream();
     s_chunk_queue = xQueueCreate(PLAYER_SVC_CHUNK_BUF_COUNT, sizeof(player_service_chunk_msg_t));
     s_buf_pool_sem = xSemaphoreCreateCounting(PLAYER_SVC_CHUNK_BUF_COUNT, PLAYER_SVC_CHUNK_BUF_COUNT);
@@ -2547,7 +2757,7 @@ esp_err_t player_service_init(void)
                                                 MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
         if (s_decoder_task_stack == NULL)
         {
-            ESP_LOGE(TAG, "failed to allocate player decoder stack in PSRAM");
+            ESP_LOGE(TAG, "failed to allocate player decoder stack in internal memory");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -2587,7 +2797,21 @@ esp_err_t player_service_init(void)
                                                player_service_on_cartridge_event,
                                                NULL));
 
+    if (!app_is_running_in_qemu())
+    {
+        err = player_service_attach_i2s_output();
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
     s_initialised = true;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(HID_SERVICE_EVENT,
+                                                        HID_EVENT_BUTTON_DOWN,
+                                                        player_service_on_hid_button_event,
+                                                        NULL,
+                                                        &s_hid_button_down_handler));
     ESP_ERROR_CHECK(power_mgmt_service_register_shutdown_callback(player_service_shutdown_callback,
                                                                   NULL,
                                                                   POWER_MGMT_SERVICE_SHUTDOWN_PRIORITY_PLAYER));
@@ -2745,16 +2969,15 @@ uint8_t player_service_get_volume_percent(void)
                      PLAYER_SVC_VOLUME_Q8_ONE);
 }
 
-void player_service_set_volume_absolute(uint8_t avrc_vol)
+void player_service_set_volume_absolute(uint8_t volume_127)
 {
-    /* Map 0..127 AVRCP volume to 0..PLAYER_SVC_VOLUME_LEVEL_COUNT-1 */
-    uint8_t level = (uint8_t)((uint32_t)avrc_vol * (PLAYER_SVC_VOLUME_LEVEL_COUNT - 1U) / 127U);
+    uint8_t level = (uint8_t)((uint32_t)volume_127 * (PLAYER_SVC_VOLUME_LEVEL_COUNT - 1U) / 127U);
     if (level >= PLAYER_SVC_VOLUME_LEVEL_COUNT)
     {
         level = PLAYER_SVC_VOLUME_LEVEL_COUNT - 1;
     }
     s_volume_level = level;
-    ESP_LOGI(TAG, "volume set to %u%% (AVRCP %u)", player_service_get_volume_percent(), avrc_vol);
+    ESP_LOGI(TAG, "volume set to %u%% (absolute %u/127)", player_service_get_volume_percent(), volume_127);
 }
 
 esp_err_t player_service_set_playback_mode(player_service_playback_mode_t mode)
@@ -2783,45 +3006,40 @@ player_service_playback_mode_t player_service_get_playback_mode(void)
     return s_playback_mode;
 }
 
-int32_t player_service_pcm_provider(uint8_t *data, int32_t len, void *user_ctx)
+static int32_t player_service_pcm_provider(uint8_t *data, int32_t len, void *user_ctx)
 {
     (void)user_ctx;
-
-    int32_t filled;
+    size_t target;
+    TickType_t initial_wait_ticks;
+    TickType_t continue_wait_ticks;
 
     if (!data || len <= 0)
     {
         return 0;
     }
 
-    if (!s_pcm_stream)
+    target = (size_t)len;
+
+    if (!s_pcm_stream || s_paused || !s_playing)
     {
-        memset(data, 0, (size_t)len);
+        memset(data, 0, target);
         return len;
     }
 
-    if (s_paused)
-    {
-        memset(data, 0, (size_t)len);
-        return len;
-    }
+    initial_wait_ticks = player_service_qemu_pcm_wait_ticks(PLAYER_SVC_I2S_PCM_INITIAL_WAIT_MS);
+    continue_wait_ticks = player_service_qemu_pcm_wait_ticks(PLAYER_SVC_I2S_PCM_CONTINUE_WAIT_MS);
 
-    size_t received = xStreamBufferReceive(s_pcm_stream, data, (size_t)len, 0);
-    if (received < (size_t)len)
-    {
-        memset(data + received, 0, (size_t)len - received);
-    }
-
-    filled = (int32_t)received;
-    player_service_apply_volume(data, (size_t)filled);
-    return filled;
+    (void)player_service_read_pcm_stream(data,
+                                         target,
+                                         initial_wait_ticks,
+                                         continue_wait_ticks);
+    player_service_apply_volume(data, target);
+    return len;
 }
 
 int32_t player_service_qemu_pcm_provider(uint8_t *data, int32_t len, void *user_ctx)
 {
     (void)user_ctx;
-
-    size_t received = 0;
     size_t target;
 
     if (!data || len <= 0)
@@ -2837,27 +3055,10 @@ int32_t player_service_qemu_pcm_provider(uint8_t *data, int32_t len, void *user_
         return len;
     }
 
-    while (received < target)
-    {
-        TickType_t wait_ticks = player_service_qemu_pcm_wait_ticks(received == 0 ? PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS
-                                                                                 : PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS);
-        size_t chunk = xStreamBufferReceive(s_pcm_stream,
-                                            data + received,
-                                            target - received,
-                                            wait_ticks);
-        if (chunk == 0)
-        {
-            break;
-        }
-
-        received += chunk;
-    }
-
-    if (received < target)
-    {
-        memset(data + received, 0, target - received);
-    }
-
-    player_service_apply_volume(data, received);
+    (void)player_service_read_pcm_stream(data,
+                                         target,
+                                         player_service_qemu_pcm_wait_ticks(PLAYER_SVC_QEMU_PCM_INITIAL_WAIT_MS),
+                                         player_service_qemu_pcm_wait_ticks(PLAYER_SVC_QEMU_PCM_CONTINUE_WAIT_MS));
+    player_service_apply_volume(data, target);
     return (int32_t)target;
 }

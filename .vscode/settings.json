@@ -5,7 +5,7 @@
   ],
   "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.5.1/",
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32"
+    "IDF_TARGET": "esp32s3"
   },
   "idf.qemuExtraArgs": [
     "--qemu-extra-args=\"-monitor none -drive file=build/sd_image.bin,if=sd,format=raw\""
@@ -17,6 +17,7 @@
     "--compile-commands-dir=c:\\Users\\GrieferPig\\bttest\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM7",
-  "idf.enableCCache": true
+  "idf.portWin": "COM20",
+  "idf.enableCCache": true,
+  "idf.flashBaudRate": "2000000"
 }

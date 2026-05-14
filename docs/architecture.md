@@ -25,8 +25,7 @@ bttest/
 │   ├── companion_api_service.c/.h BLE companion API over the SPP transport
 │   ├── wifi_service.c/.h       Wi-Fi STA: connect, scan, NVS creds, SNTP
 │   ├── cartridge_service.c/.h  SD card mount/unmount, metadata, async reader
-│   ├── i2s_service.c/.h        I2S output (currently a no-op stub)
-│   ├── audio_output_switch.c/.h PCM routing between BT and I2S outputs
+│   ├── i2s_service.c/.h        I2S output service fed directly by player_service
 │   ├── console_service.c/.h    UART console: commands + telemetry task
 │   └── jukeboy_formats.h       On-disk format structs (.jba, .jbm)
 ├── components/
@@ -56,17 +55,11 @@ All services follow the same pattern:
 │  service    │  INSERTED /  │   service    │
 │             │  UNMOUNTED   │              │
 └─────────────┘              └──────┬───────┘
-                                    │ registers PCM provider
-                             ┌──────▼───────┐
-                             │ audio_output │
-                             │   switch     │
-                             └──┬───────┬───┘
-                                │       │
-                         ┌──────▼──┐ ┌──▼──────────┐
-                         │  i2s    │ │  bluetooth   │
-                         │ service │ │  service     │
-                         │ (stub)  │ │  (A2DP src)  │
-                         └─────────┘ └──────────────┘
+                                     │ registers PCM provider
+                                  ┌──────▼───────┐
+                                  │     i2s      │
+                                  │   service    │
+                                  └──────────────┘
 ```
 
 ### Task Pinning & Stack Allocation
@@ -80,7 +73,7 @@ All services follow the same pattern:
 | `cart_reader`     | any  | 4096          | Internal   | Async 128 KB block reads from SD            |
 | `bt_svc`          | any  | 2048          | Internal   | BT command dispatch (must stay internal)    |
 | `wifi_svc`        | 0    | 4096          | Internal   | NVS/flash APIs require internal stack       |
-| `i2s_svc`         | 0    | 2048          | Internal   | Stub — blocks on queue, no-op               |
+| `i2s_svc`         | 0    | 2048          | Internal   | Pulls PCM from player_service into I2S DMA  |
 | `console_svc`     | —    | managed by ESP | Internal  | UART REPL task (esp_console)                |
 | `telemetry`       | any  | 2048          | PSRAM      | Periodic heap/CPU stats                     |
 
@@ -196,21 +189,8 @@ All GAP/A2DP/AVRCP callbacks post messages to a single BT service queue.
 The BT service task processes them sequentially, avoiding re-entrant BT API
 calls.
 
-The PCM data callback (`esp_a2d_source_data_cb`) invokes the registered
-provider function (wired through `audio_output_switch`) to pull PCM data.
-
----
-
-## Audio Output Switch
-
-A thin routing layer that directs the PCM provider to either the Bluetooth
-A2DP endpoint or the I2S output:
-
-- Maintains a `s_provider` function pointer (set by player service).
-- `audio_output_switch_select()` unregisters from the old target and registers
-  with the new one.
-- Listens for `BLUETOOTH_SVC_EVENT_A2DP_CONNECTION_STATE` to automatically
-  switch to BT when a speaker connects, and fall back to I2S on disconnect.
+On hardware, `player_service_init()` registers its PCM provider directly with
+`i2s_service`, which pulls PCM from the player stream and drives the codec.
 
 ---
 
@@ -231,10 +211,9 @@ rather than calling Wi-Fi APIs directly, avoiding deadlocks.
 
 ## I2S Service
 
-Currently a **stub** — the task blocks on its command queue and discards all
-messages. No I2S hardware is driven. When real I2S support is added, the task
-should be updated to periodically pull PCM data from the registered provider
-and feed it to the I2S DMA.
+The I2S task periodically pulls PCM data from the registered provider and feeds
+it to the I2S DMA. On hardware builds, the provider is registered directly by
+`player_service_init()`.
 
 ---
 

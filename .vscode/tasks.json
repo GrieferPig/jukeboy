@@ -19,6 +19,58 @@
 			"command": "cd tools/wasm-sdk && cargo build-examples",
 			"isBackground": false,
 			"group": "build"
+		},
+		{
+			"label": "Flash ESP32-S3 app",
+			"type": "shell",
+			"command": "C:\\Espressif\\python_env\\idf5.5_py3.11_env\\Scripts\\python.exe",
+			"args": [
+				"C:\\Espressif\\frameworks\\esp-idf-v5.5.1\\tools\\idf.py",
+				"-C",
+				"C:\\Users\\GrieferPig\\bttest",
+				"-p",
+				"COM20",
+				"flash"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build ESP-IDF app",
+			"type": "shell",
+			"command": "C:\\Espressif\\python_env\\idf5.5_py3.11_env\\Scripts\\python.exe",
+			"args": [
+				"C:/Espressif/frameworks/esp-idf-v5.5.1/tools/idf.py",
+				"-C",
+				"c:/Users/GrieferPig/bttest",
+				"build"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build ESP-IDF app (exported env)",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/d",
+				"/c",
+				"call C:\\Espressif\\frameworks\\esp-idf-v5.5.1\\export.bat && C:\\Espressif\\python_env\\idf5.5_py3.11_env\\Scripts\\python.exe C:/Espressif/frameworks/esp-idf-v5.5.1/tools/idf.py -C c:/Users/GrieferPig/bttest build"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build ESP-IDF app (manual PATH)",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/d",
+				"/c",
+				"set \"IDF_PATH=C:\\Espressif\\frameworks\\esp-idf-v5.5.1\" && set \"PATH=C:\\Espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin;C:\\Espressif\\tools\\cmake\\3.30.2\\bin;C:\\Espressif\\tools\\ninja\\1.12.1;%PATH%\" && C:\\Espressif\\python_env\\idf5.5_py3.11_env\\Scripts\\python.exe C:/Espressif/frameworks/esp-idf-v5.5.1/tools/idf.py -C c:/Users/GrieferPig/bttest build"
+			],
+			"isBackground": false,
+			"group": "build"
 		}
 	]
 }

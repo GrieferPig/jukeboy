@@ -1,8 +1,8 @@
-# Name,   Type, SubType, Offset,  Size, Flags
-otadata,data,ota,0x1E000,0x2000,
-app0,app,ota_0,0x20000,0x350000,
-app1,app,ota_1,0x370000,0x350000,
-nvs,data,nvs,0x6C0000,0x3D000,
-nvs_keys,data,nvs_keys,0x6FD000,0x1000,encrypted
-littlefs,data,littlefs,0x6FE000,0x101000,
-phy,data,phy,0x7FF000,0x1000,
+# Name,   Type, SubType, Offset,   Size,    Flags
+otadata,  data, ota,     0x1E000,  0x2000,
+app0,     app,  ota_0,   0x20000,  0x600000,
+app1,     app,  ota_1,   0x620000, 0x600000,
+nvs,      data, nvs,     0xC20000, 0x80000,
+nvs_keys, data, nvs_keys,0xCA0000, 0x1000, encrypted
+littlefs, data, littlefs,0xCA1000, 0x35E000,
+phy,      data, phy,     0xFFF000, 0x1000,

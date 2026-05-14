@@ -98,8 +98,7 @@ extern "C"
                                                      player_service_playlist_track_info_t *track_info);
     bool player_service_is_paused(void);
     uint8_t player_service_get_volume_percent(void);
-    void player_service_set_volume_absolute(uint8_t avrc_vol);
-    int32_t player_service_pcm_provider(uint8_t *data, int32_t len, void *user_ctx);
+    void player_service_set_volume_absolute(uint8_t volume_127);
     int32_t player_service_qemu_pcm_provider(uint8_t *data, int32_t len, void *user_ctx);
 
     /**

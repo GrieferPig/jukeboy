@@ -6,9 +6,6 @@
 
 #include "nvs_flash.h"
 #include "esp_partition.h"
-#include "esp_bt.h"
-#include "esp_bt_main.h"
-#include "esp_gap_bt_api.h"
 #include "esp_littlefs.h"
 #include "esp_eth.h"
 #include "esp_log.h"
@@ -16,7 +13,6 @@
 #include "esp_pm.h"
 #include "esp_task_wdt.h"
 
-#include "audio_output_switch.h"
 #include "bluetooth_service.h"
 #include "cartridge_service.h"
 #include "companion_api_service.h"
@@ -65,8 +61,8 @@ static void app_run_super_loop(bool running_in_qemu)
     }
     else
     {
-        services[service_count++] = wifi_service_process_once;
-        services[service_count++] = bluetooth_service_process_once;
+        // services[service_count++] = wifi_service_process_once;
+        // services[service_count++] = bluetooth_service_process_once;
     }
 
     TickType_t idle_ticks = app_super_loop_idle_ticks();
@@ -158,8 +154,8 @@ void app_main(void)
     // {
     //     esp_pm_config_t pm_config = {
     //         .max_freq_mhz = 240,
-    //         .min_freq_mhz = 240,
-    //         .light_sleep_enable = false,
+    //         .min_freq_mhz = 80,
+    //         .light_sleep_enable = true,
     //     };
     //     ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
     // }
@@ -183,27 +179,10 @@ void app_main(void)
     }
     else
     {
-        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
-        ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BTDM));
-
-        ESP_ERROR_CHECK(esp_bluedroid_init());
-        ESP_ERROR_CHECK(esp_bluedroid_enable());
-
-        esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-        esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_IO;
-        esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
-
-        ESP_ERROR_CHECK(bluetooth_service_init());
-        ESP_ERROR_CHECK(wifi_service_init());
+        // ESP_ERROR_CHECK(bluetooth_service_init());
+        // ESP_ERROR_CHECK(wifi_service_init());
         ESP_ERROR_CHECK(i2s_service_init());
         ESP_ERROR_CHECK(hid_service_init());
-        ESP_ERROR_CHECK(audio_output_switch_init());
-
-        ESP_ERROR_CHECK(bluetooth_service_register_48k_sbc_endpoint());
-
-        ESP_ERROR_CHECK(audio_output_switch_set_provider(player_service_pcm_provider, NULL));
-        ESP_ERROR_CHECK(audio_output_switch_select(AUDIO_OUTPUT_TARGET_I2S));
     }
 
     ESP_ERROR_CHECK(player_service_init());
@@ -218,7 +197,7 @@ void app_main(void)
     }
     if (!running_in_qemu)
     {
-        ESP_ERROR_CHECK(companion_api_service_init());
+        // ESP_ERROR_CHECK(companion_api_service_init());
     }
 
     if (running_in_qemu && QEMU_PCM_SERVICE_ENABLED)

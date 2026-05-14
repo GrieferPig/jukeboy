@@ -15,9 +15,6 @@
 #include "bootloader_common.h"
 #include <soc/rtc_cntl_reg.h>
 #include <soc/soc.h>
-#include "esp_rom_gpio.h"
-#include "hal/gpio_ll.h"
-#include "soc/gpio_sig_map.h"
 
 #define CUSTOM_DOWNLOAD_MAGIC_WORD 0xDEADBEEF
 #define CUSTOM_DOWNLOAD_MAGIC_REG RTC_CNTL_STORE0_REG
@@ -26,63 +23,14 @@ static const char *TAG = "boot";
 
 static int select_partition_number(bootloader_state_t *bs);
 
-static void bootloader_gpio_make_disabled(int gpio_num)
-{
-    esp_rom_gpio_pad_select_gpio(gpio_num);
-    esp_rom_gpio_connect_out_signal(gpio_num, SIG_GPIO_OUT_IDX, false, false);
-    gpio_ll_pullup_dis(&GPIO, gpio_num);
-    gpio_ll_pulldown_dis(&GPIO, gpio_num);
-    gpio_ll_input_disable(&GPIO, gpio_num);
-    gpio_ll_output_disable(&GPIO, gpio_num);
-}
-
-static void bootloader_gpio_make_input_nopull(int gpio_num)
-{
-    esp_rom_gpio_pad_select_gpio(gpio_num);
-    esp_rom_gpio_connect_out_signal(gpio_num, SIG_GPIO_OUT_IDX, false, false);
-    gpio_ll_pullup_dis(&GPIO, gpio_num);
-    gpio_ll_pulldown_dis(&GPIO, gpio_num);
-    gpio_ll_output_disable(&GPIO, gpio_num);
-    gpio_ll_input_enable(&GPIO, gpio_num);
-}
-
-static void bootloader_gpio_make_output_low(int gpio_num)
-{
-    esp_rom_gpio_pad_select_gpio(gpio_num);
-    esp_rom_gpio_connect_out_signal(gpio_num, SIG_GPIO_OUT_IDX, false, false);
-    gpio_ll_pullup_dis(&GPIO, gpio_num);
-    gpio_ll_pulldown_dis(&GPIO, gpio_num);
-    gpio_ll_input_disable(&GPIO, gpio_num);
-    gpio_ll_set_level(&GPIO, gpio_num, 0);
-    gpio_ll_output_enable(&GPIO, gpio_num);
-}
-
 void bootloader_user_gpio_init(void)
 {
-    /* Disable input and output */
-    bootloader_gpio_make_input_nopull(25);
-    bootloader_gpio_make_input_nopull(26);
-    bootloader_gpio_make_input_nopull(27);
-    // bootloader_gpio_make_input_nopull(14);
-    bootloader_gpio_make_input_nopull(13);
-    bootloader_gpio_make_input_nopull(22);
-    bootloader_gpio_make_input_nopull(18);
-    // bootloader_gpio_make_input_nopull(2);
-    // bootloader_gpio_make_input_nopull(15);
-
-    /* Enable input, no pull-up */
-    bootloader_gpio_make_input_nopull(34);
-    bootloader_gpio_make_input_nopull(35);
-
-    /* Enable output low */
-    bootloader_gpio_make_output_low(21);
-    bootloader_gpio_make_output_low(32);
-    bootloader_gpio_make_output_low(33);
-    bootloader_gpio_make_output_low(23);
-    bootloader_gpio_make_output_low(19);
-    bootloader_gpio_make_output_low(5);
-    bootloader_gpio_make_output_low(4);
-    bootloader_gpio_make_output_low(12);
+    /*
+     * ESP32-S3-WROOM N16R8 routes flash and octal PSRAM through module pins
+     * that overlap several legacy ESP32 board GPIOs configured here before the
+     * port. Leave those pins alone in the bootloader so flash and PSRAM remain
+     * readable when the app starts.
+     */
 }
 
 /* =====================================================================
@@ -492,7 +440,8 @@ void __attribute__((noreturn)) call_start_cpu0(void)
     }
 
     // Init board GPIOs, must be done to prevent back powering peripherals
-    bootloader_user_gpio_init();
+    // TODO: update for esp32-s3 pinout
+    // bootloader_user_gpio_init();
 
 #ifdef CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP
     // If this boot is a wake up from the deep sleep then go to the short way,

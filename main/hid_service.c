@@ -2,45 +2,101 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "driver/rtc_io.h"
-#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_continuous.h"
+#include "esp_adc/adc_filter.h"
+#include "esp_check.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "led_strip.h"
+#include "nvs.h"
 #include "pin_defs.h"
 #include "power_mgmt_service.h"
-#include "ulp.h"
-#include "ulp_hid.h"
-
-#include "esp_attr.h"
-#include "esp_check.h"
-#include "esp_log.h"
 
 ESP_EVENT_DEFINE_BASE(HID_SERVICE_EVENT);
 
-#define HID_SVC_BUTTON_SAMPLE_PERIOD_US 10000
+#define HID_SVC_BUTTON_SAMPLE_PERIOD_MS 10
 #define HID_SVC_BUTTON_DEBOUNCE_COUNT 3
 #define HID_SVC_BUTTON_ADC_UNIT ADC_UNIT_1
 #define HID_SVC_BUTTON_ADC_ATTEN ADC_ATTEN_DB_12
 #define HID_SVC_BUTTON_ADC_BITWIDTH ADC_BITWIDTH_12
-#define HID_SVC_MAIN_ADC_CHANNEL ADC_CHANNEL_7
-#define HID_SVC_MISC_ADC_CHANNEL ADC_CHANNEL_6
+#define HID_SVC_MAIN_ADC_CHANNEL ADC_CHANNEL_0
+#define HID_SVC_MISC_ADC_CHANNEL ADC_CHANNEL_3
+#define HID_SVC_BUTTON_ADC_SAMPLE_FREQ_HZ 2000
+#define HID_SVC_BUTTON_ADC_CONV_FRAME_SIZE 64
+#define HID_SVC_BUTTON_ADC_READ_BUF_SIZE 128
+#define HID_SVC_BUTTON_ADC_STORE_BUF_SIZE 512
+#define HID_SVC_BUTTON_ADC_IIR_COEFF ADC_DIGI_IIR_FILTER_COEFF_8
+#define HID_SVC_BUTTON_ADC_MAX_RAW 4095U
+#define HID_SVC_BUTTONS_PER_LADDER 3U
+#define HID_SVC_LADDER_STATE_COUNT (1U << HID_SVC_BUTTONS_PER_LADDER)
+#define HID_SVC_LADDER_LEVEL_COUNT HID_SERVICE_BUTTON_LADDER_STATE_COUNT
+#define HID_SVC_BUTTON_CALIBRATION_NAMESPACE "hid"
+#define HID_SVC_BUTTON_CALIBRATION_KEY "calib"
+#define HID_SVC_BUTTON_CALIBRATION_VERSION 1U
 #define HID_SVC_LED_RMT_RESOLUTION_HZ (10 * 1000 * 1000)
 #define HID_SVC_LED_SETTLE_MS 5
 #define HID_SVC_TASK_STACK_SIZE 3072
 #define HID_SVC_TASK_PRIORITY 4
 #define HID_SVC_SHUTDOWN_PRIORITY 250
 
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+#define HID_SVC_BUTTON_ADC_OUTPUT_FORMAT ADC_DIGI_OUTPUT_FORMAT_TYPE1
+#define HID_SVC_BUTTON_ADC_GET_CHANNEL(sample) ((sample)->type1.channel)
+#define HID_SVC_BUTTON_ADC_GET_DATA(sample) ((sample)->type1.data)
+#define HID_SVC_BUTTON_ADC_GET_UNIT(sample) HID_SVC_BUTTON_ADC_UNIT
+#else
+#define HID_SVC_BUTTON_ADC_OUTPUT_FORMAT ADC_DIGI_OUTPUT_FORMAT_TYPE2
+#define HID_SVC_BUTTON_ADC_GET_CHANNEL(sample) ((sample)->type2.channel)
+#define HID_SVC_BUTTON_ADC_GET_DATA(sample) ((sample)->type2.data)
+#define HID_SVC_BUTTON_ADC_GET_UNIT(sample) ((sample)->type2.unit == 0 ? ADC_UNIT_1 : ADC_UNIT_2)
+#endif
+
 static const char *TAG = "hid_svc";
 
-extern const uint8_t ulp_hid_bin_start[] asm("_binary_ulp_hid_bin_start");
-extern const uint8_t ulp_hid_bin_end[] asm("_binary_ulp_hid_bin_end");
+typedef struct
+{
+    uint16_t raw;
+    uint8_t state;
+} hid_service_ladder_level_t;
+
+typedef struct
+{
+    adc_channel_t channel;
+    adc_cali_handle_t cali_handle;
+    adc_cali_scheme_ver_t cali_scheme;
+    bool cali_enabled;
+    bool decode_ready;
+    uint8_t stable_state;
+    uint8_t pending_state;
+    uint8_t pending_count;
+    uint16_t last_raw;
+    uint16_t last_value;
+    hid_service_ladder_level_t levels[HID_SVC_LADDER_LEVEL_COUNT];
+    uint16_t calibration_value[HID_SVC_LADDER_STATE_COUNT];
+    uint16_t threshold_value[HID_SVC_LADDER_LEVEL_COUNT - 1U];
+} hid_service_ladder_runtime_t;
+
+typedef struct
+{
+    uint8_t version;
+    uint8_t valid;
+    uint16_t reserved;
+    uint16_t main_value[HID_SVC_LADDER_STATE_COUNT];
+    uint16_t misc_value[HID_SVC_LADDER_STATE_COUNT];
+} hid_service_button_calibration_record_t;
 
 static SemaphoreHandle_t s_service_lock;
 static TaskHandle_t s_task_handle;
-static adc_oneshot_unit_handle_t s_button_adc_handle;
+static adc_continuous_handle_t s_button_adc_handle;
+static adc_iir_filter_handle_t s_main_button_adc_filter;
+static adc_iir_filter_handle_t s_misc_button_adc_filter;
 static led_strip_handle_t s_led_strip;
 static uint8_t s_led_red;
 static uint8_t s_led_green;
@@ -50,11 +106,501 @@ static uint32_t s_button_state;
 static uint32_t s_button_generation;
 static bool s_initialized;
 static bool s_led_rail_requested;
-static bool s_ulp_isr_registered;
+static bool s_button_adc_started;
+static bool s_button_decode_enabled;
+static bool s_button_calibration_active;
+static hid_service_ladder_runtime_t s_main_ladder = {
+    .channel = HID_SVC_MAIN_ADC_CHANNEL,
+    .last_raw = HID_SVC_BUTTON_ADC_MAX_RAW,
+    .last_value = HID_SVC_BUTTON_ADC_MAX_RAW,
+};
+static hid_service_ladder_runtime_t s_misc_ladder = {
+    .channel = HID_SVC_MISC_ADC_CHANNEL,
+    .last_raw = HID_SVC_BUTTON_ADC_MAX_RAW,
+    .last_value = HID_SVC_BUTTON_ADC_MAX_RAW,
+};
 
 static inline uint32_t hid_service_button_mask(hid_button_t button)
 {
     return 1UL << (uint32_t)button;
+}
+
+static TickType_t hid_service_button_sample_ticks(void)
+{
+    TickType_t sample_ticks = pdMS_TO_TICKS(HID_SVC_BUTTON_SAMPLE_PERIOD_MS);
+    return sample_ticks == 0 ? 1 : sample_ticks;
+}
+
+static uint32_t hid_service_compose_button_state(uint8_t main_state, uint8_t misc_state)
+{
+    return ((uint32_t)main_state & 0x7U) | (((uint32_t)misc_state & 0x7U) << HID_SVC_BUTTONS_PER_LADDER);
+}
+
+static void hid_service_reset_ladder_state_locked(hid_service_ladder_runtime_t *ladder)
+{
+    if (ladder == NULL)
+    {
+        return;
+    }
+
+    ladder->stable_state = 0;
+    ladder->pending_state = 0;
+    ladder->pending_count = 0;
+}
+
+static void hid_service_reset_button_state_locked(void)
+{
+    hid_service_reset_ladder_state_locked(&s_main_ladder);
+    hid_service_reset_ladder_state_locked(&s_misc_ladder);
+    if (s_button_state != 0)
+    {
+        s_button_generation++;
+    }
+    s_button_state = 0;
+}
+
+static esp_err_t hid_service_create_button_adc_cali(hid_service_ladder_runtime_t *ladder)
+{
+    adc_cali_scheme_ver_t scheme_mask = 0;
+    esp_err_t err;
+
+    ESP_RETURN_ON_FALSE(ladder != NULL, ESP_ERR_INVALID_ARG, TAG, "ladder state is null");
+
+    ladder->cali_handle = NULL;
+    ladder->cali_scheme = 0;
+    ladder->cali_enabled = false;
+
+    err = adc_cali_check_scheme(&scheme_mask);
+    if (err == ESP_ERR_NOT_SUPPORTED)
+    {
+        ESP_LOGW(TAG, "ADC calibration is not supported for channel %u", (unsigned)ladder->channel);
+        return ESP_OK;
+    }
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    if ((scheme_mask & ADC_CALI_SCHEME_VER_CURVE_FITTING) != 0)
+    {
+        adc_cali_curve_fitting_config_t cali_cfg = {
+            .unit_id = HID_SVC_BUTTON_ADC_UNIT,
+            .chan = ladder->channel,
+            .atten = HID_SVC_BUTTON_ADC_ATTEN,
+            .bitwidth = HID_SVC_BUTTON_ADC_BITWIDTH,
+        };
+        err = adc_cali_create_scheme_curve_fitting(&cali_cfg, &ladder->cali_handle);
+        if (err == ESP_OK)
+        {
+            ladder->cali_scheme = ADC_CALI_SCHEME_VER_CURVE_FITTING;
+            ladder->cali_enabled = true;
+            return ESP_OK;
+        }
+        if (err != ESP_ERR_NOT_SUPPORTED)
+        {
+            return err;
+        }
+    }
+#endif
+
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    if ((scheme_mask & ADC_CALI_SCHEME_VER_LINE_FITTING) != 0)
+    {
+        adc_cali_line_fitting_config_t cali_cfg = {
+            .unit_id = HID_SVC_BUTTON_ADC_UNIT,
+            .atten = HID_SVC_BUTTON_ADC_ATTEN,
+            .bitwidth = HID_SVC_BUTTON_ADC_BITWIDTH,
+#if CONFIG_IDF_TARGET_ESP32
+            .default_vref = 0,
+#endif
+        };
+        err = adc_cali_create_scheme_line_fitting(&cali_cfg, &ladder->cali_handle);
+        if (err == ESP_OK)
+        {
+            ladder->cali_scheme = ADC_CALI_SCHEME_VER_LINE_FITTING;
+            ladder->cali_enabled = true;
+            return ESP_OK;
+        }
+        if (err != ESP_ERR_NOT_SUPPORTED)
+        {
+            return err;
+        }
+    }
+#endif
+
+    ESP_LOGW(TAG, "ADC calibration scheme creation failed for channel %u; using raw values", (unsigned)ladder->channel);
+    return ESP_OK;
+}
+
+static void hid_service_delete_button_adc_cali(hid_service_ladder_runtime_t *ladder)
+{
+    if (ladder == NULL || ladder->cali_handle == NULL)
+    {
+        return;
+    }
+
+    switch (ladder->cali_scheme)
+    {
+    case ADC_CALI_SCHEME_VER_CURVE_FITTING:
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+        (void)adc_cali_delete_scheme_curve_fitting(ladder->cali_handle);
+#endif
+        break;
+    case ADC_CALI_SCHEME_VER_LINE_FITTING:
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+        (void)adc_cali_delete_scheme_line_fitting(ladder->cali_handle);
+#endif
+        break;
+    default:
+        break;
+    }
+
+    ladder->cali_handle = NULL;
+    ladder->cali_scheme = 0;
+    ladder->cali_enabled = false;
+}
+
+static esp_err_t hid_service_sample_value_from_raw(const hid_service_ladder_runtime_t *ladder,
+                                                   uint16_t raw,
+                                                   uint16_t *value_out)
+{
+    ESP_RETURN_ON_FALSE(ladder != NULL, ESP_ERR_INVALID_ARG, TAG, "ladder state is null");
+    ESP_RETURN_ON_FALSE(value_out != NULL, ESP_ERR_INVALID_ARG, TAG, "button ADC value output is null");
+
+    if (!ladder->cali_enabled || ladder->cali_handle == NULL)
+    {
+        *value_out = raw;
+        return ESP_OK;
+    }
+
+    int voltage = 0;
+    esp_err_t err = adc_cali_raw_to_voltage(ladder->cali_handle, raw, &voltage);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    if (voltage <= 0)
+    {
+        *value_out = 0;
+        return ESP_OK;
+    }
+    if (voltage >= UINT16_MAX)
+    {
+        *value_out = UINT16_MAX;
+        return ESP_OK;
+    }
+
+    *value_out = (uint16_t)voltage;
+    return ESP_OK;
+}
+
+static esp_err_t hid_service_load_button_calibration_record(hid_service_button_calibration_record_t *record_out)
+{
+    nvs_handle_t handle;
+    size_t record_size = sizeof(*record_out);
+    esp_err_t err;
+
+    ESP_RETURN_ON_FALSE(record_out != NULL, ESP_ERR_INVALID_ARG, TAG, "button calibration record output is null");
+
+    memset(record_out, 0, sizeof(*record_out));
+    err = nvs_open(HID_SVC_BUTTON_CALIBRATION_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = nvs_get_blob(handle, HID_SVC_BUTTON_CALIBRATION_KEY, record_out, &record_size);
+    nvs_close(handle);
+    if (err != ESP_OK)
+    {
+        memset(record_out, 0, sizeof(*record_out));
+        return err;
+    }
+
+    if (record_size != sizeof(*record_out) ||
+        record_out->version != HID_SVC_BUTTON_CALIBRATION_VERSION ||
+        !record_out->valid)
+    {
+        memset(record_out, 0, sizeof(*record_out));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t hid_service_store_button_calibration_record(const hid_service_button_calibration_record_t *record)
+{
+    nvs_handle_t handle;
+    esp_err_t err;
+
+    ESP_RETURN_ON_FALSE(record != NULL, ESP_ERR_INVALID_ARG, TAG, "button calibration record is null");
+
+    err = nvs_open(HID_SVC_BUTTON_CALIBRATION_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = nvs_set_blob(handle, HID_SVC_BUTTON_CALIBRATION_KEY, record, sizeof(*record));
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static void hid_service_sort_ladder_levels(hid_service_ladder_level_t *levels, size_t level_count)
+{
+    for (size_t index = 1; index < level_count; index++)
+    {
+        hid_service_ladder_level_t level = levels[index];
+        size_t insert_index = index;
+
+        while (insert_index > 0 && level.raw < levels[insert_index - 1U].raw)
+        {
+            levels[insert_index] = levels[insert_index - 1U];
+            insert_index--;
+        }
+
+        levels[insert_index] = level;
+    }
+}
+
+static esp_err_t hid_service_prepare_ladder_calibration(const uint16_t *values,
+                                                        hid_service_ladder_level_t *levels_out,
+                                                        uint16_t *threshold_out)
+{
+    ESP_RETURN_ON_FALSE(values != NULL, ESP_ERR_INVALID_ARG, TAG, "ladder calibration values are null");
+    ESP_RETURN_ON_FALSE(levels_out != NULL, ESP_ERR_INVALID_ARG, TAG, "ladder calibration levels are null");
+    ESP_RETURN_ON_FALSE(threshold_out != NULL, ESP_ERR_INVALID_ARG, TAG, "ladder calibration thresholds are null");
+
+    for (uint8_t state = 0; state < HID_SVC_LADDER_STATE_COUNT; state++)
+    {
+        levels_out[state].state = state;
+        levels_out[state].raw = values[state];
+    }
+
+    hid_service_sort_ladder_levels(levels_out, HID_SVC_LADDER_LEVEL_COUNT);
+
+    for (uint8_t index = 0; index < HID_SVC_LADDER_LEVEL_COUNT - 1U; index++)
+    {
+        if (levels_out[index].raw >= levels_out[index + 1U].raw)
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        threshold_out[index] =
+            (uint16_t)(((uint32_t)levels_out[index].raw + (uint32_t)levels_out[index + 1U].raw) / 2U);
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t hid_service_apply_ladder_calibration(hid_service_ladder_runtime_t *ladder,
+                                                      const uint16_t *values)
+{
+    hid_service_ladder_level_t levels[HID_SVC_LADDER_LEVEL_COUNT];
+    uint16_t thresholds[HID_SVC_LADDER_LEVEL_COUNT - 1U];
+    esp_err_t err;
+
+    ESP_RETURN_ON_FALSE(ladder != NULL, ESP_ERR_INVALID_ARG, TAG, "ladder state is null");
+
+    err = hid_service_prepare_ladder_calibration(values, levels, thresholds);
+    if (err != ESP_OK)
+    {
+        ladder->decode_ready = false;
+        ESP_LOGE(TAG, "invalid ladder calibration for channel %u", (unsigned)ladder->channel);
+        return err;
+    }
+
+    memcpy(ladder->calibration_value, values, sizeof(ladder->calibration_value));
+    memcpy(ladder->levels, levels, sizeof(ladder->levels));
+    memcpy(ladder->threshold_value, thresholds, sizeof(ladder->threshold_value));
+    ladder->decode_ready = true;
+
+    ESP_LOGI(TAG,
+             "button ladder channel %u values 0=%u 1=%u 2=%u 3=%u 4=%u 5=%u 6=%u 7=%u",
+             (unsigned)ladder->channel,
+             (unsigned)ladder->calibration_value[0],
+             (unsigned)ladder->calibration_value[1],
+             (unsigned)ladder->calibration_value[2],
+             (unsigned)ladder->calibration_value[3],
+             (unsigned)ladder->calibration_value[4],
+             (unsigned)ladder->calibration_value[5],
+             (unsigned)ladder->calibration_value[6],
+             (unsigned)ladder->calibration_value[7]);
+
+    return ESP_OK;
+}
+
+static esp_err_t hid_service_apply_button_calibration(const hid_service_button_calibration_record_t *record)
+{
+    esp_err_t err;
+
+    ESP_RETURN_ON_FALSE(record != NULL, ESP_ERR_INVALID_ARG, TAG, "button calibration record is null");
+
+    err = hid_service_apply_ladder_calibration(&s_main_ladder, record->main_value);
+    if (err != ESP_OK)
+    {
+        s_button_decode_enabled = false;
+        s_misc_ladder.decode_ready = false;
+        hid_service_reset_button_state_locked();
+        return err;
+    }
+
+    err = hid_service_apply_ladder_calibration(&s_misc_ladder, record->misc_value);
+    if (err != ESP_OK)
+    {
+        s_button_decode_enabled = false;
+        s_main_ladder.decode_ready = false;
+        s_misc_ladder.decode_ready = false;
+        hid_service_reset_button_state_locked();
+        return err;
+    }
+
+    s_button_decode_enabled = true;
+    hid_service_reset_button_state_locked();
+    return ESP_OK;
+}
+
+static esp_err_t hid_service_load_button_calibration(void)
+{
+    hid_service_button_calibration_record_t record;
+    esp_err_t err = hid_service_load_button_calibration_record(&record);
+    if (err != ESP_OK)
+    {
+        s_button_decode_enabled = false;
+        s_main_ladder.decode_ready = false;
+        s_misc_ladder.decode_ready = false;
+        hid_service_reset_button_state_locked();
+        return err;
+    }
+
+    return hid_service_apply_button_calibration(&record);
+}
+
+static uint8_t hid_service_decode_ladder_state(const hid_service_ladder_runtime_t *ladder, uint16_t value)
+{
+    ESP_RETURN_ON_FALSE(ladder != NULL, 0, TAG, "ladder state is null");
+
+    for (uint8_t index = 0; index < HID_SVC_LADDER_LEVEL_COUNT - 1U; index++)
+    {
+        if (value < ladder->threshold_value[index])
+        {
+            return ladder->levels[index].state;
+        }
+    }
+
+    return ladder->levels[HID_SVC_LADDER_LEVEL_COUNT - 1U].state;
+}
+
+static esp_err_t hid_service_update_button_adc_raws(uint16_t *main_raw_out, uint16_t *misc_raw_out)
+{
+    uint16_t main_raw = s_main_ladder.last_raw;
+    uint16_t misc_raw = s_misc_ladder.last_raw;
+    uint8_t result[HID_SVC_BUTTON_ADC_READ_BUF_SIZE];
+
+    ESP_RETURN_ON_FALSE(main_raw_out != NULL, ESP_ERR_INVALID_ARG, TAG, "main button ADC output is null");
+    ESP_RETURN_ON_FALSE(misc_raw_out != NULL, ESP_ERR_INVALID_ARG, TAG, "misc button ADC output is null");
+    ESP_RETURN_ON_FALSE(s_button_adc_handle != NULL, ESP_ERR_INVALID_STATE, TAG, "button ADC handle is not initialized");
+
+    while (true)
+    {
+        uint32_t out_length = 0;
+        esp_err_t err = adc_continuous_read(s_button_adc_handle,
+                                            result,
+                                            sizeof(result),
+                                            &out_length,
+                                            0);
+        if (err == ESP_ERR_TIMEOUT)
+        {
+            break;
+        }
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        for (uint32_t index = 0; index + SOC_ADC_DIGI_RESULT_BYTES <= out_length; index += SOC_ADC_DIGI_RESULT_BYTES)
+        {
+            adc_digi_output_data_t *sample = (adc_digi_output_data_t *)&result[index];
+
+            if (HID_SVC_BUTTON_ADC_GET_UNIT(sample) != HID_SVC_BUTTON_ADC_UNIT)
+            {
+                continue;
+            }
+
+            adc_channel_t channel = (adc_channel_t)HID_SVC_BUTTON_ADC_GET_CHANNEL(sample);
+            uint16_t raw = (uint16_t)HID_SVC_BUTTON_ADC_GET_DATA(sample);
+            if (channel == HID_SVC_MAIN_ADC_CHANNEL)
+            {
+                main_raw = raw;
+            }
+            else if (channel == HID_SVC_MISC_ADC_CHANNEL)
+            {
+                misc_raw = raw;
+            }
+        }
+    }
+
+    *main_raw_out = main_raw;
+    *misc_raw_out = misc_raw;
+    return ESP_OK;
+}
+
+static void hid_service_update_ladder_sample_locked(hid_service_ladder_runtime_t *ladder,
+                                                    uint16_t raw,
+                                                    uint16_t value)
+{
+    if (ladder == NULL)
+    {
+        return;
+    }
+
+    ladder->last_raw = raw;
+    ladder->last_value = value;
+}
+
+static bool hid_service_update_ladder_locked(hid_service_ladder_runtime_t *ladder, uint16_t value)
+{
+    uint8_t decoded_state;
+
+    ESP_RETURN_ON_FALSE(ladder != NULL, false, TAG, "ladder state is null");
+    if (!ladder->decode_ready)
+    {
+        return false;
+    }
+
+    decoded_state = hid_service_decode_ladder_state(ladder, value);
+
+    if (decoded_state == ladder->stable_state)
+    {
+        ladder->pending_state = decoded_state;
+        ladder->pending_count = 0;
+        return false;
+    }
+
+    if (decoded_state != ladder->pending_state)
+    {
+        ladder->pending_state = decoded_state;
+        ladder->pending_count = 1;
+    }
+    else if (ladder->pending_count < UINT8_MAX)
+    {
+        ladder->pending_count++;
+    }
+
+    if (ladder->pending_count < HID_SVC_BUTTON_DEBOUNCE_COUNT)
+    {
+        return false;
+    }
+
+    ladder->stable_state = decoded_state;
+    ladder->pending_state = decoded_state;
+    ladder->pending_count = 0;
+    return true;
 }
 
 static esp_err_t hid_service_post_button_event(hid_button_t button, hid_service_event_id_t event_id)
@@ -66,15 +612,140 @@ static esp_err_t hid_service_post_button_event(hid_button_t button, hid_service_
                           pdMS_TO_TICKS(1000));
 }
 
-static esp_err_t hid_service_configure_button_adc_channel(adc_oneshot_unit_handle_t handle,
-                                                          adc_channel_t channel)
+static void hid_service_deinit_button_adc(void)
 {
-    adc_oneshot_chan_cfg_t channel_cfg = {
-        .bitwidth = HID_SVC_BUTTON_ADC_BITWIDTH,
-        .atten = HID_SVC_BUTTON_ADC_ATTEN,
+    s_button_decode_enabled = false;
+    s_button_calibration_active = false;
+    s_main_ladder.decode_ready = false;
+    s_misc_ladder.decode_ready = false;
+
+    hid_service_delete_button_adc_cali(&s_main_ladder);
+    hid_service_delete_button_adc_cali(&s_misc_ladder);
+
+    if (s_button_adc_handle != NULL)
+    {
+        if (s_button_adc_started)
+        {
+            (void)adc_continuous_stop(s_button_adc_handle);
+            s_button_adc_started = false;
+        }
+
+        if (s_main_button_adc_filter != NULL)
+        {
+            (void)adc_continuous_iir_filter_disable(s_main_button_adc_filter);
+            (void)adc_del_continuous_iir_filter(s_main_button_adc_filter);
+            s_main_button_adc_filter = NULL;
+        }
+
+        if (s_misc_button_adc_filter != NULL)
+        {
+            (void)adc_continuous_iir_filter_disable(s_misc_button_adc_filter);
+            (void)adc_del_continuous_iir_filter(s_misc_button_adc_filter);
+            s_misc_button_adc_filter = NULL;
+        }
+
+        (void)adc_continuous_deinit(s_button_adc_handle);
+        s_button_adc_handle = NULL;
+    }
+}
+
+static esp_err_t hid_service_configure_button_adc(void)
+{
+    if (s_button_adc_handle != NULL)
+    {
+        return ESP_OK;
+    }
+
+    adc_continuous_handle_cfg_t handle_cfg = {
+        .max_store_buf_size = HID_SVC_BUTTON_ADC_STORE_BUF_SIZE,
+        .conv_frame_size = HID_SVC_BUTTON_ADC_CONV_FRAME_SIZE,
+        .flags = {
+            .flush_pool = 1,
+        },
+    };
+    esp_err_t err = adc_continuous_new_handle(&handle_cfg, &s_button_adc_handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    adc_digi_pattern_config_t adc_pattern[2] = {
+        {
+            .atten = HID_SVC_BUTTON_ADC_ATTEN,
+            .channel = HID_SVC_MAIN_ADC_CHANNEL,
+            .unit = HID_SVC_BUTTON_ADC_UNIT,
+            .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH,
+        },
+        {
+            .atten = HID_SVC_BUTTON_ADC_ATTEN,
+            .channel = HID_SVC_MISC_ADC_CHANNEL,
+            .unit = HID_SVC_BUTTON_ADC_UNIT,
+            .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH,
+        },
+    };
+    adc_continuous_config_t dig_cfg = {
+        .pattern_num = sizeof(adc_pattern) / sizeof(adc_pattern[0]),
+        .adc_pattern = adc_pattern,
+        .sample_freq_hz = HID_SVC_BUTTON_ADC_SAMPLE_FREQ_HZ,
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1,
+        .format = HID_SVC_BUTTON_ADC_OUTPUT_FORMAT,
     };
 
-    return adc_oneshot_config_channel(handle, channel, &channel_cfg);
+    err = adc_continuous_config(s_button_adc_handle, &dig_cfg);
+    if (err != ESP_OK)
+    {
+        hid_service_deinit_button_adc();
+        return err;
+    }
+
+    adc_continuous_iir_filter_config_t main_filter_cfg = {
+        .unit = HID_SVC_BUTTON_ADC_UNIT,
+        .channel = HID_SVC_MAIN_ADC_CHANNEL,
+        .coeff = HID_SVC_BUTTON_ADC_IIR_COEFF,
+    };
+    err = adc_new_continuous_iir_filter(s_button_adc_handle, &main_filter_cfg, &s_main_button_adc_filter);
+    if (err != ESP_OK)
+    {
+        hid_service_deinit_button_adc();
+        return err;
+    }
+
+    err = adc_continuous_iir_filter_enable(s_main_button_adc_filter);
+    if (err != ESP_OK)
+    {
+        hid_service_deinit_button_adc();
+        return err;
+    }
+
+    adc_continuous_iir_filter_config_t misc_filter_cfg = {
+        .unit = HID_SVC_BUTTON_ADC_UNIT,
+        .channel = HID_SVC_MISC_ADC_CHANNEL,
+        .coeff = HID_SVC_BUTTON_ADC_IIR_COEFF,
+    };
+    err = adc_new_continuous_iir_filter(s_button_adc_handle, &misc_filter_cfg, &s_misc_button_adc_filter);
+    if (err != ESP_OK)
+    {
+        hid_service_deinit_button_adc();
+        return err;
+    }
+
+    err = adc_continuous_iir_filter_enable(s_misc_button_adc_filter);
+    if (err != ESP_OK)
+    {
+        hid_service_deinit_button_adc();
+        return err;
+    }
+
+    err = adc_continuous_start(s_button_adc_handle);
+    if (err != ESP_OK)
+    {
+        hid_service_deinit_button_adc();
+        return err;
+    }
+
+    s_button_adc_started = true;
+
+    return ESP_OK;
 }
 
 static esp_err_t hid_service_apply_led_locked(void)
@@ -135,25 +806,68 @@ static esp_err_t hid_service_apply_led_locked(void)
     return ESP_OK;
 }
 
-static void hid_service_handle_button_update(void)
+static void hid_service_poll_buttons_once(void)
 {
     hid_button_t changed_buttons[HID_BUTTON_COUNT];
     hid_service_event_id_t changed_events[HID_BUTTON_COUNT];
     size_t changed_count = 0;
-    uint32_t next_generation = ulp_button_generation & UINT16_MAX;
-    uint32_t next_state = ulp_button_state & UINT16_MAX;
+    uint16_t main_raw = 0;
+    uint16_t misc_raw = 0;
+    uint16_t main_value = 0;
+    uint16_t misc_value = 0;
+    uint32_t next_state;
+    uint32_t changed_mask;
+    esp_err_t err;
+
+    err = hid_service_update_button_adc_raws(&main_raw, &misc_raw);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to read button ladders: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = hid_service_sample_value_from_raw(&s_main_ladder, main_raw, &main_value);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to calibrate main button ladder: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = hid_service_sample_value_from_raw(&s_misc_ladder, misc_raw, &misc_value);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "failed to calibrate misc button ladder: %s", esp_err_to_name(err));
+        return;
+    }
 
     xSemaphoreTake(s_service_lock, portMAX_DELAY);
-    if (next_generation == s_button_generation)
+
+    hid_service_update_ladder_sample_locked(&s_main_ladder, main_raw, main_value);
+    hid_service_update_ladder_sample_locked(&s_misc_ladder, misc_raw, misc_value);
+
+    if (!s_button_decode_enabled || s_button_calibration_active)
     {
         xSemaphoreGive(s_service_lock);
         return;
     }
 
-    uint32_t changed_mask = s_button_state ^ next_state;
-    s_button_state = next_state;
-    s_button_generation = next_generation;
+    (void)hid_service_update_ladder_locked(&s_main_ladder, main_value);
+    (void)hid_service_update_ladder_locked(&s_misc_ladder, misc_value);
+
+    next_state = hid_service_compose_button_state(s_main_ladder.stable_state, s_misc_ladder.stable_state);
+    changed_mask = s_button_state ^ next_state;
+    if (changed_mask != 0)
+    {
+        s_button_state = next_state;
+        s_button_generation++;
+    }
+
     xSemaphoreGive(s_service_lock);
+
+    if (changed_mask == 0)
+    {
+        return;
+    }
 
     for (uint32_t button = 0; button < HID_BUTTON_COUNT; button++)
     {
@@ -184,27 +898,15 @@ static void hid_service_handle_button_update(void)
 
 static void hid_service_task(void *param)
 {
+    TickType_t sample_ticks = hid_service_button_sample_ticks();
+    TickType_t wake_ticks = xTaskGetTickCount();
+
     (void)param;
 
     for (;;)
     {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        hid_service_handle_button_update();
-    }
-}
-
-static void IRAM_ATTR hid_service_ulp_isr(void *arg)
-{
-    (void)arg;
-
-    BaseType_t task_woken = pdFALSE;
-    if (s_task_handle != NULL)
-    {
-        vTaskNotifyGiveFromISR(s_task_handle, &task_woken);
-    }
-    if (task_woken == pdTRUE)
-    {
-        portYIELD_FROM_ISR();
+        hid_service_poll_buttons_once();
+        vTaskDelayUntil(&wake_ticks, sample_ticks);
     }
 }
 
@@ -246,53 +948,62 @@ static esp_err_t hid_service_init_buttons(void)
 {
     ESP_RETURN_ON_FALSE(rtc_gpio_is_valid_gpio(HAL_MAIN_BTN_PIN), ESP_ERR_INVALID_ARG, TAG, "main button is not RTC capable");
     ESP_RETURN_ON_FALSE(rtc_gpio_is_valid_gpio(HAL_MISC_BTN_PIN), ESP_ERR_INVALID_ARG, TAG, "misc button is not RTC capable");
-    ESP_RETURN_ON_FALSE(HAL_MAIN_BTN_PIN == GPIO_NUM_35, ESP_ERR_INVALID_STATE, TAG, "main button ladder expects GPIO35");
-    ESP_RETURN_ON_FALSE(HAL_MISC_BTN_PIN == GPIO_NUM_34, ESP_ERR_INVALID_STATE, TAG, "misc button ladder expects GPIO34");
+    ESP_RETURN_ON_FALSE(HAL_MAIN_BTN_PIN == GPIO_NUM_1, ESP_ERR_INVALID_STATE, TAG, "main button ladder expects GPIO1");
+    ESP_RETURN_ON_FALSE(HAL_MISC_BTN_PIN == GPIO_NUM_4, ESP_ERR_INVALID_STATE, TAG, "misc button ladder expects GPIO4");
 
     esp_err_t err;
 
-    err = ulp_load_binary(0,
-                          ulp_hid_bin_start,
-                          (size_t)(ulp_hid_bin_end - ulp_hid_bin_start) / sizeof(uint32_t));
-    ESP_RETURN_ON_ERROR(err, TAG, "failed to load ULP program");
+    err = hid_service_configure_button_adc();
+    ESP_RETURN_ON_ERROR(err, TAG, "failed to configure button ADC channels");
 
-    adc_oneshot_unit_init_cfg_t adc_init_cfg = {
-        .unit_id = HID_SVC_BUTTON_ADC_UNIT,
-        .ulp_mode = ADC_ULP_MODE_FSM,
-    };
-    err = adc_oneshot_new_unit(&adc_init_cfg, &s_button_adc_handle);
-    ESP_RETURN_ON_ERROR(err, TAG, "failed to initialize button ADC unit");
+    err = hid_service_create_button_adc_cali(&s_main_ladder);
+    if (err != ESP_OK)
+    {
+        hid_service_deinit_button_adc();
+        return err;
+    }
 
-    err = hid_service_configure_button_adc_channel(s_button_adc_handle, HID_SVC_MAIN_ADC_CHANNEL);
-    ESP_RETURN_ON_ERROR(err, TAG, "failed to configure main button ADC channel");
-    err = hid_service_configure_button_adc_channel(s_button_adc_handle, HID_SVC_MISC_ADC_CHANNEL);
-    ESP_RETURN_ON_ERROR(err, TAG, "failed to configure misc button ADC channel");
+    err = hid_service_create_button_adc_cali(&s_misc_ladder);
+    if (err != ESP_OK)
+    {
+        hid_service_deinit_button_adc();
+        return err;
+    }
 
-    ulp_main_counter = 0;
-    ulp_misc_counter = 0;
-    ulp_main_stable = 0;
-    ulp_misc_stable = 0;
-    ulp_main_last_raw = 0;
-    ulp_misc_last_raw = 0;
-    ulp_button_state = 0;
-    ulp_button_generation = 0;
-    ulp_debounce_threshold = HID_SVC_BUTTON_DEBOUNCE_COUNT;
+    s_main_ladder.last_raw = HID_SVC_BUTTON_ADC_MAX_RAW;
+    s_main_ladder.last_value = HID_SVC_BUTTON_ADC_MAX_RAW;
+    s_main_ladder.decode_ready = false;
+    s_misc_ladder.last_raw = HID_SVC_BUTTON_ADC_MAX_RAW;
+    s_misc_ladder.last_value = HID_SVC_BUTTON_ADC_MAX_RAW;
+    s_misc_ladder.decode_ready = false;
+    hid_service_reset_ladder_state_locked(&s_main_ladder);
+    hid_service_reset_ladder_state_locked(&s_misc_ladder);
+    s_button_state = 0;
+    s_button_generation = 0;
+    s_button_decode_enabled = false;
+    s_button_calibration_active = false;
 
-    err = ulp_set_wakeup_period(0, HID_SVC_BUTTON_SAMPLE_PERIOD_US);
-    ESP_RETURN_ON_ERROR(err, TAG, "failed to set ULP wake period");
-
-    err = ulp_isr_register(hid_service_ulp_isr, NULL);
-    ESP_RETURN_ON_ERROR(err, TAG, "failed to register ULP ISR");
-    s_ulp_isr_registered = true;
-
-    err = ulp_run(&ulp_entry - RTC_SLOW_MEM);
-    ESP_RETURN_ON_ERROR(err, TAG, "failed to start ULP program");
+    err = hid_service_load_button_calibration();
+    if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGW(TAG, "no valid HID calibration found in NVS; button state changes will be ignored until `hid calib` is run");
+        return ESP_OK;
+    }
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG,
+                 "failed to load HID calibration (%s); button state changes will be ignored until `hid calib` is run",
+                 esp_err_to_name(err));
+        return ESP_OK;
+    }
 
     return ESP_OK;
 }
 
 esp_err_t hid_service_init(void)
 {
+    esp_err_t err;
+
     if (s_initialized)
     {
         return ESP_OK;
@@ -302,6 +1013,18 @@ esp_err_t hid_service_init(void)
     if (s_service_lock == NULL)
     {
         return ESP_ERR_NO_MEM;
+    }
+
+    err = hid_service_init_led_strip();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = hid_service_init_buttons();
+    if (err != ESP_OK)
+    {
+        return err;
     }
 
     if (xTaskCreatePinnedToCore(hid_service_task,
@@ -315,18 +1038,6 @@ esp_err_t hid_service_init(void)
         vSemaphoreDelete(s_service_lock);
         s_service_lock = NULL;
         return ESP_ERR_NO_MEM;
-    }
-
-    esp_err_t err = hid_service_init_led_strip();
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    err = hid_service_init_buttons();
-    if (err != ESP_OK)
-    {
-        return err;
     }
 
     err = power_mgmt_service_register_shutdown_callback(hid_service_shutdown_callback,
@@ -392,9 +1103,119 @@ esp_err_t hid_service_get_adc_status(hid_service_adc_status_t *status_out)
     ESP_RETURN_ON_FALSE(status_out != NULL, ESP_ERR_INVALID_ARG, TAG, "ADC status output is null");
 
     xSemaphoreTake(s_service_lock, portMAX_DELAY);
-    status_out->main_raw = (uint16_t)(ulp_main_last_raw & UINT16_MAX);
-    status_out->misc_raw = (uint16_t)(ulp_misc_last_raw & UINT16_MAX);
+    status_out->main_raw = s_main_ladder.last_raw;
+    status_out->misc_raw = s_misc_ladder.last_raw;
+    status_out->main_value = s_main_ladder.last_value;
+    status_out->misc_value = s_misc_ladder.last_value;
+    status_out->calibration_loaded = s_button_decode_enabled;
     xSemaphoreGive(s_service_lock);
 
     return ESP_OK;
+}
+
+esp_err_t hid_service_capture_adc_average(uint32_t sample_count,
+                                          uint32_t sample_period_ms,
+                                          hid_service_adc_status_t *status_out)
+{
+    uint64_t main_raw_total = 0;
+    uint64_t misc_raw_total = 0;
+    uint64_t main_value_total = 0;
+    uint64_t misc_value_total = 0;
+    bool calibration_loaded = false;
+    TickType_t sample_delay_ticks = 0;
+
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "HID service is not initialized");
+    ESP_RETURN_ON_FALSE(status_out != NULL, ESP_ERR_INVALID_ARG, TAG, "ADC average output is null");
+    ESP_RETURN_ON_FALSE(sample_count > 0, ESP_ERR_INVALID_ARG, TAG, "ADC average sample count must be non-zero");
+
+    if (sample_period_ms > 0)
+    {
+        sample_delay_ticks = pdMS_TO_TICKS(sample_period_ms);
+        if (sample_delay_ticks == 0)
+        {
+            sample_delay_ticks = 1;
+        }
+    }
+
+    memset(status_out, 0, sizeof(*status_out));
+    for (uint32_t index = 0; index < sample_count; index++)
+    {
+        hid_service_adc_status_t sample = {0};
+        esp_err_t err = hid_service_get_adc_status(&sample);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        main_raw_total += sample.main_raw;
+        misc_raw_total += sample.misc_raw;
+        main_value_total += sample.main_value;
+        misc_value_total += sample.misc_value;
+        calibration_loaded = sample.calibration_loaded;
+
+        if (sample_delay_ticks > 0 && (index + 1U) < sample_count)
+        {
+            vTaskDelay(sample_delay_ticks);
+        }
+    }
+
+    status_out->main_raw = (uint16_t)(main_raw_total / sample_count);
+    status_out->misc_raw = (uint16_t)(misc_raw_total / sample_count);
+    status_out->main_value = (uint16_t)(main_value_total / sample_count);
+    status_out->misc_value = (uint16_t)(misc_value_total / sample_count);
+    status_out->calibration_loaded = calibration_loaded;
+    return ESP_OK;
+}
+
+esp_err_t hid_service_set_calibration_active(bool active)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "HID service is not initialized");
+
+    xSemaphoreTake(s_service_lock, portMAX_DELAY);
+    s_button_calibration_active = active;
+    hid_service_reset_button_state_locked();
+    xSemaphoreGive(s_service_lock);
+    return ESP_OK;
+}
+
+esp_err_t hid_service_store_calibration(const uint16_t *main_values,
+                                        const uint16_t *misc_values)
+{
+    hid_service_button_calibration_record_t record = {
+        .version = HID_SVC_BUTTON_CALIBRATION_VERSION,
+        .valid = 1,
+    };
+    hid_service_ladder_level_t validation_levels[HID_SVC_LADDER_LEVEL_COUNT];
+    uint16_t validation_thresholds[HID_SVC_LADDER_LEVEL_COUNT - 1U];
+    esp_err_t err;
+
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "HID service is not initialized");
+    ESP_RETURN_ON_FALSE(main_values != NULL, ESP_ERR_INVALID_ARG, TAG, "main calibration values are null");
+    ESP_RETURN_ON_FALSE(misc_values != NULL, ESP_ERR_INVALID_ARG, TAG, "misc calibration values are null");
+
+    err = hid_service_prepare_ladder_calibration(main_values, validation_levels, validation_thresholds);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = hid_service_prepare_ladder_calibration(misc_values, validation_levels, validation_thresholds);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    memcpy(record.main_value, main_values, sizeof(record.main_value));
+    memcpy(record.misc_value, misc_values, sizeof(record.misc_value));
+
+    err = hid_service_store_button_calibration_record(&record);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    xSemaphoreTake(s_service_lock, portMAX_DELAY);
+    err = hid_service_apply_button_calibration(&record);
+    xSemaphoreGive(s_service_lock);
+    return err;
 }

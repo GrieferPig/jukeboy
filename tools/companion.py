@@ -15,19 +15,47 @@ import uuid
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-try:
+if TYPE_CHECKING:
     from bleak import BleakClient, BleakScanner
     from bleak.backends.characteristic import BleakGATTCharacteristic
     from bleak.backends.device import BLEDevice
     from bleak.backends.scanner import AdvertisementData
-except ModuleNotFoundError as exc:
-    raise SystemExit(
-        "The bleak package is required for tools/companion.py. "
-        "Install it into the Python environment you will use for BLE testing with "
-        "`python -m pip install bleak`."
-    ) from exc
+else:
+    BleakClient = None
+    BleakScanner = None
+    BleakGATTCharacteristic = None
+    BLEDevice = None
+    AdvertisementData = None
+
+
+def require_bleak() -> None:
+    global AdvertisementData, BLEDevice, BleakClient, BleakGATTCharacteristic, BleakScanner
+
+    if BleakClient is not None and BleakScanner is not None:
+        return
+
+    try:
+        from bleak import BleakClient as imported_bleak_client
+        from bleak import BleakScanner as imported_bleak_scanner
+        from bleak.backends.characteristic import (
+            BleakGATTCharacteristic as imported_characteristic,
+        )
+        from bleak.backends.device import BLEDevice as imported_device
+        from bleak.backends.scanner import AdvertisementData as imported_advertisement
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "The bleak package is required for BLE operations in tools/companion.py. "
+            "Install it into the Python environment you will use for BLE testing with "
+            "`python -m pip install bleak`."
+        ) from exc
+
+    BleakClient = imported_bleak_client
+    BleakScanner = imported_bleak_scanner
+    BleakGATTCharacteristic = imported_characteristic
+    BLEDevice = imported_device
+    AdvertisementData = imported_advertisement
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -624,6 +652,8 @@ class CompanionBleClient:
         )
 
     async def connect(self) -> None:
+        require_bleak()
+
         self._loop = asyncio.get_running_loop()
         self.device = await self._resolve_device()
         self.client = BleakClient(
@@ -1769,6 +1799,8 @@ def parse_button_sequence(value: str | None) -> list[int]:
 
 
 async def print_scan(timeout: float) -> None:
+    require_bleak()
+
     discovered = await BleakScanner.discover(timeout=timeout, return_adv=True)
     results = []
     for device, advertisement in discovered_devices_with_advertisements(discovered):

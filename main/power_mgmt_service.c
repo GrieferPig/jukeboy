@@ -100,6 +100,37 @@ static bool power_mgmt_service_is_valid_rail(power_mgmt_rail_t rail)
     return rail >= 0 && rail < POWER_MGMT_RAIL_COUNT;
 }
 
+static bool power_mgmt_service_gpio_available(gpio_num_t pin)
+{
+    return pin >= 0 && pin < GPIO_NUM_MAX;
+}
+
+static uint64_t power_mgmt_service_pin_mask(gpio_num_t pin)
+{
+    if (!power_mgmt_service_gpio_available(pin))
+    {
+        return 0;
+    }
+
+    return 1ULL << (uint32_t)pin;
+}
+
+static bool power_mgmt_service_dac_control_available(void)
+{
+    return power_mgmt_service_gpio_available(HAL_DAC_POWER_GATE_PIN) ||
+           power_mgmt_service_gpio_available(HAL_DAC_MUTE_PIN);
+}
+
+static esp_err_t power_mgmt_service_set_gpio_level_if_available(gpio_num_t pin, uint32_t level)
+{
+    if (!power_mgmt_service_gpio_available(pin))
+    {
+        return ESP_OK;
+    }
+
+    return gpio_set_level(pin, level);
+}
+
 static bool power_mgmt_service_deadline_reached(TickType_t now, TickType_t deadline)
 {
     return (int32_t)(now - deadline) >= 0;
@@ -144,8 +175,13 @@ static bool power_mgmt_service_effective_enabled(power_mgmt_rail_t rail)
 
 static esp_err_t power_mgmt_service_configure_gpio_disabled(gpio_num_t pin)
 {
+    if (!power_mgmt_service_gpio_available(pin))
+    {
+        return ESP_OK;
+    }
+
     gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << pin,
+        .pin_bit_mask = power_mgmt_service_pin_mask(pin),
         .mode = GPIO_MODE_DISABLE,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -157,13 +193,18 @@ static esp_err_t power_mgmt_service_configure_gpio_disabled(gpio_num_t pin)
 
 static esp_err_t power_mgmt_service_configure_dac_mute_locked(bool enabled)
 {
+    if (!power_mgmt_service_gpio_available(HAL_DAC_MUTE_PIN))
+    {
+        return ESP_OK;
+    }
+
     if (!enabled)
     {
         return power_mgmt_service_configure_gpio_disabled(HAL_DAC_MUTE_PIN);
     }
 
     gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << HAL_DAC_MUTE_PIN,
+        .pin_bit_mask = power_mgmt_service_pin_mask(HAL_DAC_MUTE_PIN),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -185,6 +226,11 @@ static esp_err_t power_mgmt_service_reconfig_dac_i2s_gpio_locked(bool enabled)
         return ESP_OK;
     }
 
+    if (!power_mgmt_service_dac_control_available())
+    {
+        return ESP_OK;
+    }
+
     return i2s_channel_reconfig_std_gpio(s_dac_i2s_channel,
                                          enabled ? &s_dac_i2s_gpio_connected : &s_dac_i2s_gpio_disconnected);
 }
@@ -193,11 +239,16 @@ static esp_err_t power_mgmt_service_apply_dac_pin_state_locked(bool enabled)
 {
     esp_err_t err;
 
+    if (!power_mgmt_service_dac_control_available())
+    {
+        return ESP_OK;
+    }
+
     if (enabled)
     {
         s_dac_muted = true;
 
-        err = gpio_set_level(HAL_DAC_POWER_GATE_PIN, 0);
+        err = power_mgmt_service_set_gpio_level_if_available(HAL_DAC_POWER_GATE_PIN, 0);
         if (err != ESP_OK)
         {
             return err;
@@ -261,7 +312,7 @@ static esp_err_t power_mgmt_service_apply_dac_pin_state_locked(bool enabled)
         return err;
     }
 
-    return gpio_set_level(HAL_DAC_POWER_GATE_PIN, 1);
+    return power_mgmt_service_set_gpio_level_if_available(HAL_DAC_POWER_GATE_PIN, 1);
 }
 
 static esp_err_t power_mgmt_service_apply_locked(power_mgmt_rail_t rail)
@@ -283,7 +334,7 @@ static esp_err_t power_mgmt_service_apply_locked(power_mgmt_rail_t rail)
         }
         else
         {
-            err = gpio_set_level(s_rail_configs[rail].gate_pin, 0);
+            err = power_mgmt_service_set_gpio_level_if_available(s_rail_configs[rail].gate_pin, 0);
         }
     }
     else
@@ -294,7 +345,7 @@ static esp_err_t power_mgmt_service_apply_locked(power_mgmt_rail_t rail)
         }
         else
         {
-            err = gpio_set_level(s_rail_configs[rail].gate_pin, 1);
+            err = power_mgmt_service_set_gpio_level_if_available(s_rail_configs[rail].gate_pin, 1);
         }
     }
 
@@ -390,15 +441,36 @@ esp_err_t power_mgmt_service_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    uint64_t rail_pin_mask = 0;
+    if (power_mgmt_service_gpio_available(HAL_DAC_POWER_GATE_PIN))
+    {
+        rail_pin_mask |= power_mgmt_service_pin_mask(HAL_DAC_POWER_GATE_PIN);
+    }
+    if (power_mgmt_service_gpio_available(HAL_LED_GATE_PIN))
+    {
+        rail_pin_mask |= power_mgmt_service_pin_mask(HAL_LED_GATE_PIN);
+    }
+
     gpio_config_t rail_gpio_cfg = {
-        .pin_bit_mask = (1ULL << HAL_DAC_POWER_GATE_PIN) | (1ULL << HAL_LED_GATE_PIN),
+        .pin_bit_mask = rail_pin_mask,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
 
-    err = gpio_config(&rail_gpio_cfg);
+    if (rail_pin_mask != 0)
+    {
+        err = gpio_config(&rail_gpio_cfg);
+        if (err != ESP_OK)
+        {
+            vSemaphoreDelete(s_service_lock);
+            s_service_lock = NULL;
+            return err;
+        }
+    }
+
+    err = power_mgmt_service_set_gpio_level_if_available(HAL_DAC_POWER_GATE_PIN, 1);
     if (err != ESP_OK)
     {
         vSemaphoreDelete(s_service_lock);
@@ -406,15 +478,7 @@ esp_err_t power_mgmt_service_init(void)
         return err;
     }
 
-    err = gpio_set_level(HAL_DAC_POWER_GATE_PIN, 1);
-    if (err != ESP_OK)
-    {
-        vSemaphoreDelete(s_service_lock);
-        s_service_lock = NULL;
-        return err;
-    }
-
-    err = gpio_set_level(HAL_LED_GATE_PIN, 1);
+    err = power_mgmt_service_set_gpio_level_if_available(HAL_LED_GATE_PIN, 1);
     if (err != ESP_OK)
     {
         vSemaphoreDelete(s_service_lock);
@@ -571,6 +635,11 @@ esp_err_t power_mgmt_service_set_dac_muted(bool muted)
 {
     ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "power management service is not initialized");
 
+    if (!power_mgmt_service_gpio_available(HAL_DAC_MUTE_PIN))
+    {
+        return ESP_OK;
+    }
+
     xSemaphoreTake(s_service_lock, portMAX_DELAY);
     if (!s_rail_enabled[POWER_MGMT_RAIL_DAC])
     {
@@ -579,7 +648,7 @@ esp_err_t power_mgmt_service_set_dac_muted(bool muted)
     }
 
     s_dac_muted = muted;
-    esp_err_t err = gpio_set_level(HAL_DAC_MUTE_PIN, muted ? 0 : 1);
+    esp_err_t err = power_mgmt_service_set_gpio_level_if_available(HAL_DAC_MUTE_PIN, muted ? 0 : 1);
     xSemaphoreGive(s_service_lock);
 
     return err;

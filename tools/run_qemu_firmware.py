@@ -120,7 +120,9 @@ def merge_flash(build_dir: Path, dry_run: bool) -> None:
     subprocess.run(command, cwd=build_dir, check=True)
 
 
-def build_qemu_command(args: argparse.Namespace, root: Path) -> list[str]:
+def build_qemu_command(
+    args: argparse.Namespace, root: Path, dry_run: bool
+) -> list[str]:
     build_dir = resolve_path(root, args.build_dir)
     qemu_dir = resolve_path(root, args.qemu_dir)
 
@@ -138,15 +140,20 @@ def build_qemu_command(args: argparse.Namespace, root: Path) -> list[str]:
     qemu_efuse = build_dir / "qemu_efuse.bin"
     sd_image = build_dir / "sd_image.bin"
 
-    ensure_exists(qemu_exe, "QEMU executable")
-    ensure_exists(pc_bios_dir, "QEMU pc-bios directory")
-    if args.skip_flash_merge:
-        ensure_exists(qemu_flash, "merged QEMU flash image")
+    if not dry_run:
+        ensure_exists(qemu_exe, "QEMU executable")
+        ensure_exists(pc_bios_dir, "QEMU pc-bios directory")
+        if args.skip_flash_merge:
+            ensure_exists(qemu_flash, "merged QEMU flash image")
     if not qemu_efuse.exists():
         # QEMU expects a 128-byte blank eFuse backing file; create one on demand.
-        print(f"Creating blank eFuse image: {qemu_efuse}")
-        qemu_efuse.write_bytes(bytes(128))
-    ensure_exists(sd_image, "QEMU SD image")
+        if dry_run:
+            print(f"Would create blank eFuse image: {qemu_efuse}")
+        else:
+            print(f"Creating blank eFuse image: {qemu_efuse}")
+            qemu_efuse.write_bytes(bytes(128))
+    if not dry_run:
+        ensure_exists(sd_image, "QEMU SD image")
 
     command = [
         str(qemu_exe),
@@ -212,7 +219,7 @@ def main() -> int:
     if not args.skip_flash_merge:
         merge_flash(build_dir, args.dry_run)
 
-    qemu_command = build_qemu_command(args, root)
+    qemu_command = build_qemu_command(args, root, args.dry_run)
     print(f"+ {format_command(qemu_command)}")
 
     if args.dry_run:
