@@ -14,10 +14,12 @@
 #include "esp_task_wdt.h"
 
 #include "a2dp_coprocessor_service.h"
+#include "audio_output_switch.h"
 #include "bluetooth_service.h"
 #include "cartridge_service.h"
 #include "companion_api_service.h"
 #include "console_service.h"
+#include "display_service.h"
 #include "hid_service.h"
 #include "i2s_service.h"
 #include "lastfm_service.h"
@@ -199,7 +201,9 @@ void app_main(void)
         ESP_ERROR_CHECK(wifi_service_init());
         ESP_ERROR_CHECK(i2s_service_init());
         ESP_ERROR_CHECK(a2dp_coprocessor_service_init());
+        ESP_ERROR_CHECK(audio_output_switch_init());
         ESP_ERROR_CHECK(hid_service_init());
+        ESP_ERROR_CHECK(display_service_init());
     }
 
     ESP_ERROR_CHECK(player_service_init());

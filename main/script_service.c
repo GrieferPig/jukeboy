@@ -59,6 +59,13 @@
 #define SCRIPT_CWASM_EXTENSION ".cwasm"
 #define SCRIPT_LOG_ROOT_PATH RAMDISK_SERVICE_MOUNT_PATH "/script-logs"
 
+typedef enum
+{
+    SCRIPT_SERVICE_START_STATE_PENDING = 0,
+    SCRIPT_SERVICE_START_STATE_READY,
+    SCRIPT_SERVICE_START_STATE_FAILED,
+} script_service_start_state_t;
+
 typedef struct
 {
     char requested_path[SCRIPT_SERVICE_MAX_PATH_LEN];
@@ -66,11 +73,17 @@ typedef struct
     char **argv;
     int argc;
     bool detach_on_finish;
+    bool startup_handshake_enabled;
     script_service_run_mode_t mode;
     uint8_t *script_buffer;
     uint32_t script_buffer_size;
     int log_fd;
     esp_err_t err;
+    script_service_start_state_t startup_state;
+    SemaphoreHandle_t startup_sem;
+    StaticSemaphore_t startup_sem_storage;
+    SemaphoreHandle_t startup_ack_sem;
+    StaticSemaphore_t startup_ack_sem_storage;
     SemaphoreHandle_t completion_sem;
     StaticSemaphore_t completion_sem_storage;
     script_service_run_result_t result;
@@ -314,6 +327,57 @@ static void script_release_context(script_run_context_t *context)
             xSemaphoreGive(s_state_mutex);
         }
     }
+}
+
+static void script_publish_startup_state(script_run_context_t *context,
+                                         script_service_start_state_t state)
+{
+    if (!context || context->startup_state != SCRIPT_SERVICE_START_STATE_PENDING)
+    {
+        return;
+    }
+
+    context->startup_state = state;
+
+    if (!context->startup_handshake_enabled || !context->startup_sem || !context->startup_ack_sem)
+    {
+        return;
+    }
+
+    xSemaphoreGive(context->startup_sem);
+    xSemaphoreTake(context->startup_ack_sem, portMAX_DELAY);
+}
+
+static esp_err_t script_wait_for_startup(script_run_context_t *context,
+                                         script_service_run_result_t *result)
+{
+    if (!context)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!context->startup_handshake_enabled)
+    {
+        if (result)
+        {
+            *result = context->result;
+        }
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(context->startup_sem, portMAX_DELAY);
+    if (result)
+    {
+        *result = context->result;
+    }
+    xSemaphoreGive(context->startup_ack_sem);
+
+    if (context->startup_state == SCRIPT_SERVICE_START_STATE_FAILED)
+    {
+        return context->err != ESP_OK ? context->err : ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 static void script_capture_last_result_locked(const script_run_context_t *context)
@@ -1370,9 +1434,9 @@ static void script_yield_task(void *pvParameters)
     while (1)
     {
         vTaskDelay(interval_ticks == 0 ? 1 : interval_ticks);
-        vTaskSuspend(target_task);
-        vTaskDelay(SCRIPT_SERVICE_YIELD_SLEEP_TICKS);
-        vTaskResume(target_task);
+        // vTaskSuspend(target_task);
+        // vTaskDelay(SCRIPT_SERVICE_YIELD_SLEEP_TICKS);
+        // vTaskResume(target_task);
     }
 }
 
@@ -1540,6 +1604,7 @@ static esp_err_t script_execute_module(script_run_context_t *context)
         buffer = script_load_file(context->result.resolved_path, &buffer_size, &context->result);
         if (!buffer)
         {
+            script_publish_startup_state(context, SCRIPT_SERVICE_START_STATE_FAILED);
             return ESP_ERR_NOT_FOUND;
         }
 
@@ -1573,6 +1638,8 @@ static esp_err_t script_execute_module(script_run_context_t *context)
 
     ESP_EARLY_LOGI(TAG, "exec instantiated");
 
+    script_publish_startup_state(context, SCRIPT_SERVICE_START_STATE_READY);
+
     err = script_execute_builtin_module(context, module_inst);
 
     if (err != ESP_OK)
@@ -1592,6 +1659,11 @@ static esp_err_t script_execute_module(script_run_context_t *context)
     }
 
 cleanup:
+    if (err != ESP_OK)
+    {
+        script_publish_startup_state(context, SCRIPT_SERVICE_START_STATE_FAILED);
+    }
+
     if (module_inst)
     {
         wasm_runtime_deinstantiate(module_inst);
@@ -1647,6 +1719,15 @@ static esp_err_t script_acquire_context(script_run_context_t **context_out,
     if (!context->completion_sem)
     {
         script_set_result_message(result, "failed to create script completion semaphore");
+        script_release_context(context);
+        return ESP_ERR_NO_MEM;
+    }
+
+    context->startup_sem = xSemaphoreCreateBinaryStatic(&context->startup_sem_storage);
+    context->startup_ack_sem = xSemaphoreCreateBinaryStatic(&context->startup_ack_sem_storage);
+    if (!context->startup_sem || !context->startup_ack_sem)
+    {
+        script_set_result_message(result, "failed to create script startup semaphore");
         script_release_context(context);
         return ESP_ERR_NO_MEM;
     }
@@ -2138,6 +2219,7 @@ esp_err_t script_service_start(const char *path,
     }
 
     context->detach_on_finish = true;
+    context->startup_handshake_enabled = true;
     err = script_queue_context(context);
     if (err != ESP_OK)
     {
@@ -2149,11 +2231,7 @@ esp_err_t script_service_start(const char *path,
         return err;
     }
 
-    if (result)
-    {
-        *result = context->result;
-    }
-    return ESP_OK;
+    return script_wait_for_startup(context, result);
 }
 
 esp_err_t script_service_run(const char *path,
@@ -2171,6 +2249,7 @@ esp_err_t script_service_run(const char *path,
     }
 
     context->detach_on_finish = false;
+    context->startup_handshake_enabled = false;
     err = script_queue_context(context);
     if (err != ESP_OK)
     {

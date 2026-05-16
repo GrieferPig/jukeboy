@@ -26,9 +26,9 @@
 #include "esp_audio_types.h"
 
 #include "a2dp_coprocessor_service.h"
+#include "audio_output_switch.h"
 #include "cartridge_service.h"
 #include "hid_service.h"
-#include "i2s_service.h"
 #include "jukeboy_formats.h"
 #include "player_service.h"
 #include "power_mgmt_service.h"
@@ -116,6 +116,7 @@ typedef enum
     PLAYER_SVC_CMD_A2DP_CONNECTION_STATE,
     PLAYER_SVC_CMD_A2DP_REMOTE_COMMAND,
     PLAYER_SVC_CMD_A2DP_VOLUME,
+    PLAYER_SVC_CMD_A2DP_OUTPUT_REFRESH,
     PLAYER_SVC_CMD_PERSIST_FOR_SHUTDOWN,
 } player_service_cmd_t;
 
@@ -366,6 +367,14 @@ static bool player_service_queue_a2dp_volume(uint8_t volume, bool from_remote_ta
     return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
 }
 
+static bool player_service_queue_a2dp_output_refresh(void)
+{
+    player_service_msg_t msg = {
+        .cmd = PLAYER_SVC_CMD_A2DP_OUTPUT_REFRESH,
+    };
+    return s_cmd_queue && xQueueSend(s_cmd_queue, &msg, 0) == pdPASS;
+}
+
 static bool player_service_control_from_avrcp_key(uint8_t key_code, player_service_control_t *control)
 {
     if (!control)
@@ -448,6 +457,18 @@ static void player_service_on_a2dp_coprocessor_event(a2dp_coprocessor_event_t ev
     }
 }
 
+static void player_service_on_audio_output_event(void *arg, esp_event_base_t base, int32_t id, void *event_data)
+{
+    (void)arg;
+    (void)base;
+    (void)event_data;
+
+    if (id == AUDIO_OUTPUT_SWITCH_EVENT_TARGET_CHANGED && !player_service_queue_a2dp_output_refresh())
+    {
+        ESP_LOGW(TAG, "dropped A2DP output refresh event");
+    }
+}
+
 static StreamBufferHandle_t player_service_create_pcm_stream(void)
 {
     if (!app_is_running_in_qemu())
@@ -513,19 +534,7 @@ static size_t player_service_read_pcm_stream(uint8_t *data,
 
 static esp_err_t player_service_attach_i2s_output(void)
 {
-    esp_err_t err = i2s_service_register_pcm_provider(player_service_pcm_provider, NULL);
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-
-    err = i2s_service_start_audio();
-    if (err != ESP_OK)
-    {
-        (void)i2s_service_register_pcm_provider(NULL, NULL);
-    }
-
-    return err;
+    return audio_output_switch_set_provider(player_service_pcm_provider, NULL);
 }
 
 static bool player_service_playlist_filename(size_t index, char *buffer, size_t buffer_len)
@@ -1702,7 +1711,7 @@ static void player_service_disable_a2dp_volume_override(void)
 
 static bool player_service_should_run_a2dp_output(void)
 {
-    return s_a2dp_connected && s_playing && !s_paused;
+    return audio_output_switch_get_target() == AUDIO_OUTPUT_TARGET_A2DP && s_a2dp_connected && s_playing && !s_paused;
 }
 
 static void player_service_update_a2dp_output(void)
@@ -2772,6 +2781,8 @@ static void player_service_handle_control(player_service_control_t control)
 
 static void player_service_handle_a2dp_connection_state(bool connected)
 {
+    audio_output_target_t desired_target;
+
     if (s_a2dp_connected == connected)
     {
         return;
@@ -2779,6 +2790,20 @@ static void player_service_handle_a2dp_connection_state(bool connected)
 
     s_a2dp_connected = connected;
     ESP_LOGI(TAG, "A2DP sink %s", connected ? "connected" : "disconnected");
+
+    desired_target = connected ? AUDIO_OUTPUT_TARGET_A2DP : AUDIO_OUTPUT_TARGET_I2S;
+    if (audio_output_switch_get_target() != desired_target)
+    {
+        esp_err_t err = audio_output_switch_select(desired_target);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG,
+                     "failed to auto-switch audio output to %s after A2DP %s: %s",
+                     audio_output_switch_target_name(desired_target),
+                     connected ? "connect" : "disconnect",
+                     esp_err_to_name(err));
+        }
+    }
 }
 
 static void player_service_handle_a2dp_remote_command(uint8_t key_code, uint8_t key_state)
@@ -2908,6 +2933,8 @@ static void player_service_task(void *param)
             break;
         case PLAYER_SVC_CMD_A2DP_VOLUME:
             player_service_handle_a2dp_volume(msg.a2dp_volume, msg.a2dp_volume_from_remote_target);
+            break;
+        case PLAYER_SVC_CMD_A2DP_OUTPUT_REFRESH:
             break;
         case PLAYER_SVC_CMD_PERSIST_FOR_SHUTDOWN:
         {
@@ -3073,6 +3100,11 @@ esp_err_t player_service_init(void)
         {
             return err;
         }
+
+        ESP_ERROR_CHECK(esp_event_handler_register(AUDIO_OUTPUT_SWITCH_EVENT,
+                                                   AUDIO_OUTPUT_SWITCH_EVENT_TARGET_CHANGED,
+                                                   player_service_on_audio_output_event,
+                                                   NULL));
     }
 
     s_initialised = true;

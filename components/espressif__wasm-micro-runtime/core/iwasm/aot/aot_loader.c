@@ -3379,9 +3379,9 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
             wasm_runtime_free(symbol);
 
         if (!apply_relocation(
-            module, aot_text, aot_text_size, relocation->relocation_offset,
-            relocation->relocation_addend, relocation->relocation_type,
-            symbol_addr, symbol_index, error_buf, error_buf_size))
+                module, aot_text, aot_text_size, relocation->relocation_offset,
+                relocation->relocation_addend, relocation->relocation_type,
+                symbol_addr, symbol_index, error_buf, error_buf_size))
             return false;
     }
 
@@ -4369,8 +4369,13 @@ create_sections(AOTModule *module, const uint8 *buf, uint32 size,
                     destroy_aot_text = true;
 
                     if ((uint32)total_size > section->section_body_size) {
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
+                        memset(mirrored_text + (uint32)section_size, 0,
+                               (uint32)total_size - section_size);
+#else
                         memset(aot_text + (uint32)section_size, 0,
                                (uint32)total_size - section_size);
+#endif
                         section->section_body_size = (uint32)total_size;
                     }
                 }
@@ -4498,7 +4503,8 @@ aot_load_from_aot_file(const uint8 *buf, uint32 size, const LoadArgs *args,
         return NULL;
     }
     os_thread_jit_write_protect_np(true); /* Make memory executable */
-    os_icache_flush(module->code, module->code_size);
+    os_icache_flush(module->literal,
+                    (size_t)module->literal_size + (size_t)module->code_size);
 
 #if WASM_ENABLE_AOT_VALIDATOR != 0
     if (!aot_module_validate(module, error_buf, error_buf_size)) {

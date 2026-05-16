@@ -5,16 +5,19 @@
 
 #include "platform_api_vmcore.h"
 #include "platform_api_extension.h"
+#include "esp_cache.h"
+#include "hal/cache_hal.h"
 #if (WASM_MEM_DUAL_BUS_MIRROR != 0)
 #include "soc/mmu.h"
-#include "rom/cache.h"
 
-#define MEM_DUAL_BUS_OFFSET (SOC_IROM_LOW - SOC_IROM_HIGH)
+#define MEM_DUAL_BUS_OFFSET (SOC_IROM_LOW - SOC_DROM_LOW)
 
 #define in_ibus_ext(addr) \
     (((uint32)addr >= SOC_IROM_LOW) && ((uint32)addr < SOC_IROM_HIGH))
 
-static portMUX_TYPE s_spinlock = portMUX_INITIALIZER_UNLOCKED;
+#define ALIGN_DOWN_BY(value, align) ((value) & ~((uintptr_t)(align) - 1U))
+#define ALIGN_UP_BY(value, align) \
+    (((value) + ((uintptr_t)(align) - 1U)) & ~((uintptr_t)(align) - 1U))
 #endif
 
 static void *
@@ -64,7 +67,7 @@ os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
         uintptr_t *addr_field = buf_fixed - sizeof(uintptr_t);
         *addr_field = (uintptr_t)buf_origin;
 #if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-        memset(buf_fixed + MEM_DUAL_BUS_OFFSET, 0, size);
+        memset(buf_fixed, 0, size);
         return buf_fixed + MEM_DUAL_BUS_OFFSET;
 #else
         memset(buf_fixed, 0, size);
@@ -121,28 +124,76 @@ os_mprotect(void *addr, size_t size, int prot)
 }
 
 void
-#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-    IRAM_ATTR
-#endif
-    os_dcache_flush()
+os_dcache_flush()
 {
-#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-    uint32_t preload;
-    extern void Cache_WriteBack_All(void);
-
-    portENTER_CRITICAL(&s_spinlock);
-
-    Cache_WriteBack_All();
-    preload = Cache_Disable_ICache();
-    Cache_Enable_ICache(preload);
-
-    portEXIT_CRITICAL(&s_spinlock);
-#endif
+    /* The ESP-IDF port syncs executable regions in os_icache_flush() once the
+     * caller can provide the exact address range that was modified. */
 }
 
 void
 os_icache_flush(void *start, size_t len)
 {
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
+    void *dbus_addr;
+    uintptr_t dbus_start;
+    uintptr_t dbus_end;
+    uintptr_t ibus_start;
+    uintptr_t ibus_end;
+    uint32_t dbus_cache_level = 0;
+    uint32_t dbus_cache_id = 0;
+    uint32_t ibus_cache_level = 0;
+    uint32_t ibus_cache_id = 0;
+    uint32_t data_cache_line_size;
+    uint32_t inst_cache_line_size;
+    bool valid;
+
+    if (!start || len == 0) {
+        return;
+    }
+
+    dbus_addr = os_get_dbus_mirror(start);
+    if (!dbus_addr) {
+        return;
+    }
+
+    valid = cache_hal_vaddr_to_cache_level_id(
+        (uint32_t)dbus_addr, (uint32_t)len, &dbus_cache_level, &dbus_cache_id);
+    if (!valid) {
+        return;
+    }
+
+    valid = cache_hal_vaddr_to_cache_level_id(
+        (uint32_t)start, (uint32_t)len, &ibus_cache_level, &ibus_cache_id);
+    if (!valid) {
+        return;
+    }
+
+    (void)dbus_cache_id;
+    (void)ibus_cache_id;
+
+    data_cache_line_size =
+        cache_hal_get_cache_line_size(dbus_cache_level, CACHE_TYPE_DATA);
+    inst_cache_line_size =
+        cache_hal_get_cache_line_size(ibus_cache_level, CACHE_TYPE_INSTRUCTION);
+
+    if (data_cache_line_size == 0 || inst_cache_line_size == 0) {
+        return;
+    }
+
+    dbus_start = ALIGN_DOWN_BY((uintptr_t)dbus_addr, data_cache_line_size);
+    dbus_end = ALIGN_UP_BY((uintptr_t)dbus_addr + len, data_cache_line_size);
+    ibus_start = ALIGN_DOWN_BY((uintptr_t)start, inst_cache_line_size);
+    ibus_end = ALIGN_UP_BY((uintptr_t)start + len, inst_cache_line_size);
+
+    (void)esp_cache_msync((void *)dbus_start, dbus_end - dbus_start,
+                          ESP_CACHE_MSYNC_FLAG_DIR_C2M
+                              | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+    (void)cache_hal_invalidate_addr((uint32_t)ibus_start,
+                                    (uint32_t)(ibus_end - ibus_start));
+#else
+    (void)start;
+    (void)len;
+#endif
 }
 
 #if (WASM_MEM_DUAL_BUS_MIRROR != 0)

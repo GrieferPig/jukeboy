@@ -104,6 +104,8 @@ Trusted apps can be inspected and revoked from the console:
 | `0x0100` | `SNAPSHOT` | Yes | Composite firmware snapshot |
 | `0x0101` | `PLAYBACK_STATUS` | Yes | Same payload as snapshot in first implementation |
 | `0x0102` | `PLAYBACK_CONTROL` | Yes | Playback action + optional value |
+| `0x0103` | `OUTPUT_STATUS` | Yes | Current audio output target and A2DP connection state |
+| `0x0104` | `OUTPUT_SELECT` | Yes | Select A2DP or local I2S output |
 | `0x0110` | `LIBRARY_ALBUM` | Yes | Album/cartridge metadata |
 | `0x0111` | `LIBRARY_TRACK_PAGE` | Yes | Paged track metadata, max 8 per response |
 | `0x0112` | `LIBRARY_COVER` | Yes | Paged `cover.png` transfer, max 1024 bytes per response |
@@ -120,6 +122,10 @@ Trusted apps can be inspected and revoked from the console:
 | `0x0401` | `HISTORY_ALBUM_PAGE` | Yes | Paged album history, max 4 per response |
 | `0x0500` | `BT_AUDIO_STATUS` | Yes | A2DP/bonded device summary |
 | `0x0501` | `BT_AUDIO_CONTROL` | Yes | Connect last, pair best sink, disconnect |
+| `0x0502` | `BT_SCAN_START` | Yes | Start A2DP sink discovery |
+| `0x0503` | `BT_SCAN_RESULTS` | Yes | Paged discovered sink results |
+| `0x0504` | `BT_BONDED_LIST` | Yes | List bonded A2DP devices with display names |
+| `0x0505` | `BT_UNBOND` | Yes | Remove a bonded A2DP device and return the refreshed list |
 
 ## Playback Actions
 
@@ -137,7 +143,35 @@ Trusted apps can be inspected and revoked from the console:
 | 7 | Seek absolute seconds | seconds in current track |
 | 8 | Set volume percent | `0..100` |
 | 9 | Set playback mode | player mode enum |
-| 10 | Set output target | `0` Bluetooth, `1` I2S |
+| 10 | Set output target | Legacy path; prefer `OUTPUT_SELECT`. Values are `0` A2DP, `1` I2S |
+
+## Audio Output
+
+The preferred output-management surface is separate from playback controls:
+
+- `OUTPUT_STATUS` has no request TLVs. The response includes `OUTPUT_TARGET`
+   (`0x030E`) and `BT_A2DP_CONNECTED` (`0x0800`).
+- `OUTPUT_SELECT` accepts `OUTPUT_TARGET` (`0x030E`) as one byte: `0` for A2DP
+   and `1` for I2S. The response uses the same payload as `OUTPUT_STATUS`.
+
+Selecting A2DP wakes the external A2DP coprocessor if needed. Selecting I2S
+suspends A2DP audio and asks the coprocessor to enter deep sleep.
+
+## Bluetooth Bonded Devices
+
+`BT_BONDED_LIST` has no request TLVs. The response includes:
+
+- `BT_BONDED_COUNT` (`0x0801`) for the bonded-device count reported by the A2DP
+   coprocessor for this response.
+- `RETURNED_COUNT` (`0x040C`) for the number of device records included in this
+   frame.
+- Repeated device records encoded as `BT_ADDR` (`0x0802`, six raw address bytes)
+   followed by `BT_NAME` (`0x0803`, UTF-8 display name). The name can be empty if
+   the coprocessor has not cached one for that address yet, and long names may be
+   truncated to fit the coprocessor UART payload budget.
+
+`BT_UNBOND` accepts one `BT_ADDR` TLV. On success, the response uses the
+refreshed bonded-list payload described above, with opcode `BT_UNBOND`.
 
 ## Library Cover Transfer
 

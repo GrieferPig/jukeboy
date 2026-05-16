@@ -8,10 +8,12 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 
 #include "pin_defs.h"
+#include "power_mgmt_service.h"
 
 #define A2DP_UART_NUM UART_NUM_1
 #define A2DP_UART_BAUD 115200
@@ -26,6 +28,9 @@
 #define A2DP_SYNC_1 0xD2
 #define A2DP_HEADER_LEN 4
 #define A2DP_CRC_LEN 2
+#define A2DP_EN_PULSE_LOW_MS 50
+#define A2DP_BOOT_WAIT_MS 1200
+#define A2DP_SHUTDOWN_PRIORITY (POWER_MGMT_SERVICE_SHUTDOWN_PRIORITY_BLUETOOTH + 10)
 
 typedef enum
 {
@@ -46,6 +51,7 @@ typedef enum
     UART_CMD_LIST_BONDED = 0x0F,
     UART_CMD_UNBOND = 0x10,
     UART_CMD_GET_DISCOVERY_RESULTS = 0x11,
+    UART_CMD_SHUTDOWN = 0x12,
 } a2dp_uart_command_t;
 
 typedef enum
@@ -100,10 +106,12 @@ static SemaphoreHandle_t s_command_mutex;
 static SemaphoreHandle_t s_ack_sem;
 static SemaphoreHandle_t s_response_sem;
 static bool s_initialised;
+static bool s_en_pin_configured;
+static bool s_coprocessor_awake;
 static uint8_t s_next_seq = 1;
 static a2dp_coprocessor_status_t s_status;
 static a2dp_coprocessor_pairing_confirm_t s_pairing_confirm;
-static a2dp_coprocessor_addr_t s_bonded_devices[A2DP_COPROCESSOR_MAX_LIST_ITEMS];
+static a2dp_coprocessor_bonded_device_t s_bonded_devices[A2DP_COPROCESSOR_MAX_LIST_ITEMS];
 static size_t s_bonded_count;
 static a2dp_coprocessor_scan_entry_t s_discovery_entries[A2DP_COPROCESSOR_MAX_LIST_ITEMS];
 static size_t s_discovery_count;
@@ -198,6 +206,89 @@ static void drain_semaphore(SemaphoreHandle_t sem)
     while (sem && xSemaphoreTake(sem, 0) == pdTRUE)
     {
     }
+}
+
+static bool a2dp_en_pin_available(void)
+{
+    return HAL_A2DP_EN_PIN >= 0 && HAL_A2DP_EN_PIN < GPIO_NUM_MAX;
+}
+
+static uint64_t a2dp_en_pin_mask(void)
+{
+    return a2dp_en_pin_available() ? (1ULL << (uint32_t)HAL_A2DP_EN_PIN) : 0;
+}
+
+static void a2dp_mark_awake(bool awake)
+{
+    taskENTER_CRITICAL(&s_state_lock);
+    s_coprocessor_awake = awake;
+    if (!awake)
+    {
+        s_status.coprocessor_seen = false;
+        s_status.a2dp_connected = false;
+        s_status.i2s_running = false;
+        s_status.discovery_running = false;
+        memset(s_status.connected_bda, 0, sizeof(s_status.connected_bda));
+    }
+    taskEXIT_CRITICAL(&s_state_lock);
+}
+
+static esp_err_t a2dp_configure_en_pin(void)
+{
+    if (!a2dp_en_pin_available())
+    {
+        return ESP_OK;
+    }
+    if (s_en_pin_configured)
+    {
+        return ESP_OK;
+    }
+
+    gpio_config_t cfg = {
+        .pin_bit_mask = a2dp_en_pin_mask(),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t err = gpio_config(&cfg);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = gpio_set_level(HAL_A2DP_EN_PIN, 1);
+    if (err == ESP_OK)
+    {
+        s_en_pin_configured = true;
+    }
+    return err;
+}
+
+static esp_err_t a2dp_pulse_en_pin(void)
+{
+    esp_err_t err = a2dp_configure_en_pin();
+    if (err != ESP_OK || !a2dp_en_pin_available())
+    {
+        return err;
+    }
+
+    ESP_LOGI(TAG, "coprocessor not responding, pulsing EN GPIO %d", HAL_A2DP_EN_PIN);
+    err = gpio_set_level(HAL_A2DP_EN_PIN, 0);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    vTaskDelay(pdMS_TO_TICKS(A2DP_EN_PULSE_LOW_MS));
+
+    err = gpio_set_level(HAL_A2DP_EN_PIN, 1);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    vTaskDelay(pdMS_TO_TICKS(A2DP_BOOT_WAIT_MS));
+    return ESP_OK;
 }
 
 static esp_err_t uart_send_frame(uint8_t type, uint8_t seq, const uint8_t *payload, uint16_t len)
@@ -399,6 +490,7 @@ static void handle_status(uint8_t seq, const uint8_t *payload, uint16_t len)
     }
 
     taskENTER_CRITICAL(&s_state_lock);
+    s_coprocessor_awake = true;
     s_status.coprocessor_seen = true;
     s_status.initialised = (payload[0] & 0x01) != 0;
     s_status.discovery_running = (payload[0] & 0x02) != 0;
@@ -464,6 +556,7 @@ static void handle_addr_list(uint8_t seq, uint8_t type, const uint8_t *payload, 
 {
     size_t count;
     esp_err_t status = ESP_OK;
+    bool extended_bonded_list = false;
 
     if (len < 1)
     {
@@ -476,7 +569,12 @@ static void handle_addr_list(uint8_t seq, uint8_t type, const uint8_t *payload, 
     {
         count = A2DP_COPROCESSOR_MAX_LIST_ITEMS;
     }
-    if (len < 1 + count * A2DP_COPROCESSOR_ADDR_LEN)
+    if (type == UART_EVT_BONDED_LIST)
+    {
+        extended_bonded_list = len != 1 + count * A2DP_COPROCESSOR_ADDR_LEN;
+    }
+
+    if (!extended_bonded_list && len < 1 + count * A2DP_COPROCESSOR_ADDR_LEN)
     {
         status = ESP_ERR_INVALID_SIZE;
         count = 0;
@@ -485,12 +583,57 @@ static void handle_addr_list(uint8_t seq, uint8_t type, const uint8_t *payload, 
     taskENTER_CRITICAL(&s_state_lock);
     if (type == UART_EVT_BONDED_LIST)
     {
-        s_bonded_count = count;
+        size_t parsed_count = 0;
         memset(s_bonded_devices, 0, sizeof(s_bonded_devices));
-        for (size_t index = 0; index < count; index++)
+
+        if (status == ESP_OK && extended_bonded_list)
         {
-            memcpy(s_bonded_devices[index], &payload[1 + index * A2DP_COPROCESSOR_ADDR_LEN], A2DP_COPROCESSOR_ADDR_LEN);
+            size_t offset = 1;
+            for (size_t index = 0; index < count; index++)
+            {
+                if (offset + A2DP_COPROCESSOR_ADDR_LEN + 1 > len)
+                {
+                    status = ESP_ERR_INVALID_SIZE;
+                    parsed_count = 0;
+                    memset(s_bonded_devices, 0, sizeof(s_bonded_devices));
+                    break;
+                }
+
+                memcpy(s_bonded_devices[parsed_count].bda, &payload[offset], A2DP_COPROCESSOR_ADDR_LEN);
+                offset += A2DP_COPROCESSOR_ADDR_LEN;
+
+                uint8_t name_len = payload[offset++];
+                if (offset + name_len > len)
+                {
+                    status = ESP_ERR_INVALID_SIZE;
+                    parsed_count = 0;
+                    memset(s_bonded_devices, 0, sizeof(s_bonded_devices));
+                    break;
+                }
+
+                size_t copy_len = name_len;
+                if (copy_len > A2DP_COPROCESSOR_MAX_DEVICE_NAME_LEN)
+                {
+                    copy_len = A2DP_COPROCESSOR_MAX_DEVICE_NAME_LEN;
+                }
+                if (copy_len > 0)
+                {
+                    memcpy(s_bonded_devices[parsed_count].name, &payload[offset], copy_len);
+                    s_bonded_devices[parsed_count].name[copy_len] = '\0';
+                }
+                offset += name_len;
+                parsed_count++;
+            }
         }
+        else if (status == ESP_OK)
+        {
+            for (size_t index = 0; index < count; index++)
+            {
+                memcpy(s_bonded_devices[index].bda, &payload[1 + index * A2DP_COPROCESSOR_ADDR_LEN], A2DP_COPROCESSOR_ADDR_LEN);
+            }
+            parsed_count = count;
+        }
+        s_bonded_count = status == ESP_OK ? parsed_count : 0;
     }
     else
     {
@@ -689,6 +832,7 @@ static void handle_avrcp_notification(const uint8_t *payload, uint16_t len)
 static void handle_frame(uint8_t type, uint8_t seq, const uint8_t *payload, uint16_t len)
 {
     taskENTER_CRITICAL(&s_state_lock);
+    s_coprocessor_awake = true;
     s_status.coprocessor_seen = true;
     s_status.rx_frames++;
     taskEXIT_CRITICAL(&s_state_lock);
@@ -854,6 +998,12 @@ static void uart_task(void *param)
     }
 }
 
+static esp_err_t a2dp_coprocessor_shutdown_callback(void *user_ctx)
+{
+    (void)user_ctx;
+    return a2dp_coprocessor_service_shutdown();
+}
+
 esp_err_t a2dp_coprocessor_service_init(void)
 {
     uart_config_t uart_config = {
@@ -877,6 +1027,12 @@ esp_err_t a2dp_coprocessor_service_init(void)
     if (!s_command_mutex || !s_ack_sem || !s_response_sem)
     {
         return ESP_ERR_NO_MEM;
+    }
+
+    err = a2dp_configure_en_pin();
+    if (err != ESP_OK)
+    {
+        return err;
     }
 
     err = uart_driver_install(A2DP_UART_NUM,
@@ -926,11 +1082,19 @@ esp_err_t a2dp_coprocessor_service_init(void)
     taskEXIT_CRITICAL(&s_state_lock);
 
     ESP_LOGI(TAG,
-             "A2DP coprocessor UART ready: uart=%d baud=%d tx=%d rx=%d",
+             "A2DP coprocessor UART ready: uart=%d baud=%d tx=%d rx=%d en=%d",
              A2DP_UART_NUM,
              A2DP_UART_BAUD,
              HAL_A2DP_UART_TX_PIN,
-             HAL_A2DP_UART_RX_PIN);
+             HAL_A2DP_UART_RX_PIN,
+             HAL_A2DP_EN_PIN);
+    err = power_mgmt_service_register_shutdown_callback(a2dp_coprocessor_shutdown_callback,
+                                                        NULL,
+                                                        A2DP_SHUTDOWN_PRIORITY);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        return err;
+    }
     a2dp_emit(A2DP_COPROCESSOR_EVENT_STARTED, NULL);
     return ESP_OK;
 }
@@ -969,6 +1133,16 @@ bool a2dp_coprocessor_service_is_initialised(void)
     return s_initialised;
 }
 
+bool a2dp_coprocessor_service_is_awake(void)
+{
+    bool awake;
+
+    taskENTER_CRITICAL(&s_state_lock);
+    awake = s_coprocessor_awake;
+    taskEXIT_CRITICAL(&s_state_lock);
+    return awake;
+}
+
 bool a2dp_coprocessor_service_is_a2dp_connected(void)
 {
     bool connected;
@@ -989,6 +1163,90 @@ bool a2dp_coprocessor_service_is_discovery_running(void)
     return running;
 }
 
+esp_err_t a2dp_coprocessor_service_wake_for_request(void)
+{
+    if (!s_initialised)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = a2dp_coprocessor_service_refresh_status();
+    if (err == ESP_OK)
+    {
+        a2dp_mark_awake(true);
+        return ESP_OK;
+    }
+
+    a2dp_mark_awake(false);
+
+    err = a2dp_pulse_en_pin();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = a2dp_coprocessor_service_refresh_status();
+    if (err == ESP_OK)
+    {
+        a2dp_mark_awake(true);
+    }
+    else
+    {
+        a2dp_mark_awake(false);
+    }
+    return err;
+}
+
+esp_err_t a2dp_coprocessor_service_shutdown(void)
+{
+    if (!s_initialised)
+    {
+        return ESP_OK;
+    }
+
+    esp_err_t err = a2dp_coprocessor_service_refresh_status();
+    if (err != ESP_OK)
+    {
+        a2dp_mark_awake(false);
+        return ESP_OK;
+    }
+
+    err = send_command(UART_CMD_SHUTDOWN, NULL, 0, 0);
+    if (err == ESP_OK || err == ESP_ERR_TIMEOUT)
+    {
+        a2dp_mark_awake(false);
+        return ESP_OK;
+    }
+    return err;
+}
+
+static esp_err_t send_request_command(uint8_t command,
+                                      const uint8_t *payload,
+                                      uint16_t len,
+                                      uint8_t response_type)
+{
+    esp_err_t err = a2dp_coprocessor_service_wake_for_request();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    return send_command(command, payload, len, response_type);
+}
+
+static esp_err_t send_awake_only_command(uint8_t command,
+                                         const uint8_t *payload,
+                                         uint16_t len,
+                                         uint8_t response_type)
+{
+    esp_err_t err = a2dp_coprocessor_service_refresh_status();
+    if (err != ESP_OK)
+    {
+        a2dp_mark_awake(false);
+        return ESP_OK;
+    }
+    return send_command(command, payload, len, response_type);
+}
+
 esp_err_t a2dp_coprocessor_service_pair_best_a2dp_sink(void)
 {
     esp_err_t err;
@@ -998,7 +1256,7 @@ esp_err_t a2dp_coprocessor_service_pair_best_a2dp_sink(void)
     memset(s_discovery_entries, 0, sizeof(s_discovery_entries));
     taskEXIT_CRITICAL(&s_state_lock);
 
-    err = send_command(UART_CMD_PAIR_BEST, NULL, 0, 0);
+    err = send_request_command(UART_CMD_PAIR_BEST, NULL, 0, 0);
     if (err == ESP_OK)
     {
         taskENTER_CRITICAL(&s_state_lock);
@@ -1017,7 +1275,7 @@ esp_err_t a2dp_coprocessor_service_start_discovery(void)
     memset(s_discovery_entries, 0, sizeof(s_discovery_entries));
     taskEXIT_CRITICAL(&s_state_lock);
 
-    err = send_command(UART_CMD_START_DISCOVERY, NULL, 0, 0);
+    err = send_request_command(UART_CMD_START_DISCOVERY, NULL, 0, 0);
     if (err == ESP_OK)
     {
         taskENTER_CRITICAL(&s_state_lock);
@@ -1029,7 +1287,7 @@ esp_err_t a2dp_coprocessor_service_start_discovery(void)
 
 esp_err_t a2dp_coprocessor_service_connect_last_bonded_a2dp_device(void)
 {
-    return send_command(UART_CMD_CONNECT_LAST, NULL, 0, 0);
+    return send_request_command(UART_CMD_CONNECT_LAST, NULL, 0, 0);
 }
 
 esp_err_t a2dp_coprocessor_service_connect_a2dp(const a2dp_coprocessor_addr_t remote_bda)
@@ -1038,12 +1296,12 @@ esp_err_t a2dp_coprocessor_service_connect_a2dp(const a2dp_coprocessor_addr_t re
     {
         return ESP_ERR_INVALID_ARG;
     }
-    return send_command(UART_CMD_CONNECT_ADDR, remote_bda, A2DP_COPROCESSOR_ADDR_LEN, 0);
+    return send_request_command(UART_CMD_CONNECT_ADDR, remote_bda, A2DP_COPROCESSOR_ADDR_LEN, 0);
 }
 
 esp_err_t a2dp_coprocessor_service_disconnect_a2dp(void)
 {
-    return send_command(UART_CMD_DISCONNECT, NULL, 0, 0);
+    return send_awake_only_command(UART_CMD_DISCONNECT, NULL, 0, 0);
 }
 
 esp_err_t a2dp_coprocessor_service_get_pending_pairing_confirm(a2dp_coprocessor_pairing_confirm_t *confirm)
@@ -1062,7 +1320,7 @@ esp_err_t a2dp_coprocessor_service_get_pending_pairing_confirm(a2dp_coprocessor_
 esp_err_t a2dp_coprocessor_service_reply_pairing_confirm(bool accept)
 {
     uint8_t payload = accept ? 1 : 0;
-    esp_err_t err = send_command(UART_CMD_PAIR_CONFIRM, &payload, sizeof(payload), 0);
+    esp_err_t err = send_request_command(UART_CMD_PAIR_CONFIRM, &payload, sizeof(payload), 0);
     if (err == ESP_OK)
     {
         taskENTER_CRITICAL(&s_state_lock);
@@ -1074,7 +1332,7 @@ esp_err_t a2dp_coprocessor_service_reply_pairing_confirm(bool accept)
 
 esp_err_t a2dp_coprocessor_service_start_audio(void)
 {
-    esp_err_t err = send_command(UART_CMD_AUDIO_START, NULL, 0, 0);
+    esp_err_t err = send_request_command(UART_CMD_AUDIO_START, NULL, 0, 0);
     if (err == ESP_OK)
     {
         taskENTER_CRITICAL(&s_state_lock);
@@ -1086,7 +1344,7 @@ esp_err_t a2dp_coprocessor_service_start_audio(void)
 
 esp_err_t a2dp_coprocessor_service_suspend_audio(void)
 {
-    esp_err_t err = send_command(UART_CMD_AUDIO_SUSPEND, NULL, 0, 0);
+    esp_err_t err = send_awake_only_command(UART_CMD_AUDIO_SUSPEND, NULL, 0, 0);
     if (err == ESP_OK)
     {
         taskENTER_CRITICAL(&s_state_lock);
@@ -1098,7 +1356,7 @@ esp_err_t a2dp_coprocessor_service_suspend_audio(void)
 
 esp_err_t a2dp_coprocessor_service_send_media_key(uint8_t key_code)
 {
-    return send_command(UART_CMD_MEDIA_KEY, &key_code, sizeof(key_code), 0);
+    return send_request_command(UART_CMD_MEDIA_KEY, &key_code, sizeof(key_code), 0);
 }
 
 esp_err_t a2dp_coprocessor_service_set_absolute_volume(uint8_t volume)
@@ -1107,17 +1365,17 @@ esp_err_t a2dp_coprocessor_service_set_absolute_volume(uint8_t volume)
     {
         volume = 127;
     }
-    return send_command(UART_CMD_SET_VOLUME, &volume, sizeof(volume), 0);
+    return send_request_command(UART_CMD_SET_VOLUME, &volume, sizeof(volume), 0);
 }
 
 esp_err_t a2dp_coprocessor_service_get_metadata(uint8_t attr_mask)
 {
-    return send_command(UART_CMD_GET_METADATA, &attr_mask, sizeof(attr_mask), 0);
+    return send_request_command(UART_CMD_GET_METADATA, &attr_mask, sizeof(attr_mask), 0);
 }
 
 esp_err_t a2dp_coprocessor_service_get_play_status(void)
 {
-    return send_command(UART_CMD_GET_PLAY_STATUS, NULL, 0, 0);
+    return send_request_command(UART_CMD_GET_PLAY_STATUS, NULL, 0, 0);
 }
 
 esp_err_t a2dp_coprocessor_service_register_notification(uint8_t event_id, uint32_t event_parameter)
@@ -1125,12 +1383,12 @@ esp_err_t a2dp_coprocessor_service_register_notification(uint8_t event_id, uint3
     uint8_t payload[5];
     payload[0] = event_id;
     put_u32(&payload[1], event_parameter);
-    return send_command(UART_CMD_REGISTER_NOTIFICATION, payload, sizeof(payload), 0);
+    return send_request_command(UART_CMD_REGISTER_NOTIFICATION, payload, sizeof(payload), 0);
 }
 
 esp_err_t a2dp_coprocessor_service_refresh_bonded_devices(void)
 {
-    return send_command(UART_CMD_LIST_BONDED, NULL, 0, UART_EVT_BONDED_LIST);
+    return send_request_command(UART_CMD_LIST_BONDED, NULL, 0, UART_EVT_BONDED_LIST);
 }
 
 size_t a2dp_coprocessor_service_get_bonded_device_count(void)
@@ -1163,7 +1421,34 @@ esp_err_t a2dp_coprocessor_service_get_bonded_devices(size_t *count,
     copied = s_bonded_count < capacity ? s_bonded_count : capacity;
     for (size_t index = 0; index < copied; index++)
     {
-        memcpy(devices[index], s_bonded_devices[index], A2DP_COPROCESSOR_ADDR_LEN);
+        memcpy(devices[index], s_bonded_devices[index].bda, A2DP_COPROCESSOR_ADDR_LEN);
+    }
+    *count = copied;
+    taskEXIT_CRITICAL(&s_state_lock);
+    return ESP_OK;
+}
+
+esp_err_t a2dp_coprocessor_service_get_bonded_device_entries(size_t *count,
+                                                             a2dp_coprocessor_bonded_device_t *devices)
+{
+    size_t capacity;
+    size_t copied;
+
+    if (!count)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    capacity = *count;
+    if (capacity > 0 && !devices)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    taskENTER_CRITICAL(&s_state_lock);
+    copied = s_bonded_count < capacity ? s_bonded_count : capacity;
+    for (size_t index = 0; index < copied; index++)
+    {
+        memcpy(&devices[index], &s_bonded_devices[index], sizeof(devices[index]));
     }
     *count = copied;
     taskEXIT_CRITICAL(&s_state_lock);
@@ -1172,7 +1457,7 @@ esp_err_t a2dp_coprocessor_service_get_bonded_devices(size_t *count,
 
 esp_err_t a2dp_coprocessor_service_refresh_discovery_results(void)
 {
-    return send_command(UART_CMD_GET_DISCOVERY_RESULTS, NULL, 0, UART_EVT_DISCOVERY_LIST);
+    return send_request_command(UART_CMD_GET_DISCOVERY_RESULTS, NULL, 0, UART_EVT_DISCOVERY_LIST);
 }
 
 esp_err_t a2dp_coprocessor_service_get_discovery_results(a2dp_coprocessor_scan_entry_t *out_entries,
@@ -1208,5 +1493,5 @@ esp_err_t a2dp_coprocessor_service_unbond(const a2dp_coprocessor_addr_t addr)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    return send_command(UART_CMD_UNBOND, addr, A2DP_COPROCESSOR_ADDR_LEN, 0);
+    return send_request_command(UART_CMD_UNBOND, addr, A2DP_COPROCESSOR_ADDR_LEN, 0);
 }

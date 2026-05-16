@@ -21,6 +21,7 @@
 #include "argtable3/argtable3.h"
 
 #include "a2dp_coprocessor_service.h"
+#include "audio_output_switch.h"
 #include "bluetooth_service.h"
 #include "wifi_service.h"
 #include "companion_api_service.h"
@@ -37,7 +38,7 @@
 static const char *TAG = "console_svc";
 
 #define TELEMETRY_INTERVAL_MS 5000
-#define TELEMETRY_MAX_TASKS 32
+#define TELEMETRY_MAX_TASKS 64
 #define CONSOLE_REPL_TASK_STACK_SIZE 6144
 #define CONSOLE_PSRAM_ALLOC_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define HID_CALIB_CAPTURE_SAMPLE_COUNT 25U
@@ -122,6 +123,7 @@ static void capture_runtime_snapshot(void)
 
 static void print_memory_stats(void)
 {
+    UBaseType_t total_task_count = uxTaskGetNumberOfTasks();
     size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t total_internal = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t max_block_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -130,7 +132,7 @@ static void print_memory_stats(void)
     size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     size_t max_block_psram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
 
-    UBaseType_t task_count = uxTaskGetNumberOfTasks();
+    UBaseType_t task_count = total_task_count;
     configRUN_TIME_COUNTER_TYPE total_runtime = 0;
 
     if (s_telemetry_mutex)
@@ -155,6 +157,15 @@ static void print_memory_stats(void)
              total_psram ? (float)free_psram / total_psram * 100.0f : 0.0f);
     ESP_LOGI(TAG, "External PSRAM Largest Free Block: %u Bytes", (unsigned int)max_block_psram);
     ESP_LOGI(TAG, "------------------------");
+    ESP_LOGI(TAG, "Task slots: %u captured of %u total",
+             (unsigned int)task_count,
+             (unsigned int)total_task_count);
+    if (total_task_count > TELEMETRY_MAX_TASKS)
+    {
+        ESP_LOGW(TAG,
+                 "task telemetry truncated to %u entries; increase TELEMETRY_MAX_TASKS if tasks are missing",
+                 (unsigned int)TELEMETRY_MAX_TASKS);
+    }
 
     task_count = uxTaskGetSystemState(s_task_state_buf, task_count, &total_runtime);
     ESP_LOGI(TAG, "--- CPU TELEMETRY (INTERVAL) ---");
@@ -175,10 +186,6 @@ static void print_memory_stats(void)
             if (previous && s_task_state_buf[index].ulRunTimeCounter >= previous->runtime_counter)
             {
                 task_delta = s_task_state_buf[index].ulRunTimeCounter - previous->runtime_counter;
-            }
-            if (task_delta == 0)
-            {
-                continue;
             }
 
             float pct = runtime_delta ? ((float)task_delta * 100.0f) / (float)runtime_delta : 0.0f;
@@ -3201,19 +3208,35 @@ static int cmd_audio_output(int argc, char **argv)
 
     if (s_audio_output_args.target->count == 0 || strcmp(s_audio_output_args.target->sval[0], "status") == 0)
     {
-        printf("Audio output: i2s\n");
+        printf("Audio output: %s\n", audio_output_switch_target_name(audio_output_switch_get_target()));
         return 0;
     }
 
     const char *target = s_audio_output_args.target->sval[0];
+    audio_output_target_t next_target;
     if (strcmp(target, "i2s") == 0)
     {
-        printf("Audio output is fixed to i2s\n");
-        return 0;
+        next_target = AUDIO_OUTPUT_TARGET_I2S;
+    }
+    else if (strcmp(target, "a2dp") == 0)
+    {
+        next_target = AUDIO_OUTPUT_TARGET_A2DP;
+    }
+    else
+    {
+        printf("Usage: audio_output [status|i2s|a2dp]\n");
+        return 1;
     }
 
-    printf("Usage: audio_output [status|i2s]\n");
-    return 1;
+    esp_err_t err = audio_output_switch_select(next_target);
+    if (err != ESP_OK)
+    {
+        printf("Error: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Audio output switched to %s\n", audio_output_switch_target_name(next_target));
+    return 0;
 }
 
 /* ════════════════════════════════════════════════════════════════════ *
@@ -3248,7 +3271,7 @@ esp_err_t console_service_init(void)
     s_bt_media_key_args.end = arg_end(1);
     s_autoreconnect_args.action = arg_str0(NULL, NULL, "<on|off>", "Enable or disable");
     s_autoreconnect_args.end = arg_end(1);
-    s_audio_output_args.target = arg_str0(NULL, NULL, "<status|i2s>", "Report the fixed i2s audio output");
+    s_audio_output_args.target = arg_str0(NULL, NULL, "<status|i2s|a2dp>", "Get status or switch audio output target");
     s_audio_output_args.end = arg_end(1);
     s_media_args.action = arg_str0(NULL, NULL, "<action>", "status|next|prev|pause|ff|rewind|vol_up|vol_down|mode");
     s_media_args.value = arg_str0(NULL, NULL, "<value>", "For 'mode': sequential|single_repeat|shuffle");
@@ -3285,7 +3308,7 @@ esp_err_t console_service_init(void)
 
     const esp_console_cmd_t audio_output_cmd = {
         .command = "audio_output",
-        .help = "Audio output is fixed to i2s: audio_output [status|i2s]",
+        .help = "Audio output: audio_output [status|i2s|a2dp]",
         .hint = NULL,
         .func = cmd_audio_output,
         .argtable = &s_audio_output_args,

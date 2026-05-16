@@ -5,10 +5,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
-
 COREMARK_REF = "1f483d5b8316753a742cbf5590caf5bd0a4e4777"
 COREMARK_REPO = "https://github.com/eembc/coremark.git"
-DEFAULT_WAMRC = "wamrc-2.4.0"
+DEFAULT_WAMRC = "tools/bin/wamrc-2.4.0"
+DEFAULT_CPU = "esp32s3"
+DEFAULT_SIZE_LEVEL = 0
 
 
 def repo_root() -> Path:
@@ -88,7 +89,8 @@ def build_coremark(args: argparse.Namespace) -> None:
     aot_cmd = [
         to_wsl_path(wamrc),
         "--target=xtensa",
-        "--cpu=esp32",
+        f"--cpu={args.cpu}",
+        f"--size-level={args.size_level}",
         "-o",
         to_wsl_path(aot_out),
         to_wsl_path(wasm_out),
@@ -111,6 +113,18 @@ def parse_args() -> argparse.Namespace:
         "--wamrc",
         default=DEFAULT_WAMRC,
         help="Path to the Linux wamrc binary relative to the repo root",
+    )
+    parser.add_argument(
+        "--cpu",
+        default=DEFAULT_CPU,
+        help="Xtensa CPU name to pass to wamrc (for example: esp32, esp32s2, esp32s3)",
+    )
+    parser.add_argument(
+        "--size-level",
+        type=int,
+        default=DEFAULT_SIZE_LEVEL,
+        choices=range(4),
+        help="wamrc code size model (0=large, 3=small)",
     )
     return parser.parse_args()
 

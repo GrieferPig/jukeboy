@@ -1,9 +1,13 @@
 idf_component_register(SRCS "companion_api_service.c" "play_history_service.c" "main.c"
                        "a2dp_coprocessor_service.c"
+                       "audio_output_switch.c"
                        "bluetooth_service.c"
                        "cartridge_service.c"
                        "companion_api_service.c"
                        "console_service.c"
+                       "display_framebuffer.c"
+                       "display_service.c"
+                      
                        "hid_service.c"
                        "i2s_service.c"
                        "lastfm_service.c"
@@ -18,7 +22,7 @@ idf_component_register(SRCS "companion_api_service.c" "play_history_service.c" "
                        "script_service.c"
                        "wifi_service.c"
                    REQUIRES soc esp_adc
-                   PRIV_REQUIRES spi_flash bt esp_psram nvs_flash esp_hw_support esp_audio_codec esp_ringbuf freertos esp_event esp_wifi esp_netif esp_eth esp_pm lwip log console fatfs sdmmc heap esp_system esp_timer esp_vfs_console esp_driver_i2s esp_driver_gpio esp_driver_uart esp_driver_rmt esp_http_client esp-tls json mbedtls joltwallet__littlefs espressif__led_strip espressif__wasmachine_core
+                   PRIV_REQUIRES spi_flash bt esp_psram nvs_flash esp_hw_support esp_audio_codec esp_ringbuf freertos esp_event esp_wifi esp_netif esp_eth esp_pm lwip log console fatfs sdmmc heap esp_system esp_timer esp_vfs_console esp_driver_i2s esp_driver_gpio esp_driver_uart esp_driver_rmt esp_driver_spi esp_http_client esp-tls esp_lcd json mbedtls joltwallet__littlefs espressif__led_strip espressif__wasmachine_core lvgl
                    INCLUDE_DIRS "." )
 
 set(FLASHFS_SOURCE_DIR "${CMAKE_SOURCE_DIR}/flashfs")

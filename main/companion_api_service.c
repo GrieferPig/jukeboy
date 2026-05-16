@@ -24,6 +24,7 @@
 #include "mbedtls/md.h"
 
 #include "a2dp_coprocessor_service.h"
+#include "audio_output_switch.h"
 #include "bluetooth_service.h"
 #include "cartridge_service.h"
 #include "hid_service.h"
@@ -56,6 +57,7 @@
 #define COMPANION_API_NVS_RECORD_VERSION 1U
 #define COMPANION_API_PSRAM_ALLOC_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define COMPANION_API_STACK_ALLOC_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#define COMPANION_API_OUTPUT_TARGET_A2DP 0U
 #define COMPANION_API_OUTPUT_TARGET_I2S 1U
 
 #define COMPANION_API_MAGIC0 ((uint8_t)'J')
@@ -1159,7 +1161,7 @@ static void companion_api_append_playback_status(companion_api_writer_t *writer)
     companion_api_append_u8(writer, COMPANION_API_TLV_PLAYBACK_MODE, (uint8_t)snapshot.playback_mode);
     companion_api_append_string(writer, COMPANION_API_TLV_TRACK_TITLE, snapshot.track_title);
     companion_api_append_string(writer, COMPANION_API_TLV_TRACK_FILE, snapshot.filename);
-    companion_api_append_u8(writer, COMPANION_API_TLV_OUTPUT_TARGET, COMPANION_API_OUTPUT_TARGET_I2S);
+    companion_api_append_u8(writer, COMPANION_API_TLV_OUTPUT_TARGET, (uint8_t)audio_output_switch_get_target());
 }
 
 static void companion_api_append_cartridge_status(companion_api_writer_t *writer)
@@ -1461,7 +1463,14 @@ static esp_err_t companion_api_handle_playback_control(uint32_t request_id, cons
         err = player_service_set_playback_mode((player_service_playback_mode_t)value);
         break;
     case COMPANION_API_PLAYBACK_ACTION_SET_OUTPUT_TARGET:
-        err = value == COMPANION_API_OUTPUT_TARGET_I2S ? ESP_OK : ESP_ERR_INVALID_ARG;
+        if (value != COMPANION_API_OUTPUT_TARGET_A2DP && value != COMPANION_API_OUTPUT_TARGET_I2S)
+        {
+            err = ESP_ERR_INVALID_ARG;
+        }
+        else
+        {
+            err = audio_output_switch_select((audio_output_target_t)value);
+        }
         break;
     default:
         err = ESP_ERR_INVALID_ARG;
@@ -1913,7 +1922,7 @@ static esp_err_t companion_api_handle_bt_audio_control(uint32_t request_id, cons
 
 static void companion_api_append_output_status(companion_api_writer_t *writer)
 {
-    companion_api_append_u8(writer, COMPANION_API_TLV_OUTPUT_TARGET, COMPANION_API_OUTPUT_TARGET_I2S);
+    companion_api_append_u8(writer, COMPANION_API_TLV_OUTPUT_TARGET, (uint8_t)audio_output_switch_get_target());
     companion_api_append_bool(writer,
                               COMPANION_API_TLV_BT_A2DP_CONNECTED,
                               a2dp_coprocessor_service_is_a2dp_connected());
@@ -1948,10 +1957,19 @@ static esp_err_t companion_api_handle_output_select(uint32_t request_id,
     {
         return companion_api_send_error(COMPANION_API_OP_OUTPUT_SELECT, request_id, COMPANION_API_ERR_INVALID_ARG);
     }
-    if (target != COMPANION_API_OUTPUT_TARGET_I2S)
+    if (target != COMPANION_API_OUTPUT_TARGET_A2DP && target != COMPANION_API_OUTPUT_TARGET_I2S)
     {
         return companion_api_send_error(COMPANION_API_OP_OUTPUT_SELECT, request_id, COMPANION_API_ERR_INVALID_ARG);
     }
+
+    esp_err_t err = audio_output_switch_select((audio_output_target_t)target);
+    if (err != ESP_OK)
+    {
+        return companion_api_send_error(COMPANION_API_OP_OUTPUT_SELECT,
+                                        request_id,
+                                        companion_api_error_from_esp(err));
+    }
+    companion_api_touch_generation();
 
     companion_api_writer_init(&writer);
     companion_api_append_u16(&writer, COMPANION_API_TLV_STATUS, COMPANION_API_ERR_OK);
@@ -2164,23 +2182,23 @@ static esp_err_t companion_api_handle_bt_scan_results(uint32_t request_id)
     return companion_api_send_ok(COMPANION_API_OP_BT_SCAN_RESULTS, request_id, &writer);
 }
 
-static esp_err_t companion_api_handle_bt_bonded_list(uint32_t request_id)
+static esp_err_t companion_api_send_bt_bonded_list_response(uint16_t opcode, uint32_t request_id)
 {
     companion_api_writer_t writer;
     esp_err_t err = a2dp_coprocessor_service_refresh_bonded_devices();
     if (err != ESP_OK)
     {
-        return companion_api_send_error(COMPANION_API_OP_BT_BONDED_LIST, request_id, companion_api_error_from_esp(err));
+        return companion_api_send_error(opcode, request_id, companion_api_error_from_esp(err));
     }
 
     size_t bonded_n = a2dp_coprocessor_service_get_bonded_device_count();
-    a2dp_coprocessor_addr_t devices[8];
+    a2dp_coprocessor_bonded_device_t devices[8];
     size_t count = bonded_n < 8 ? bonded_n : 8;
 
-    err = a2dp_coprocessor_service_get_bonded_devices(&count, devices);
+    err = a2dp_coprocessor_service_get_bonded_device_entries(&count, devices);
     if (err != ESP_OK)
     {
-        return companion_api_send_error(COMPANION_API_OP_BT_BONDED_LIST, request_id, companion_api_error_from_esp(err));
+        return companion_api_send_error(opcode, request_id, companion_api_error_from_esp(err));
     }
 
     companion_api_writer_init(&writer);
@@ -2190,13 +2208,19 @@ static esp_err_t companion_api_handle_bt_bonded_list(uint32_t request_id)
     {
         if (!companion_api_append_tlv(&writer,
                                       COMPANION_API_TLV_BT_ADDR,
-                                      devices[index],
-                                      A2DP_COPROCESSOR_ADDR_LEN))
+                                      devices[index].bda,
+                                      A2DP_COPROCESSOR_ADDR_LEN) ||
+            !companion_api_append_string(&writer, COMPANION_API_TLV_BT_NAME, devices[index].name))
         {
             break;
         }
     }
-    return companion_api_send_ok(COMPANION_API_OP_BT_BONDED_LIST, request_id, &writer);
+    return companion_api_send_ok(opcode, request_id, &writer);
+}
+
+static esp_err_t companion_api_handle_bt_bonded_list(uint32_t request_id)
+{
+    return companion_api_send_bt_bonded_list_response(COMPANION_API_OP_BT_BONDED_LIST, request_id);
 }
 
 static esp_err_t companion_api_handle_bt_unbond(uint32_t request_id,
@@ -2218,7 +2242,7 @@ static esp_err_t companion_api_handle_bt_unbond(uint32_t request_id,
         return companion_api_send_error(COMPANION_API_OP_BT_UNBOND, request_id, companion_api_error_from_esp(err));
     }
     companion_api_touch_generation();
-    return companion_api_handle_bt_bonded_list(request_id);
+    return companion_api_send_bt_bonded_list_response(COMPANION_API_OP_BT_UNBOND, request_id);
 }
 
 static esp_err_t companion_api_handle_hid_status(uint32_t request_id)

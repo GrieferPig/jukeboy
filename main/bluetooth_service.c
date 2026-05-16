@@ -24,7 +24,7 @@
 #include "bluetooth_service.h"
 #include "power_mgmt_service.h"
 
-#define BT_SVC_NAME_BLE_SPP "ESP_SPP_SERVER"
+#define BT_SVC_NAME_BLE_SPP "Jukeboy"
 #define BT_SVC_BLE_SPP_SERVICE_UUID 0xABF0
 #define BT_SVC_BLE_SPP_DATA_RECEIVE_UUID 0xABF1
 #define BT_SVC_BLE_SPP_DATA_NOTIFY_UUID 0xABF2

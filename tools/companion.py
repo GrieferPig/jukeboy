@@ -98,6 +98,7 @@ PLAYBACK_MODE_FROM_ID = {value: key for key, value in PLAYBACK_MODE_TO_ID.items(
 
 OUTPUT_TARGET_TO_ID = {
     "bluetooth": 0,
+    "a2dp": 0,
     "i2s": 1,
 }
 OUTPUT_TARGET_FROM_ID = {value: key for key, value in OUTPUT_TARGET_TO_ID.items()}
@@ -207,6 +208,11 @@ TLV_NAME = {
     0x0704: "history_last_seen",
     0x0800: "bt_a2dp_connected",
     0x0801: "bt_bonded_count",
+    0x0802: "bt_addr",
+    0x0803: "bt_name",
+    0x0804: "bt_rssi",
+    0x0805: "bt_cod",
+    0x0806: "bt_scan_running",
 }
 
 
@@ -232,6 +238,8 @@ class Opcode(IntEnum):
     SNAPSHOT = 0x0100
     PLAYBACK_STATUS = 0x0101
     PLAYBACK_CONTROL = 0x0102
+    OUTPUT_STATUS = 0x0103
+    OUTPUT_SELECT = 0x0104
     LIBRARY_ALBUM = 0x0110
     LIBRARY_TRACK_PAGE = 0x0111
     LIBRARY_COVER = 0x0112
@@ -248,9 +256,14 @@ class Opcode(IntEnum):
     HISTORY_ALBUM_PAGE = 0x0401
     BT_AUDIO_STATUS = 0x0500
     BT_AUDIO_CONTROL = 0x0501
+    BT_SCAN_START = 0x0502
+    BT_SCAN_RESULTS = 0x0503
+    BT_BONDED_LIST = 0x0504
+    BT_UNBOND = 0x0505
 
 
 class TlvType(IntEnum):
+    STATUS = 0x0001
     ERROR_CODE = 0x0002
     ERROR_MESSAGE = 0x0003
     PROTOCOL_VERSION = 0x0004
@@ -339,6 +352,11 @@ class TlvType(IntEnum):
     HISTORY_LAST_SEEN = 0x0704
     BT_A2DP_CONNECTED = 0x0800
     BT_BONDED_COUNT = 0x0801
+    BT_ADDR = 0x0802
+    BT_NAME = 0x0803
+    BT_RSSI = 0x0804
+    BT_COD = 0x0805
+    BT_SCAN_RUNNING = 0x0806
 
 
 class PlaybackAction(IntEnum):
@@ -559,6 +577,22 @@ def decode_ip_address(value: int) -> str:
         return socket.inet_ntoa(struct.pack("<I", value))
     except OSError:
         return f"0x{value:08x}"
+
+
+def decode_bt_address(value: bytes) -> str:
+    if len(value) != 6:
+        raise ValueError("Bluetooth address TLV must be 6 bytes")
+    return ":".join(f"{part:02X}" for part in value)
+
+
+def encode_bt_address(value: str) -> bytes:
+    cleaned = value.replace(":", "").replace("-", "").strip()
+    if len(cleaned) != 12:
+        raise ValueError("Bluetooth address must contain 12 hex digits")
+    try:
+        return bytes.fromhex(cleaned)
+    except ValueError as exc:
+        raise ValueError("Bluetooth address must contain only hex digits") from exc
 
 
 def ensure_track_index(value: int) -> int | None:
@@ -948,6 +982,16 @@ class CompanionBleClient:
             tlvs.append(tlv_u32(TlvType.VALUE, value))
         return decode_snapshot(await self.request(Opcode.PLAYBACK_CONTROL, tlvs=tlvs))
 
+    async def output_status(self) -> dict[str, Any]:
+        return decode_output_status(await self.request(Opcode.OUTPUT_STATUS))
+
+    async def output_select(self, target: int) -> dict[str, Any]:
+        return decode_output_status(
+            await self.request(
+                Opcode.OUTPUT_SELECT, tlvs=[tlv_u8(TlvType.OUTPUT_TARGET, target)]
+            )
+        )
+
     async def library_album(self) -> dict[str, Any]:
         return decode_album(await self.request(Opcode.LIBRARY_ALBUM))
 
@@ -1082,6 +1126,17 @@ class CompanionBleClient:
         return decode_snapshot(
             await self.request(
                 Opcode.BT_AUDIO_CONTROL, tlvs=[tlv_u8(TlvType.ACTION, int(action))]
+            )
+        )
+
+    async def bt_bonded_list(self) -> dict[str, Any]:
+        return decode_bt_bonded_list(await self.request(Opcode.BT_BONDED_LIST))
+
+    async def bt_unbond(self, address: str) -> dict[str, Any]:
+        return decode_bt_bonded_list(
+            await self.request(
+                Opcode.BT_UNBOND,
+                tlvs=[tlv_bytes(TlvType.BT_ADDR, encode_bt_address(address))],
             )
         )
 
@@ -1434,6 +1489,51 @@ def decode_snapshot(frame: Frame) -> dict[str, Any]:
             result["bluetooth"]["a2dp_connected"] = tlv_value_bool(tlv)
         elif tlv.tlv_type == TlvType.BT_BONDED_COUNT:
             result["bluetooth"]["bonded_count"] = tlv_value_u32(tlv)
+    return result
+
+
+def decode_output_status(frame: Frame) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "opcode": opcode_name(frame.opcode),
+        "request_id": frame.request_id,
+        "output_target": None,
+        "a2dp_connected": False,
+    }
+    for tlv in frame.tlvs or []:
+        if tlv.tlv_type == TlvType.OUTPUT_TARGET:
+            target_value = tlv_value_u8(tlv)
+            result["output_target"] = OUTPUT_TARGET_FROM_ID.get(
+                target_value, target_value
+            )
+        elif tlv.tlv_type == TlvType.BT_A2DP_CONNECTED:
+            result["a2dp_connected"] = tlv_value_bool(tlv)
+    return result
+
+
+def decode_bt_bonded_list(frame: Frame) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "opcode": opcode_name(frame.opcode),
+        "request_id": frame.request_id,
+        "bonded_count": 0,
+        "returned_count": None,
+        "devices": [],
+    }
+    current_device: dict[str, Any] | None = None
+    for tlv in frame.tlvs or []:
+        if tlv.tlv_type == TlvType.BT_BONDED_COUNT:
+            result["bonded_count"] = tlv_value_u32(tlv)
+        elif tlv.tlv_type == TlvType.RETURNED_COUNT:
+            result["returned_count"] = tlv_value_u32(tlv)
+        elif tlv.tlv_type == TlvType.BT_ADDR:
+            current_device = {"address": decode_bt_address(tlv.value), "name": ""}
+            result["devices"].append(current_device)
+        elif tlv.tlv_type == TlvType.BT_NAME:
+            if current_device is None:
+                current_device = {"address": "", "name": ""}
+                result["devices"].append(current_device)
+            current_device["name"] = tlv_value_string(tlv)
+    if result["returned_count"] is None:
+        result["returned_count"] = len(result["devices"])
     return result
 
 
@@ -1935,11 +2035,18 @@ async def handle_playback_command(
             PLAYBACK_MODE_TO_ID[args.mode_value],
         )
     if args.playback_command == "output":
-        return await client.playback_control(
-            PlaybackAction.SET_OUTPUT_TARGET,
-            OUTPUT_TARGET_TO_ID[args.output_target],
-        )
+        return await client.output_select(OUTPUT_TARGET_TO_ID[args.output_target])
     raise AssertionError(f"unexpected playback command {args.playback_command!r}")
+
+
+async def handle_output_command(
+    client: CompanionBleClient, args: argparse.Namespace
+) -> Any:
+    if args.output_command == "status":
+        return await client.output_status()
+    if args.output_command == "select":
+        return await client.output_select(OUTPUT_TARGET_TO_ID[args.output_target])
+    raise AssertionError(f"unexpected output command {args.output_command!r}")
 
 
 async def handle_library_command(
@@ -2031,6 +2138,10 @@ async def handle_bt_command(
         return await client.bt_audio_control(BtAction.PAIR_BEST)
     if args.bt_command == "disconnect":
         return await client.bt_audio_control(BtAction.DISCONNECT)
+    if args.bt_command == "bonded":
+        return await client.bt_bonded_list()
+    if args.bt_command == "unbond":
+        return await client.bt_unbond(args.address)
     raise AssertionError(f"unexpected bt command {args.bt_command!r}")
 
 
@@ -2208,6 +2319,14 @@ def build_command_parser() -> ReplArgumentParser:
     playback_output = playback_subparsers.add_parser("output")
     playback_output.add_argument("output_target", choices=sorted(OUTPUT_TARGET_TO_ID))
 
+    output_parser = subparsers.add_parser("output", help="Audio output target commands")
+    output_subparsers = output_parser.add_subparsers(
+        dest="output_command", required=True
+    )
+    output_subparsers.add_parser("status")
+    output_select = output_subparsers.add_parser("select")
+    output_select.add_argument("output_target", choices=sorted(OUTPUT_TARGET_TO_ID))
+
     library_parser = subparsers.add_parser("library", help="Album and track metadata")
     library_subparsers = library_parser.add_subparsers(
         dest="library_command", required=True
@@ -2268,6 +2387,9 @@ def build_command_parser() -> ReplArgumentParser:
     bt_subparsers.add_parser("connect-last")
     bt_subparsers.add_parser("pair-best")
     bt_subparsers.add_parser("disconnect")
+    bt_subparsers.add_parser("bonded")
+    bt_unbond = bt_subparsers.add_parser("unbond")
+    bt_unbond.add_argument("address")
 
     return parser
 
@@ -2496,6 +2618,8 @@ class CompanionRepl:
             json_dump(await self.client.snapshot())
         elif args.command == "playback":
             json_dump(await handle_playback_command(self.client, args))
+        elif args.command == "output":
+            json_dump(await handle_output_command(self.client, args))
         elif args.command == "library":
             json_dump(await handle_library_command(self.client, args))
         elif args.command == "wifi":

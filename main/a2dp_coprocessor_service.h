@@ -41,6 +41,12 @@ extern "C"
 
     typedef struct
     {
+        a2dp_coprocessor_addr_t bda;
+        char name[A2DP_COPROCESSOR_MAX_DEVICE_NAME_LEN + 1];
+    } a2dp_coprocessor_bonded_device_t;
+
+    typedef struct
+    {
         bool pending;
         a2dp_coprocessor_addr_t remote_bda;
         uint32_t numeric_value;
@@ -167,8 +173,11 @@ extern "C"
     esp_err_t a2dp_coprocessor_service_refresh_status(void);
     void a2dp_coprocessor_service_get_status(a2dp_coprocessor_status_t *status_out);
     bool a2dp_coprocessor_service_is_initialised(void);
+    bool a2dp_coprocessor_service_is_awake(void);
     bool a2dp_coprocessor_service_is_a2dp_connected(void);
     bool a2dp_coprocessor_service_is_discovery_running(void);
+    esp_err_t a2dp_coprocessor_service_wake_for_request(void);
+    esp_err_t a2dp_coprocessor_service_shutdown(void);
 
     esp_err_t a2dp_coprocessor_service_pair_best_a2dp_sink(void);
     esp_err_t a2dp_coprocessor_service_start_discovery(void);
@@ -189,6 +198,8 @@ extern "C"
     size_t a2dp_coprocessor_service_get_bonded_device_count(void);
     esp_err_t a2dp_coprocessor_service_get_bonded_devices(size_t *count,
                                                           a2dp_coprocessor_addr_t *devices);
+    esp_err_t a2dp_coprocessor_service_get_bonded_device_entries(size_t *count,
+                                                                 a2dp_coprocessor_bonded_device_t *devices);
     esp_err_t a2dp_coprocessor_service_refresh_discovery_results(void);
     esp_err_t a2dp_coprocessor_service_get_discovery_results(a2dp_coprocessor_scan_entry_t *out_entries,
                                                              size_t *count);
