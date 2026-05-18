@@ -6,4 +6,4 @@ dependencies:
   espressif/led_strip:
     version: "^3.0.3"
   lvgl/lvgl:
-    version: "^8"
+    version: "9.5.0"

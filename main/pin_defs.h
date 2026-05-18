@@ -21,6 +21,7 @@
 /* User inputs */
 #define HAL_MAIN_BTN_PIN GPIO_NUM_1
 #define HAL_MISC_BTN_PIN GPIO_NUM_4
+#define HAL_SIDE_BTN_PIN GPIO_NUM_5
 
 /* SH1106/SSD1306 SPI OLED pin assignments */
 #define HAL_DISPLAY_SPI_CLK_PIN GPIO_NUM_8

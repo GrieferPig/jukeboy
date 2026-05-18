@@ -34,6 +34,7 @@ ESP_EVENT_DEFINE_BASE(HID_SERVICE_EVENT);
 #define HID_SVC_BUTTON_ADC_STORE_BUF_SIZE 512
 #define HID_SVC_BUTTON_ADC_IIR_COEFF ADC_DIGI_IIR_FILTER_COEFF_8
 #define HID_SVC_BUTTON_ADC_MAX_RAW 4095U
+#define HID_SVC_SIDE_BUTTON_ACTIVE_LEVEL 0
 #define HID_SVC_BUTTONS_PER_LADDER 3U
 #define HID_SVC_LADDER_STATE_COUNT (1U << HID_SVC_BUTTONS_PER_LADDER)
 #define HID_SVC_LADDER_LEVEL_COUNT HID_SERVICE_BUTTON_LADDER_STATE_COUNT
@@ -46,17 +47,10 @@ ESP_EVENT_DEFINE_BASE(HID_SERVICE_EVENT);
 #define HID_SVC_TASK_PRIORITY 4
 #define HID_SVC_SHUTDOWN_PRIORITY 250
 
-#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
-#define HID_SVC_BUTTON_ADC_OUTPUT_FORMAT ADC_DIGI_OUTPUT_FORMAT_TYPE1
-#define HID_SVC_BUTTON_ADC_GET_CHANNEL(sample) ((sample)->type1.channel)
-#define HID_SVC_BUTTON_ADC_GET_DATA(sample) ((sample)->type1.data)
-#define HID_SVC_BUTTON_ADC_GET_UNIT(sample) HID_SVC_BUTTON_ADC_UNIT
-#else
 #define HID_SVC_BUTTON_ADC_OUTPUT_FORMAT ADC_DIGI_OUTPUT_FORMAT_TYPE2
 #define HID_SVC_BUTTON_ADC_GET_CHANNEL(sample) ((sample)->type2.channel)
 #define HID_SVC_BUTTON_ADC_GET_DATA(sample) ((sample)->type2.data)
 #define HID_SVC_BUTTON_ADC_GET_UNIT(sample) ((sample)->type2.unit == 0 ? ADC_UNIT_1 : ADC_UNIT_2)
-#endif
 
 static const char *TAG = "hid_svc";
 
@@ -92,6 +86,13 @@ typedef struct
     uint16_t misc_value[HID_SVC_LADDER_STATE_COUNT];
 } hid_service_button_calibration_record_t;
 
+typedef struct
+{
+    bool stable_pressed;
+    bool pending_pressed;
+    uint8_t pending_count;
+} hid_service_gpio_button_runtime_t;
+
 static SemaphoreHandle_t s_service_lock;
 static TaskHandle_t s_task_handle;
 static adc_continuous_handle_t s_button_adc_handle;
@@ -119,6 +120,7 @@ static hid_service_ladder_runtime_t s_misc_ladder = {
     .last_raw = HID_SVC_BUTTON_ADC_MAX_RAW,
     .last_value = HID_SVC_BUTTON_ADC_MAX_RAW,
 };
+static hid_service_gpio_button_runtime_t s_side_button;
 
 static inline uint32_t hid_service_button_mask(hid_button_t button)
 {
@@ -131,9 +133,41 @@ static TickType_t hid_service_button_sample_ticks(void)
     return sample_ticks == 0 ? 1 : sample_ticks;
 }
 
-static uint32_t hid_service_compose_button_state(uint8_t main_state, uint8_t misc_state)
+static uint32_t hid_service_compose_button_state(uint8_t main_state, uint8_t misc_state, bool side_pressed)
 {
-    return ((uint32_t)main_state & 0x7U) | (((uint32_t)misc_state & 0x7U) << HID_SVC_BUTTONS_PER_LADDER);
+    uint32_t button_state = ((uint32_t)main_state & 0x7U) |
+                            (((uint32_t)misc_state & 0x7U) << HID_SVC_BUTTONS_PER_LADDER);
+
+    if (side_pressed)
+    {
+        button_state |= hid_service_button_mask(HID_BUTTON_SIDE);
+    }
+
+    return button_state;
+}
+
+static void hid_service_set_button_state_locked(uint32_t next_state)
+{
+    if (s_button_state != next_state)
+    {
+        s_button_generation++;
+    }
+
+    s_button_state = next_state;
+}
+
+static uint32_t hid_service_build_button_state_locked(void)
+{
+    uint8_t main_state = 0;
+    uint8_t misc_state = 0;
+
+    if (s_button_decode_enabled && !s_button_calibration_active)
+    {
+        main_state = s_main_ladder.stable_state;
+        misc_state = s_misc_ladder.stable_state;
+    }
+
+    return hid_service_compose_button_state(main_state, misc_state, s_side_button.stable_pressed);
 }
 
 static void hid_service_reset_ladder_state_locked(hid_service_ladder_runtime_t *ladder)
@@ -148,15 +182,23 @@ static void hid_service_reset_ladder_state_locked(hid_service_ladder_runtime_t *
     ladder->pending_count = 0;
 }
 
+static void hid_service_reset_gpio_button_state_locked(hid_service_gpio_button_runtime_t *button)
+{
+    if (button == NULL)
+    {
+        return;
+    }
+
+    button->stable_pressed = false;
+    button->pending_pressed = false;
+    button->pending_count = 0;
+}
+
 static void hid_service_reset_button_state_locked(void)
 {
     hid_service_reset_ladder_state_locked(&s_main_ladder);
     hid_service_reset_ladder_state_locked(&s_misc_ladder);
-    if (s_button_state != 0)
-    {
-        s_button_generation++;
-    }
-    s_button_state = 0;
+    hid_service_set_button_state_locked(hid_service_build_button_state_locked());
 }
 
 static esp_err_t hid_service_create_button_adc_cali(hid_service_ladder_runtime_t *ladder)
@@ -603,6 +645,43 @@ static bool hid_service_update_ladder_locked(hid_service_ladder_runtime_t *ladde
     return true;
 }
 
+static bool hid_service_update_gpio_button_locked(hid_service_gpio_button_runtime_t *button, bool pressed)
+{
+    ESP_RETURN_ON_FALSE(button != NULL, false, TAG, "GPIO button state is null");
+
+    if (pressed == button->stable_pressed)
+    {
+        button->pending_pressed = pressed;
+        button->pending_count = 0;
+        return false;
+    }
+
+    if (pressed != button->pending_pressed)
+    {
+        button->pending_pressed = pressed;
+        button->pending_count = 1;
+    }
+    else if (button->pending_count < UINT8_MAX)
+    {
+        button->pending_count++;
+    }
+
+    if (button->pending_count < HID_SVC_BUTTON_DEBOUNCE_COUNT)
+    {
+        return false;
+    }
+
+    button->stable_pressed = pressed;
+    button->pending_pressed = pressed;
+    button->pending_count = 0;
+    return true;
+}
+
+static bool hid_service_read_side_button_pressed(void)
+{
+    return gpio_get_level(HAL_SIDE_BTN_PIN) == HID_SVC_SIDE_BUTTON_ACTIVE_LEVEL;
+}
+
 static esp_err_t hid_service_post_button_event(hid_button_t button, hid_service_event_id_t event_id)
 {
     return esp_event_post(HID_SERVICE_EVENT,
@@ -748,6 +827,19 @@ static esp_err_t hid_service_configure_button_adc(void)
     return ESP_OK;
 }
 
+static esp_err_t hid_service_configure_side_button_gpio(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << (uint32_t)HAL_SIDE_BTN_PIN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    return gpio_config(&cfg);
+}
+
 static esp_err_t hid_service_apply_led_locked(void)
 {
     ESP_RETURN_ON_FALSE(s_led_strip != NULL, ESP_ERR_INVALID_STATE, TAG, "LED strip is not initialized");
@@ -811,6 +903,8 @@ static void hid_service_poll_buttons_once(void)
     hid_button_t changed_buttons[HID_BUTTON_COUNT];
     hid_service_event_id_t changed_events[HID_BUTTON_COUNT];
     size_t changed_count = 0;
+    bool adc_sample_ready = false;
+    bool side_pressed = hid_service_read_side_button_pressed();
     uint16_t main_raw = 0;
     uint16_t misc_raw = 0;
     uint16_t main_value = 0;
@@ -823,43 +917,51 @@ static void hid_service_poll_buttons_once(void)
     if (err != ESP_OK)
     {
         ESP_LOGW(TAG, "failed to read button ladders: %s", esp_err_to_name(err));
-        return;
     }
 
-    err = hid_service_sample_value_from_raw(&s_main_ladder, main_raw, &main_value);
-    if (err != ESP_OK)
+    if (err == ESP_OK)
     {
-        ESP_LOGW(TAG, "failed to calibrate main button ladder: %s", esp_err_to_name(err));
-        return;
+        err = hid_service_sample_value_from_raw(&s_main_ladder, main_raw, &main_value);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "failed to calibrate main button ladder: %s", esp_err_to_name(err));
+        }
     }
 
-    err = hid_service_sample_value_from_raw(&s_misc_ladder, misc_raw, &misc_value);
-    if (err != ESP_OK)
+    if (err == ESP_OK)
     {
-        ESP_LOGW(TAG, "failed to calibrate misc button ladder: %s", esp_err_to_name(err));
-        return;
+        err = hid_service_sample_value_from_raw(&s_misc_ladder, misc_raw, &misc_value);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "failed to calibrate misc button ladder: %s", esp_err_to_name(err));
+        }
+        else
+        {
+            adc_sample_ready = true;
+        }
     }
 
     xSemaphoreTake(s_service_lock, portMAX_DELAY);
 
-    hid_service_update_ladder_sample_locked(&s_main_ladder, main_raw, main_value);
-    hid_service_update_ladder_sample_locked(&s_misc_ladder, misc_raw, misc_value);
-
-    if (!s_button_decode_enabled || s_button_calibration_active)
+    if (adc_sample_ready)
     {
-        xSemaphoreGive(s_service_lock);
-        return;
+        hid_service_update_ladder_sample_locked(&s_main_ladder, main_raw, main_value);
+        hid_service_update_ladder_sample_locked(&s_misc_ladder, misc_raw, misc_value);
     }
 
-    (void)hid_service_update_ladder_locked(&s_main_ladder, main_value);
-    (void)hid_service_update_ladder_locked(&s_misc_ladder, misc_value);
+    if (adc_sample_ready && s_button_decode_enabled && !s_button_calibration_active)
+    {
+        (void)hid_service_update_ladder_locked(&s_main_ladder, main_value);
+        (void)hid_service_update_ladder_locked(&s_misc_ladder, misc_value);
+    }
 
-    next_state = hid_service_compose_button_state(s_main_ladder.stable_state, s_misc_ladder.stable_state);
+    (void)hid_service_update_gpio_button_locked(&s_side_button, side_pressed);
+
+    next_state = hid_service_build_button_state_locked();
     changed_mask = s_button_state ^ next_state;
     if (changed_mask != 0)
     {
-        s_button_state = next_state;
-        s_button_generation++;
+        hid_service_set_button_state_locked(next_state);
     }
 
     xSemaphoreGive(s_service_lock);
@@ -948,10 +1050,15 @@ static esp_err_t hid_service_init_buttons(void)
 {
     ESP_RETURN_ON_FALSE(rtc_gpio_is_valid_gpio(HAL_MAIN_BTN_PIN), ESP_ERR_INVALID_ARG, TAG, "main button is not RTC capable");
     ESP_RETURN_ON_FALSE(rtc_gpio_is_valid_gpio(HAL_MISC_BTN_PIN), ESP_ERR_INVALID_ARG, TAG, "misc button is not RTC capable");
+    ESP_RETURN_ON_FALSE(GPIO_IS_VALID_GPIO(HAL_SIDE_BTN_PIN), ESP_ERR_INVALID_ARG, TAG, "side button is not a valid GPIO");
     ESP_RETURN_ON_FALSE(HAL_MAIN_BTN_PIN == GPIO_NUM_1, ESP_ERR_INVALID_STATE, TAG, "main button ladder expects GPIO1");
     ESP_RETURN_ON_FALSE(HAL_MISC_BTN_PIN == GPIO_NUM_4, ESP_ERR_INVALID_STATE, TAG, "misc button ladder expects GPIO4");
+    ESP_RETURN_ON_FALSE(HAL_SIDE_BTN_PIN == GPIO_NUM_5, ESP_ERR_INVALID_STATE, TAG, "side button expects GPIO5");
 
     esp_err_t err;
+
+    err = hid_service_configure_side_button_gpio();
+    ESP_RETURN_ON_ERROR(err, TAG, "failed to configure side button GPIO");
 
     err = hid_service_configure_button_adc();
     ESP_RETURN_ON_ERROR(err, TAG, "failed to configure button ADC channels");
@@ -978,6 +1085,7 @@ static esp_err_t hid_service_init_buttons(void)
     s_misc_ladder.decode_ready = false;
     hid_service_reset_ladder_state_locked(&s_main_ladder);
     hid_service_reset_ladder_state_locked(&s_misc_ladder);
+    hid_service_reset_gpio_button_state_locked(&s_side_button);
     s_button_state = 0;
     s_button_generation = 0;
     s_button_decode_enabled = false;
@@ -1049,10 +1157,11 @@ esp_err_t hid_service_init(void)
     }
 
     s_initialized = true;
-    ESP_LOGI(TAG, "HID service started (LED=%d MAIN=%d MISC=%d)",
+    ESP_LOGI(TAG, "HID service started (LED=%d MAIN=%d MISC=%d SIDE=%d)",
              HAL_LED_DATA_PIN,
              HAL_MAIN_BTN_PIN,
-             HAL_MISC_BTN_PIN);
+             HAL_MISC_BTN_PIN,
+             HAL_SIDE_BTN_PIN);
     return ESP_OK;
 }
 

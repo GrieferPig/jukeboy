@@ -274,6 +274,8 @@ static const char *hid_button_name(hid_button_t button)
         return "misc2";
     case HID_BUTTON_MISC_3:
         return "misc3";
+    case HID_BUTTON_SIDE:
+        return "side";
     default:
         return "unknown";
     }
@@ -1980,6 +1982,7 @@ static int hid_buttons_handler(int argc, char **argv)
         HID_BUTTON_MISC_1,
         HID_BUTTON_MISC_2,
         HID_BUTTON_MISC_3,
+        HID_BUTTON_SIDE,
     };
 
     uint32_t button_state = 0;

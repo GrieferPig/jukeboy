@@ -30,18 +30,18 @@ dependencies:
       type: service
     version: 1.20.4
   lvgl/lvgl:
-    component_hash: d7c1ac037ae6e85d94897f807d6e7ba0946a83e720074fc95a4f6241da9f9f53
+    component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
     dependencies: []
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 8.4.0
+    version: 9.5.0
 direct_dependencies:
 - espressif/led_strip
 - espressif/wasm-micro-runtime
 - idf
 - joltwallet/littlefs
 - lvgl/lvgl
-manifest_hash: 75eaab0e5684e1503782a6abff0e8a0a5fec4f4e84280f7e1b5a1082925517cc
+manifest_hash: 0718cc88cba38f7b33f451d18254c861436dc5d1ecb743d444d25bd258023964
 target: esp32s3
 version: 2.0.0

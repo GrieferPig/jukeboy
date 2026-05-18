@@ -227,73 +227,12 @@ static uint32_t s_track_started_unix;
 EXT_RAM_BSS_ATTR static size_t s_shuffle_order_storage[JUKEBOY_MAX_TRACK_FILES];
 RTC_NOINIT_ATTR static uint32_t s_resume_rtc_magic;
 RTC_NOINIT_ATTR static player_service_resume_state_t s_resume_rtc_state;
-static esp_event_handler_instance_t s_hid_button_down_handler;
 
 static bool player_service_format_track_filename(char *buffer, size_t buffer_len, uint32_t file_num);
 
 static void player_service_post_event(player_service_event_id_t event_id, const void *data, size_t len)
 {
     esp_event_post(PLAYER_SERVICE_EVENT, event_id, data, len, 0);
-}
-
-static player_service_playback_mode_t player_service_next_playback_mode(player_service_playback_mode_t mode)
-{
-    switch (mode)
-    {
-    case PLAYER_SVC_MODE_SEQUENTIAL:
-        return PLAYER_SVC_MODE_SINGLE_REPEAT;
-    case PLAYER_SVC_MODE_SINGLE_REPEAT:
-        return PLAYER_SVC_MODE_SHUFFLE;
-    case PLAYER_SVC_MODE_SHUFFLE:
-    default:
-        return PLAYER_SVC_MODE_SEQUENTIAL;
-    }
-}
-
-static void player_service_on_hid_button_event(void *handler_arg,
-                                               esp_event_base_t base,
-                                               int32_t id,
-                                               void *event_data)
-{
-    (void)handler_arg;
-    (void)base;
-
-    if (id != HID_EVENT_BUTTON_DOWN || event_data == NULL)
-    {
-        return;
-    }
-
-    hid_button_t button = *(const hid_button_t *)event_data;
-    esp_err_t err = ESP_OK;
-
-    switch (button)
-    {
-    case HID_BUTTON_MAIN_1:
-        err = player_service_request_control(PLAYER_SVC_CONTROL_NEXT);
-        break;
-    case HID_BUTTON_MAIN_2:
-        err = player_service_request_control(PLAYER_SVC_CONTROL_PAUSE);
-        break;
-    case HID_BUTTON_MAIN_3:
-        err = player_service_request_control(PLAYER_SVC_CONTROL_PREVIOUS);
-        break;
-    case HID_BUTTON_MISC_1:
-        err = player_service_set_playback_mode(player_service_next_playback_mode(player_service_get_playback_mode()));
-        break;
-    case HID_BUTTON_MISC_2:
-        err = player_service_request_control(PLAYER_SVC_CONTROL_VOLUME_UP);
-        break;
-    case HID_BUTTON_MISC_3:
-        err = player_service_request_control(PLAYER_SVC_CONTROL_VOLUME_DOWN);
-        break;
-    default:
-        return;
-    }
-
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
-    {
-        ESP_LOGW(TAG, "failed to handle HID button %u: %s", (unsigned)button, esp_err_to_name(err));
-    }
 }
 
 static bool player_service_queue_cmd(player_service_cmd_t cmd)
@@ -3112,11 +3051,6 @@ esp_err_t player_service_init(void)
     {
         a2dp_coprocessor_service_register_event_callback(player_service_on_a2dp_coprocessor_event, NULL);
     }
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(HID_SERVICE_EVENT,
-                                                        HID_EVENT_BUTTON_DOWN,
-                                                        player_service_on_hid_button_event,
-                                                        NULL,
-                                                        &s_hid_button_down_handler));
     ESP_ERROR_CHECK(power_mgmt_service_register_shutdown_callback(player_service_shutdown_callback,
                                                                   NULL,
                                                                   POWER_MGMT_SERVICE_SHUTDOWN_PRIORITY_PLAYER));

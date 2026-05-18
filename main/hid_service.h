@@ -19,6 +19,7 @@ extern "C"
     {
         /* Button IDs map to the ladder tap resistors:
          * *_1 = 4.7k tap, *_2 = 2.2k tap, *_3 = 1k tap.
+         * SIDE is a discrete active-low GPIO button.
          */
         HID_BUTTON_MAIN_1 = 0,
         HID_BUTTON_MAIN_2,
@@ -26,6 +27,7 @@ extern "C"
         HID_BUTTON_MISC_1,
         HID_BUTTON_MISC_2,
         HID_BUTTON_MISC_3,
+        HID_BUTTON_SIDE,
         HID_BUTTON_COUNT,
     } hid_button_t;
 
